@@ -19,6 +19,18 @@ LAYER_MAP = {
     "base": 0, "emissive": 1, "normal": 2, "specular": 3
 }
 
+
+def detect_layer_from_filename(filename):
+    """Detecta el layer asociado a un archivo de variante."""
+    name = Path(filename).stem
+    if "_normal" in name:
+        return 2, "normal"
+    if "_specular" in name:
+        return 3, "specular"
+    if "_emissive" in name:
+        return 1, "emissive"
+    return 0, "base"
+
 def rotate_point_90(x, y):
     return y, 1 - x 
 
@@ -204,7 +216,12 @@ def transform():
     base_map = {Path(item["file_name"]).stem: item for item in gui_data}
 
     # --- Procesar variantes ---
-    variant_files = list(VARIANTS_DIR.glob("*.png")) + list(VARIANTS_DIR.glob("*.jpg"))
+    variant_files = (
+        list(VARIANTS_DIR.glob("*.png"))
+        + list(VARIANTS_DIR.glob("*.jpg"))
+        + list((VARIANTS_DIR / "pbr_maps").glob("*.png"))
+        + list((VARIANTS_DIR / "pbr_maps").glob("*.jpg"))
+    )
     print(f"Archivos de variantes encontrados: {len(variant_files)}")
     
     if variant_files:
@@ -214,17 +231,42 @@ def transform():
         
         for file in variant_files:
             name = file.stem
-            
-            # Usar la nueva función para extraer el nombre base correctamente
-            base_key = extract_base_name(name, base_map)
-            
+
+            detected_layer_id, layer_name = detect_layer_from_filename(file.name)
+
+            base_variant_filename = file.name
+            if detected_layer_id > 0:
+                base_variant_filename = (
+                    file.name
+                    .replace("_normal", "")
+                    .replace("_specular", "")
+                    .replace("_emissive", "")
+                )
+                base_lookup_name = Path(base_variant_filename).stem
+            else:
+                base_lookup_name = name
+
+            base_key = extract_base_name(base_lookup_name, base_map)
+
             if base_key is None:
                 skipped_files += 1
                 continue
-            
+
+            if detected_layer_id > 0:
+                base_variant_path = VARIANTS_DIR / base_variant_filename
+                if not base_variant_path.exists():
+                    skipped_files += 1
+                    continue
+
             base_item = base_map[base_key]
             found_bases.add(base_key)
-            layer = base_item.get("layer", "base")
+            base_layer = base_item.get("layer", "base")
+            current_layer = layer_name if detected_layer_id > 0 else base_layer
+
+            try:
+                relative_file_name = str(file.relative_to(VARIANTS_DIR))
+            except ValueError:
+                relative_file_name = file.name
 
             # Detectar si es rotación
             rot_func = None
@@ -241,12 +283,12 @@ def transform():
             for obj in base_item.get("objects", []):
                 if not obj.get("enabled", True):
                     continue
-                
+
                 class_name = obj.get("class_name", "unknown")
                 class_id = obj.get("class_id", CLASS_MAP.get(class_name, -1))
-                layer_id = obj.get("layer_id", LAYER_MAP.get(layer, -1))
+                object_layer_id = obj.get("layer_id", LAYER_MAP.get(base_layer, -1))
                 polygon_points = obj.get("polygon", [])
-                
+
                 if len(polygon_points) < 3:
                     continue
 
@@ -272,14 +314,14 @@ def transform():
                         rx, ry = rot_func(x, y)
                         rotated_polygon.extend([round(rx, 6), round(ry, 6)])
                     normalized_polygon = rotated_polygon
-                    
+
                     # Aplicar rotación al bbox también
                     normalized_bbox = rotate_bbox(normalized_bbox, rot_func)
 
                 rows.append({
-                    "file_name": file.name,
-                    "layer_id": layer_id,
-                    "layer": layer,
+                    "file_name": relative_file_name,
+                    "layer_id": detected_layer_id if detected_layer_id > 0 else object_layer_id,
+                    "layer": current_layer,
                     "class_id": class_id,
                     "class_name": class_name,
                     "polygon": normalized_polygon,

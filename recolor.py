@@ -3,6 +3,7 @@ from os.path import basename
 import json
 import logging
 import random
+from pathlib import Path
 from PIL import Image
 import numpy as np
 from colorsys import rgb_to_hls, hls_to_rgb
@@ -13,6 +14,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import psutil
 import gc
+import cv2
+from scipy import ndimage
 
 try:
     from colormath.color_objects import sRGBColor, LabColor
@@ -59,6 +62,10 @@ CONFIG = {
     "TARGET_MEMORY_GB": 13.0,
     "MEMORY_PER_IMAGE_MB": 4.0,
 }
+
+GENERATE_PBR_MAPS = True
+PBR_INTENSITY = 2.0
+SPECULAR_SHARPNESS = 1.5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -443,7 +450,17 @@ def process_rotated_image(rot_img, base_name, rot_suffix, colors, output_dir):
             bg = adjust_background_contrast(bg, result_img)
 
             final_img = Image.alpha_composite(bg.convert("RGBA"), result_img)
-            final_img.save(os.path.join(output_dir, output_name), optimize=True)
+            output_path = os.path.join(output_dir, output_name)
+            final_img.save(output_path, optimize=True)
+
+            if GENERATE_PBR_MAPS:
+                try:
+                    save_pbr_maps(result_img, output_name, output_dir)
+                except Exception as pbr_error:
+                    logging.error(
+                        f"Error generando mapas PBR para {output_name}: {pbr_error}",
+                        exc_info=True,
+                    )
 
         logging.info(f"Generadas {len(generated_images)} variantes para rotación {rot_suffix}")
 
@@ -585,7 +602,7 @@ def main():
 
 def validate_config():
     errors = []
-    
+
     if CONFIG["MIN_COLOR"] < 1:
         errors.append("MIN_COLOR debe ser al menos 1")
     
@@ -601,6 +618,120 @@ def validate_config():
             logging.error(f"Error de configuración: {error}")
         return False
     return True
+
+
+def generate_normal_map(img_array, intensity=None):
+    """Genera un mapa normal a partir de una imagen RGBA/RGB."""
+    if intensity is None:
+        intensity = PBR_INTENSITY
+
+    if img_array.shape[2] == 4:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGBA2GRAY)
+    else:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+
+    gray = gray.astype(np.float32) / 255.0
+    gray = ndimage.gaussian_filter(gray, sigma=1)
+
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+    gx *= intensity
+    gy *= intensity
+
+    gz = np.ones_like(gray)
+    normal = np.dstack((gx, gy, gz))
+    norm = np.linalg.norm(normal, axis=2, keepdims=True)
+    norm[norm == 0] = 1.0
+    normal = normal / norm
+
+    normal = (normal + 1.0) * 127.5
+    return normal.astype(np.uint8)
+
+
+def generate_specular_map(img_array, sharpness=None):
+    """Genera un mapa specular resaltando zonas de alta frecuencia."""
+    if sharpness is None:
+        sharpness = SPECULAR_SHARPNESS
+
+    if img_array.shape[2] == 4:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGBA2GRAY)
+    else:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+
+    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
+    laplacian = np.abs(laplacian)
+
+    specular = cv2.normalize(laplacian, None, 0, 255, cv2.NORM_MINMAX)
+    specular = np.clip(specular * sharpness, 0, 255).astype(np.uint8)
+
+    return np.dstack([specular, specular, specular])
+
+
+def generate_emissive_map(img_array, base_name, class_data=None):
+    """Genera un mapa emissive basado en zonas brillantes y nombre base."""
+    rgb_array = img_array[:, :, :3] if img_array.shape[2] == 4 else img_array
+
+    emissive = np.zeros_like(rgb_array)
+
+    hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV)
+    brightness = hsv[:, :, 2]
+    bright_mask = brightness > 200
+
+    lower_name = base_name.lower()
+    if "eyes" in lower_name:
+        emissive[bright_mask] = [255, 100, 50]
+    elif "wings" in lower_name or "ala" in lower_name:
+        emissive[bright_mask] = [50, 100, 255]
+    elif "cristal" in lower_name or "crystal" in lower_name:
+        emissive[bright_mask] = [50, 255, 100]
+    else:
+        emissive[bright_mask] = [255, 255, 255]
+
+    return emissive
+
+
+def save_pbr_maps(result_img, output_name, variants_dir):
+    """Genera y guarda mapas PBR asociados a una variante."""
+    if result_img.mode == "RGBA":
+        img_array = np.array(result_img)
+    else:
+        img_array = np.array(result_img.convert("RGBA"))
+
+    base_name = Path(output_name).stem
+    for suffix in ["_color", "_rot90", "_rot180", "_rot270"]:
+        base_name = base_name.replace(suffix, "")
+
+    normal_map = generate_normal_map(img_array, intensity=PBR_INTENSITY)
+    specular_map = generate_specular_map(img_array, sharpness=SPECULAR_SHARPNESS)
+    emissive_map = generate_emissive_map(img_array, base_name)
+
+    variants_path = Path(variants_dir)
+    pbr_dir = variants_path / "pbr_maps"
+    pbr_dir.mkdir(exist_ok=True)
+
+    stem = Path(output_name).stem
+    suffix = Path(output_name).suffix or ".png"
+
+    normal_filename = f"{stem}_normal{suffix}"
+    specular_filename = f"{stem}_specular{suffix}"
+    emissive_filename = f"{stem}_emissive{suffix}"
+
+    cv2.imwrite(
+        str(pbr_dir / normal_filename),
+        cv2.cvtColor(normal_map, cv2.COLOR_RGB2BGR),
+    )
+    cv2.imwrite(
+        str(pbr_dir / specular_filename),
+        cv2.cvtColor(specular_map, cv2.COLOR_RGB2BGR),
+    )
+    cv2.imwrite(
+        str(pbr_dir / emissive_filename),
+        cv2.cvtColor(emissive_map, cv2.COLOR_RGB2BGR),
+    )
+
+    return [normal_filename, specular_filename, emissive_filename]
+
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
