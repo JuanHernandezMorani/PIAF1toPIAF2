@@ -1,0 +1,2 @@
+^#.*$  empieza la linea con #
+(?<!^)#.*$ no empieza la linea
