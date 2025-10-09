@@ -64,8 +64,44 @@ CONFIG = {
 }
 
 GENERATE_PBR_MAPS = True
-PBR_INTENSITY = 2.0
-SPECULAR_SHARPNESS = 1.5
+USE_BACKGROUND_MATERIALS = True
+BACKGROUNDS_DIR = "backgrounds"
+BACKGROUND_SEARCH_KEYWORDS = True
+
+FOREGROUND_NORMAL_INTENSITY = 2.0
+FOREGROUND_SPECULAR_SHARPNESS = 1.8
+FOREGROUND_SPECULAR_INTENSITY = 0.8
+
+BACKGROUND_NORMAL_INTENSITY = 0.8
+BACKGROUND_SPECULAR_SHARPNESS = 1.2
+BACKGROUND_SPECULAR_INTENSITY = 0.3
+
+NORMAL_BLEND_RATIO = 0.8
+SPECULAR_BLEND_RATIO = 0.7
+
+SIGMA_FOREGROUND = 1.0
+SIGMA_BACKGROUND = 2.0
+NORMAL_CLAMP_PERCENTILE = 99
+
+MATERIAL_KEYWORDS = {
+    "stone": ["stone", "rock", "piedra", "brick", "cobblestone"],
+    "wood": ["wood", "madera", "plank", "log", "oak"],
+    "metal": ["metal", "iron", "steel", "gold", "copper"],
+    "fabric": ["fabric", "cloth", "tela", "wool", "carpet"],
+    "crystal": ["crystal", "glass", "gem", "diamond", "ice"],
+}
+
+MATERIAL_SPECULAR_PROPERTIES = {
+    "metal": {"intensity": 1.2, "roughness": 0.1, "anisotropy": 0.8},
+    "fabric": {"intensity": 0.3, "roughness": 0.8, "anisotropy": 0.1},
+    "wood": {"intensity": 0.4, "roughness": 0.6, "anisotropy": 0.3},
+    "stone": {"intensity": 0.5, "roughness": 0.7, "anisotropy": 0.2},
+    "crystal": {"intensity": 0.9, "roughness": 0.3, "anisotropy": 0.6},
+    "default": {"intensity": 0.7, "roughness": 0.5, "anisotropy": 0.4},
+}
+
+PBR_INTENSITY = FOREGROUND_NORMAL_INTENSITY
+SPECULAR_SHARPNESS = FOREGROUND_SPECULAR_SHARPNESS
 
 PBR_POLYGON_JSONL = Path("data/trainDataMinecraft.jsonl")
 ALPHA_CUTOFF_SPEC = 24
@@ -491,6 +527,454 @@ def generate_synthetic_background(size):
         bg = bg.filter(ImageFilter.GaussianBlur(radius=random.uniform(1, 3)))
 
     return bg
+
+
+def extract_luminance_linear(img_array):
+    """Extrae luminancia física en espacio lineal a partir de un arreglo de imagen."""
+    if img_array.ndim == 2:
+        rgb = np.stack([img_array] * 3, axis=-1)
+    elif img_array.shape[2] >= 3:
+        rgb = img_array[:, :, :3]
+    else:
+        raise ValueError("Imagen inválida para extracción de luminancia")
+
+    rgb_linear = np.power(rgb.astype(np.float32) / 255.0, 2.2)
+    luminance = (
+        0.2126 * rgb_linear[:, :, 0]
+        + 0.7152 * rgb_linear[:, :, 1]
+        + 0.0722 * rgb_linear[:, :, 2]
+    )
+
+    return luminance
+
+
+def detect_material_type(filename):
+    """Detecta el tipo de material en función del nombre del archivo."""
+    if not filename:
+        return "default"
+
+    filename_lower = Path(filename).stem.lower()
+
+    for material, keywords in MATERIAL_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in filename_lower:
+                return material
+
+    return "default"
+
+
+def _find_related_material_map(base_path, keyword):
+    stem = base_path.stem
+    suffix = base_path.suffix
+    candidates = set()
+
+    replacements = [
+        ("Color", keyword),
+        ("color", keyword),
+        ("Albedo", keyword),
+        ("albedo", keyword),
+    ]
+
+    for old, new in replacements:
+        if old in stem:
+            candidates.add(stem.replace(old, new) + suffix)
+
+    candidates.add(f"{stem}_{keyword}{suffix}")
+    candidates.add(f"{stem}-{keyword}{suffix}")
+
+    for candidate_name in candidates:
+        candidate_path = base_path.with_name(candidate_name)
+        if candidate_path.exists():
+            return candidate_path
+
+    return None
+
+
+def load_background_layers(base_name, size, backgrounds_dir=BACKGROUNDS_DIR):
+    """Carga materiales reales de fondo y sus mapas asociados si existen."""
+    backgrounds_path = Path(backgrounds_dir)
+    if not backgrounds_path.exists() or not backgrounds_path.is_dir():
+        raise FileNotFoundError(f"Directorio de fondos no encontrado: {backgrounds_dir}")
+
+    height, width = size
+    valid_ext = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
+    background_files = [
+        path for path in backgrounds_path.iterdir() if path.suffix.lower() in valid_ext
+    ]
+
+    if not background_files:
+        raise FileNotFoundError("No se encontraron texturas de fondo válidas")
+
+    base_lower = (base_name or "").lower()
+    selected_path = None
+
+    # Coincidencia exacta
+    if base_lower:
+        for path in background_files:
+            if path.stem.lower() == base_lower:
+                selected_path = path
+                break
+
+    # Coincidencia parcial
+    if selected_path is None and base_lower:
+        for path in background_files:
+            if base_lower in path.stem.lower():
+                selected_path = path
+                break
+
+    # Búsqueda por palabras clave
+    if selected_path is None and BACKGROUND_SEARCH_KEYWORDS:
+        desired_material = detect_material_type(base_lower)
+        best_score = -1
+        fallback = background_files[0]
+        for path in background_files:
+            score = 0
+            stem_lower = path.stem.lower()
+            if base_lower and base_lower in stem_lower:
+                score += 5
+            file_material = detect_material_type(stem_lower)
+            if desired_material != "default" and file_material == desired_material:
+                score += 3
+            elif file_material != "default":
+                score += 1
+            if score > best_score:
+                best_score = score
+                selected_path = path
+        if selected_path is None:
+            selected_path = fallback
+
+    if selected_path is None:
+        selected_path = background_files[0]
+
+    background_material = detect_material_type(selected_path.stem)
+
+    with Image.open(selected_path) as color_image:
+        color_image = color_image.convert("RGB")
+        color_image = color_image.resize((width, height), Image.LANCZOS)
+        bg_rgb = np.array(color_image, dtype=np.uint8)
+    if bg_rgb.ndim == 2:
+        bg_rgb = np.stack([bg_rgb] * 3, axis=-1)
+    bg_alpha = np.full((height, width, 1), 255, dtype=np.uint8)
+    bg_rgba = np.concatenate([bg_rgb, bg_alpha], axis=2)
+
+    normal_path = _find_related_material_map(selected_path, "Normal")
+    specular_path = None
+    if normal_path is None:
+        normal_path = _find_related_material_map(selected_path, "normal")
+
+    for keyword in ("Specular", "Roughness", "Metallic", "Glossiness"):
+        specular_path = _find_related_material_map(selected_path, keyword)
+        if specular_path is not None:
+            break
+
+    bg_normal = None
+    if normal_path is not None:
+        try:
+            with Image.open(normal_path) as normal_image:
+                normal_image = normal_image.convert("RGB")
+                normal_image = normal_image.resize((width, height), Image.LANCZOS)
+                bg_normal = np.array(normal_image, dtype=np.uint8)
+        except Exception:
+            bg_normal = None
+
+    bg_specular = None
+    if specular_path is not None:
+        try:
+            with Image.open(specular_path) as specular_image:
+                specular_image = specular_image.convert("RGBA")
+                specular_image = specular_image.resize((width, height), Image.LANCZOS)
+                bg_specular = np.array(specular_image, dtype=np.uint8)
+        except Exception:
+            bg_specular = None
+
+    return bg_rgba, bg_normal, bg_specular, background_material
+
+
+def generate_foreground_normal_map(img_array, intensity=None):
+    """Genera normales de alta frecuencia para el objeto en primer plano."""
+    if intensity is None:
+        intensity = FOREGROUND_NORMAL_INTENSITY
+
+    luminance = extract_luminance_linear(img_array)
+    height, width = luminance.shape
+
+    sigma = 0.8 if max(height, width) > 256 else 0.5
+    sigma = min(SIGMA_FOREGROUND, sigma) if SIGMA_FOREGROUND else sigma
+    blurred = ndimage.gaussian_filter(luminance, sigma=sigma)
+
+    gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+
+    magnitude = np.sqrt(gx * gx + gy * gy)
+    clip_value = (
+        np.percentile(magnitude, NORMAL_CLAMP_PERCENTILE)
+        if magnitude.size and NORMAL_CLAMP_PERCENTILE
+        else 0
+    )
+    if clip_value > 0:
+        gx = np.clip(gx, -clip_value, clip_value)
+        gy = np.clip(gy, -clip_value, clip_value)
+
+    gx *= intensity
+    gy *= intensity
+
+    gz = np.ones_like(luminance, dtype=np.float32)
+    normal = np.dstack((gx, gy, gz)).astype(np.float32)
+    norm = np.linalg.norm(normal, axis=2, keepdims=True)
+    norm[norm == 0] = 1.0
+    normal = normal / norm
+
+    normal = np.clip((normal + 1.0) * 127.5, 0, 255).astype(np.uint8)
+    return normal
+
+
+def generate_background_normal_map(background_img, intensity=None):
+    """Genera normales suaves para materiales del fondo."""
+    if intensity is None:
+        intensity = BACKGROUND_NORMAL_INTENSITY
+
+    luminance = extract_luminance_linear(background_img)
+    blurred = ndimage.gaussian_filter(luminance, sigma=SIGMA_BACKGROUND)
+
+    gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=5)
+    gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=5)
+
+    gx *= intensity
+    gy *= intensity
+
+    gz = np.ones_like(luminance, dtype=np.float32)
+    normal = np.dstack((gx, gy, gz)).astype(np.float32)
+    norm = np.linalg.norm(normal, axis=2, keepdims=True)
+    norm[norm == 0] = 1.0
+    normal = normal / norm
+
+    normal = np.clip((normal + 1.0) * 127.5, 0, 255).astype(np.uint8)
+    return normal
+
+
+def generate_physically_correct_specular(
+    img_array,
+    material_type="default",
+    sharpness=None,
+    alpha_cutoff=ALPHA_CUTOFF_SPEC,
+    energy_scale=1.0,
+):
+    """Genera un mapa specular físicamente correcto en espacio lineal."""
+    if sharpness is None:
+        sharpness = FOREGROUND_SPECULAR_SHARPNESS
+
+    props = MATERIAL_SPECULAR_PROPERTIES.get(material_type, MATERIAL_SPECULAR_PROPERTIES["default"])
+
+    if img_array.shape[2] == 4:
+        rgb = img_array[:, :, :3]
+        alpha = img_array[:, :, 3]
+    else:
+        rgb = img_array
+        alpha = np.full(rgb.shape[:2], 255, dtype=np.uint8)
+
+    if alpha_cutoff is None:
+        alpha_cutoff = ALPHA_CUTOFF_SPEC
+
+    rgb_linear = np.power(rgb.astype(np.float32) / 255.0, 2.2)
+    luminance = (
+        0.2126 * rgb_linear[:, :, 0]
+        + 0.7152 * rgb_linear[:, :, 1]
+        + 0.0722 * rgb_linear[:, :, 2]
+    )
+
+    laplacian = cv2.Laplacian(luminance, cv2.CV_32F, ksize=3)
+    sobelx = cv2.Sobel(luminance, cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(luminance, cv2.CV_32F, 0, 1, ksize=3)
+    edges = np.abs(laplacian) + 0.5 * (np.abs(sobelx) + np.abs(sobely))
+    edges = cv2.bilateralFilter(edges.astype(np.float32), 9, 75, 75)
+    edges = np.clip(edges, 0.0, None)
+    if np.any(edges):
+        edges = cv2.normalize(edges, None, 0.0, 1.0, cv2.NORM_MINMAX)
+
+    specular_intensity = edges * luminance * sharpness * props["intensity"] * energy_scale
+    specular_intensity = np.clip(specular_intensity, 0.0, 1.0)
+    specular_intensity = np.power(specular_intensity, 1.0 / (props["roughness"] + 0.5))
+
+    specular_values = np.power(specular_intensity, 1.0 / 2.2) * 255.0
+    specular_values = np.clip(specular_values, 0, 255).astype(np.uint8)
+
+    alpha_mask = alpha > alpha_cutoff
+    base_alpha = alpha.astype(np.float32) / 255.0
+    anisotropy_factor = 0.5 + 0.5 * props.get("anisotropy", 0.5)
+    specular_alpha = (
+        (specular_values.astype(np.float32) / 255.0)
+        * base_alpha
+        * anisotropy_factor
+    )
+    specular_alpha = np.clip(specular_alpha * 255.0, 0, 255).astype(np.uint8)
+
+    specular_rgb = np.dstack([specular_values] * 3)
+    specular_rgb[~alpha_mask] = 0
+    specular_alpha[~alpha_mask] = 0
+
+    return np.dstack([specular_rgb, specular_alpha])
+
+
+def generate_foreground_specular_map(img_array, material_type="default", sharpness=None):
+    """Genera un mapa specular para el objeto en primer plano."""
+    if sharpness is None:
+        sharpness = FOREGROUND_SPECULAR_SHARPNESS
+
+    material = material_type or "default"
+    if material not in MATERIAL_SPECULAR_PROPERTIES:
+        material = detect_material_type(material)
+    if material not in MATERIAL_SPECULAR_PROPERTIES:
+        material = "default"
+
+    return generate_physically_correct_specular(
+        img_array,
+        material_type=material,
+        sharpness=sharpness,
+        energy_scale=FOREGROUND_SPECULAR_INTENSITY,
+    )
+
+
+def generate_background_specular_map(background_img, material_type="default", sharpness=None):
+    """Genera un mapa specular para el material de fondo."""
+    if sharpness is None:
+        sharpness = BACKGROUND_SPECULAR_SHARPNESS
+
+    material = material_type or "default"
+    if material not in MATERIAL_SPECULAR_PROPERTIES:
+        material = detect_material_type(material)
+    if material not in MATERIAL_SPECULAR_PROPERTIES:
+        material = "default"
+
+    if background_img.ndim == 2:
+        background_img = np.stack([background_img] * 3, axis=-1)
+    if background_img.shape[2] == 3:
+        alpha = np.full(background_img.shape[:2] + (1,), 255, dtype=np.uint8)
+        bg_rgba = np.concatenate([background_img, alpha], axis=2)
+    else:
+        bg_rgba = background_img
+
+    return generate_physically_correct_specular(
+        bg_rgba,
+        material_type=material,
+        sharpness=sharpness,
+        alpha_cutoff=0,
+        energy_scale=BACKGROUND_SPECULAR_INTENSITY,
+    )
+
+
+def blend_normals_physically(normal_fg, normal_bg, alpha_mask, blend_ratio=NORMAL_BLEND_RATIO):
+    """Combina normales de forma física respetando el alpha del objeto."""
+    if normal_fg.shape[2] > 3:
+        normal_fg = normal_fg[:, :, :3]
+    if normal_bg.shape[2] > 3:
+        normal_bg = normal_bg[:, :, :3]
+
+    normal_fg_vec = normal_fg.astype(np.float32) / 127.5 - 1.0
+    normal_bg_vec = normal_bg.astype(np.float32) / 127.5 - 1.0
+
+    alpha_weights = alpha_mask.astype(np.float32) / 255.0
+    fg_weight = alpha_weights * blend_ratio
+    bg_weight = (1.0 - alpha_weights) * (1.0 - blend_ratio)
+
+    blended_vec = (
+        normal_fg_vec * fg_weight[..., None]
+        + normal_bg_vec * bg_weight[..., None]
+    )
+
+    norm = np.linalg.norm(blended_vec, axis=2, keepdims=True)
+    norm[norm == 0] = 1.0
+    blended_vec = blended_vec / norm
+
+    blended = ((blended_vec + 1.0) * 127.5).astype(np.uint8)
+    return blended
+
+
+def blend_specular_physically(specular_fg, specular_bg, alpha_mask, blend_ratio=SPECULAR_BLEND_RATIO):
+    """Combina mapas specular preservando energía física."""
+    if specular_fg.shape[2] == 4:
+        spec_fg_rgb = specular_fg[:, :, :3]
+        spec_fg_alpha = specular_fg[:, :, 3]
+    else:
+        spec_fg_rgb = specular_fg
+        spec_fg_alpha = np.full(spec_fg_rgb.shape[:2], 255, dtype=np.uint8)
+
+    if specular_bg.shape[2] == 4:
+        spec_bg_rgb = specular_bg[:, :, :3]
+        spec_bg_alpha = specular_bg[:, :, 3]
+    else:
+        spec_bg_rgb = specular_bg
+        spec_bg_alpha = np.full(spec_bg_rgb.shape[:2], 255, dtype=np.uint8)
+
+    spec_fg_lin = np.power(spec_fg_rgb.astype(np.float32) / 255.0, 2.2)
+    spec_bg_lin = np.power(spec_bg_rgb.astype(np.float32) / 255.0, 2.2)
+
+    alpha_weights = alpha_mask.astype(np.float32) / 255.0
+    fg_weight = alpha_weights * blend_ratio
+    bg_weight = (1.0 - alpha_weights) * (1.0 - blend_ratio)
+
+    blended_lin = (
+        spec_fg_lin * fg_weight[..., None]
+        + spec_bg_lin * bg_weight[..., None]
+    )
+
+    blended_srgb = np.power(np.clip(blended_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0
+    blended_srgb = np.clip(blended_srgb, 0, 255).astype(np.uint8)
+
+    blended_alpha = (
+        spec_fg_alpha.astype(np.float32) * fg_weight
+        + spec_bg_alpha.astype(np.float32) * bg_weight
+    )
+    blended_alpha = np.clip(blended_alpha, 0, 255).astype(np.uint8)
+
+    return np.dstack([blended_srgb, blended_alpha])
+
+
+def generate_enhanced_pbr_maps(
+    foreground_img,
+    background_layers,
+    base_name,
+    rotation_suffix="rot0",
+    class_data=None,
+    background_material=None,
+):
+    """Genera mapas PBR combinando físicamente objeto y fondo."""
+    bg_rgb, bg_normal, bg_specular = background_layers
+
+    fg_material = detect_material_type(base_name)
+    if fg_material not in MATERIAL_SPECULAR_PROPERTIES:
+        fg_material = "default"
+
+    fg_normal = generate_foreground_normal_map(foreground_img, intensity=FOREGROUND_NORMAL_INTENSITY)
+    fg_specular = generate_foreground_specular_map(
+        foreground_img,
+        material_type=fg_material,
+        sharpness=FOREGROUND_SPECULAR_SHARPNESS,
+    )
+
+    emissive_map = generate_emissive_map(
+        foreground_img,
+        base_name,
+        class_data=class_data,
+        rotation_suffix=rotation_suffix,
+    )
+
+    if bg_normal is None:
+        bg_normal = generate_background_normal_map(bg_rgb, intensity=BACKGROUND_NORMAL_INTENSITY)
+    if bg_specular is None:
+        bg_material = background_material or detect_material_type(base_name)
+        if bg_material not in MATERIAL_SPECULAR_PROPERTIES:
+            bg_material = detect_material_type("default")
+        bg_specular = generate_background_specular_map(
+            bg_rgb,
+            material_type=bg_material,
+            sharpness=BACKGROUND_SPECULAR_SHARPNESS,
+        )
+
+    alpha_mask = foreground_img[:, :, 3] if foreground_img.shape[2] == 4 else np.full(foreground_img.shape[:2], 255, dtype=np.uint8)
+    final_normal = blend_normals_physically(fg_normal, bg_normal, alpha_mask, NORMAL_BLEND_RATIO)
+    final_specular = blend_specular_physically(fg_specular, bg_specular, alpha_mask, SPECULAR_BLEND_RATIO)
+
+    return final_normal, final_specular, emissive_map
 
 
 def process_rotated_image(rot_img, base_name, rot_suffix, colors, output_dir):
@@ -1042,14 +1526,61 @@ def save_pbr_maps(result_img, output_name, variants_dir):
     base_name, rotation_suffix = _parse_variant_metadata(output_name)
     class_data = _get_polygon_objects(base_name)
 
-    normal_map = generate_normal_map(img_array, intensity=PBR_INTENSITY)
-    specular_map = generate_specular_map(img_array, sharpness=SPECULAR_SHARPNESS)
-    emissive_map = generate_emissive_map(
-        img_array,
-        base_name,
-        class_data=class_data,
-        rotation_suffix=rotation_suffix,
-    )
+    if USE_BACKGROUND_MATERIALS:
+        try:
+            bg_rgba, bg_normal, bg_specular, bg_material = load_background_layers(
+                base_name,
+                img_array.shape[:2],
+                BACKGROUNDS_DIR,
+            )
+        except Exception as exc:
+            logging.warning(f"No se pudieron cargar materiales de fondo: {exc}")
+            width = img_array.shape[1]
+            height = img_array.shape[0]
+            synthetic_bg = generate_synthetic_background((width, height)).convert("RGB")
+            bg_rgb = np.array(synthetic_bg, dtype=np.uint8)
+            bg_alpha = np.full((height, width, 1), 255, dtype=np.uint8)
+            bg_rgba = np.concatenate([bg_rgb, bg_alpha], axis=2)
+            bg_normal = generate_background_normal_map(bg_rgba, intensity=BACKGROUND_NORMAL_INTENSITY)
+            bg_material = detect_material_type(base_name)
+            if bg_material not in MATERIAL_SPECULAR_PROPERTIES:
+                bg_material = "default"
+            bg_specular = generate_background_specular_map(
+                bg_rgba,
+                material_type=bg_material,
+                sharpness=BACKGROUND_SPECULAR_SHARPNESS,
+            )
+        else:
+            if bg_normal is not None and bg_normal.shape[:2] != img_array.shape[:2]:
+                bg_normal = cv2.resize(
+                    bg_normal,
+                    (img_array.shape[1], img_array.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            if bg_specular is not None and bg_specular.shape[:2] != img_array.shape[:2]:
+                bg_specular = cv2.resize(
+                    bg_specular,
+                    (img_array.shape[1], img_array.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+        normal_map, specular_map, emissive_map = generate_enhanced_pbr_maps(
+            img_array,
+            (bg_rgba, bg_normal, bg_specular),
+            base_name,
+            rotation_suffix=rotation_suffix,
+            class_data=class_data,
+            background_material=bg_material,
+        )
+    else:
+        normal_map = generate_normal_map(img_array, intensity=PBR_INTENSITY)
+        specular_map = generate_specular_map(img_array, sharpness=SPECULAR_SHARPNESS)
+        emissive_map = generate_emissive_map(
+            img_array,
+            base_name,
+            class_data=class_data,
+            rotation_suffix=rotation_suffix,
+        )
 
     variants_path = Path(variants_dir)
     pbr_dir = variants_path / "pbr_maps"
