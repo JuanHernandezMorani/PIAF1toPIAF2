@@ -1,5 +1,4 @@
 import os
-from os.path import basename
 import json
 import logging
 import random
@@ -8,7 +7,6 @@ from PIL import Image
 import numpy as np
 from colorsys import rgb_to_hls, hls_to_rgb
 from collections import defaultdict
-from PIL import ImageFilter
 import platform
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
@@ -39,6 +37,8 @@ CONFIG = {
     "SAMPLING_THRESHOLD": 80000,
     "BUCKET_SIZE": 14,
     "VALID_EXTENSIONS": {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"},
+    "USE_REAL_BACKGROUNDS_ONLY": True,
+    "BACKGROUNDS_DIR": "backgrounds",
     "PRESERVE_BRIGHTNESS": False,
     "USE_HLS_METHOD": True,
     "GENERATE_ROTATIONS": True,
@@ -65,8 +65,8 @@ CONFIG = {
 
 GENERATE_PBR_MAPS = True
 USE_BACKGROUND_MATERIALS = True
-BACKGROUNDS_DIR = "backgrounds"
-BACKGROUND_SEARCH_KEYWORDS = True
+USE_REAL_BACKGROUNDS_ONLY = CONFIG["USE_REAL_BACKGROUNDS_ONLY"]
+BACKGROUNDS_DIR = CONFIG["BACKGROUNDS_DIR"]
 
 FOREGROUND_NORMAL_INTENSITY = 2.0
 FOREGROUND_SPECULAR_SHARPNESS = 1.8
@@ -503,32 +503,6 @@ def adjust_background_contrast(bg, fg, target_lum_diff=50):
     return bg
 
 
-def generate_synthetic_background(size):
-    width, height = size
-
-    base_color = tuple(np.random.randint(50, 220, size=3))
-    bg = Image.new("RGB", size, base_color)
-
-    if random.random() < 0.5:
-        noise = np.random.randint(0, 30, (height, width, 3), dtype=np.uint8)
-        bg = Image.fromarray(np.clip(np.array(bg) + noise, 0, 255).astype("uint8"), "RGB")
-
-    bg_dir = "backgrounds"
-    if os.path.exists(bg_dir) and random.random() < 0.6:
-        textures = [f for f in os.listdir(bg_dir) if f.lower().endswith((".jpg", ".png"))]
-        if textures:
-            chosen = random.choice(textures)
-            tex = Image.open(os.path.join(bg_dir, chosen)).convert("RGB").resize(size)
-            bg = Image.blend(bg, tex, alpha=random.uniform(0.2, 0.5))
-            if basename(chosen).lower() in {"a.png", "b.png", "c.png"}:
-                bg = bg.filter(ImageFilter.GaussianBlur(radius=random.uniform(1.5, 3)))
-
-    if random.random() < 0.4:
-        bg = bg.filter(ImageFilter.GaussianBlur(radius=random.uniform(1, 3)))
-
-    return bg
-
-
 def extract_luminance_linear(img_array):
     """Extrae luminancia física en espacio lineal a partir de un arreglo de imagen."""
     if img_array.ndim == 2:
@@ -563,129 +537,98 @@ def detect_material_type(filename):
     return "default"
 
 
-def _find_related_material_map(base_path, keyword):
-    stem = base_path.stem
-    suffix = base_path.suffix
-    candidates = set()
+def get_random_background(size):
+    """Selecciona aleatoriamente un fondo real y lo redimensiona al tamaño solicitado."""
+    if not size or len(size) != 2:
+        raise ValueError("El tamaño del fondo debe ser una tupla (ancho, alto)")
 
-    replacements = [
-        ("Color", keyword),
-        ("color", keyword),
-        ("Albedo", keyword),
-        ("albedo", keyword),
-    ]
+    try:
+        width, height = map(int, size)
+    except Exception as exc:  # pragma: no cover - validación defensiva
+        raise ValueError("El tamaño del fondo debe contener valores numéricos") from exc
 
-    for old, new in replacements:
-        if old in stem:
-            candidates.add(stem.replace(old, new) + suffix)
+    if width <= 0 or height <= 0:
+        raise ValueError("El tamaño del fondo debe ser mayor que cero")
 
-    candidates.add(f"{stem}_{keyword}{suffix}")
-    candidates.add(f"{stem}-{keyword}{suffix}")
-
-    for candidate_name in candidates:
-        candidate_path = base_path.with_name(candidate_name)
-        if candidate_path.exists():
-            return candidate_path
-
-    return None
-
-
-def load_background_layers(base_name, size, backgrounds_dir=BACKGROUNDS_DIR):
-    """Carga materiales reales de fondo y sus mapas asociados si existen."""
-    backgrounds_path = Path(backgrounds_dir)
+    backgrounds_path = Path(CONFIG["BACKGROUNDS_DIR"])
     if not backgrounds_path.exists() or not backgrounds_path.is_dir():
-        raise FileNotFoundError(f"Directorio de fondos no encontrado: {backgrounds_dir}")
+        raise FileNotFoundError(
+            f"Directorio de fondos no encontrado: {backgrounds_path}"
+        )
 
-    height, width = size
-    valid_ext = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
+    valid_ext = {ext.lower() for ext in CONFIG["VALID_EXTENSIONS"]}
     background_files = [
-        path for path in backgrounds_path.iterdir() if path.suffix.lower() in valid_ext
+        path
+        for path in backgrounds_path.iterdir()
+        if path.is_file() and path.suffix.lower() in valid_ext
     ]
 
     if not background_files:
-        raise FileNotFoundError("No se encontraron texturas de fondo válidas")
+        raise FileNotFoundError(
+            f"No se encontraron imágenes de fondo válidas en {backgrounds_path}"
+        )
 
-    base_lower = (base_name or "").lower()
-    selected_path = None
+    random.shuffle(background_files)
+    last_error = None
 
-    # Coincidencia exacta
-    if base_lower:
-        for path in background_files:
-            if path.stem.lower() == base_lower:
-                selected_path = path
-                break
-
-    # Coincidencia parcial
-    if selected_path is None and base_lower:
-        for path in background_files:
-            if base_lower in path.stem.lower():
-                selected_path = path
-                break
-
-    # Búsqueda por palabras clave
-    if selected_path is None and BACKGROUND_SEARCH_KEYWORDS:
-        desired_material = detect_material_type(base_lower)
-        best_score = -1
-        fallback = background_files[0]
-        for path in background_files:
-            score = 0
-            stem_lower = path.stem.lower()
-            if base_lower and base_lower in stem_lower:
-                score += 5
-            file_material = detect_material_type(stem_lower)
-            if desired_material != "default" and file_material == desired_material:
-                score += 3
-            elif file_material != "default":
-                score += 1
-            if score > best_score:
-                best_score = score
-                selected_path = path
-        if selected_path is None:
-            selected_path = fallback
-
-    if selected_path is None:
-        selected_path = background_files[0]
-
-    background_material = detect_material_type(selected_path.stem)
-
-    with Image.open(selected_path) as color_image:
-        color_image = color_image.convert("RGB")
-        color_image = color_image.resize((width, height), Image.LANCZOS)
-        bg_rgb = np.array(color_image, dtype=np.uint8)
-    if bg_rgb.ndim == 2:
-        bg_rgb = np.stack([bg_rgb] * 3, axis=-1)
-    bg_alpha = np.full((height, width, 1), 255, dtype=np.uint8)
-    bg_rgba = np.concatenate([bg_rgb, bg_alpha], axis=2)
-
-    normal_path = _find_related_material_map(selected_path, "Normal")
-    specular_path = None
-    if normal_path is None:
-        normal_path = _find_related_material_map(selected_path, "normal")
-
-    for keyword in ("Specular", "Roughness", "Metallic", "Glossiness"):
-        specular_path = _find_related_material_map(selected_path, keyword)
-        if specular_path is not None:
-            break
-
-    bg_normal = None
-    if normal_path is not None:
+    for path in background_files:
         try:
-            with Image.open(normal_path) as normal_image:
-                normal_image = normal_image.convert("RGB")
-                normal_image = normal_image.resize((width, height), Image.LANCZOS)
-                bg_normal = np.array(normal_image, dtype=np.uint8)
-        except Exception:
-            bg_normal = None
+            with Image.open(path) as bg_image:
+                bg_rgba = bg_image.convert("RGBA")
+                resized = bg_rgba.resize((width, height), Image.LANCZOS)
+                result = resized.copy()
+                result.info["background_path"] = str(path)
+                return result
+        except Exception as exc:
+            logging.warning(f"No se pudo usar el background '{path}': {exc}")
+            last_error = exc
+            continue
 
-    bg_specular = None
-    if specular_path is not None:
-        try:
-            with Image.open(specular_path) as specular_image:
-                specular_image = specular_image.convert("RGBA")
-                specular_image = specular_image.resize((width, height), Image.LANCZOS)
-                bg_specular = np.array(specular_image, dtype=np.uint8)
-        except Exception:
-            bg_specular = None
+    raise RuntimeError(
+        "No se pudo cargar ninguna imagen válida de la carpeta de fondos"
+    ) from last_error
+
+
+def load_background_layers(base_name, size, backgrounds_dir=BACKGROUNDS_DIR):
+    """Carga un fondo real aleatorio y genera sus mapas de normales y especular."""
+    backgrounds_path = Path(backgrounds_dir)
+    if not backgrounds_path.exists() or not backgrounds_path.is_dir():
+        raise FileNotFoundError(
+            f"Directorio de fondos no encontrado: {backgrounds_dir}"
+        )
+
+    try:
+        width, height = map(int, size)
+    except Exception as exc:  # pragma: no cover - validación defensiva
+        raise ValueError("El tamaño debe tener formato (ancho, alto)") from exc
+
+    background_img = get_random_background((width, height))
+    background_path_str = background_img.info.get("background_path")
+    background_path = Path(background_path_str) if background_path_str else None
+
+    bg_rgba = np.array(background_img, dtype=np.uint8)
+    if bg_rgba.ndim == 2:
+        bg_rgba = np.stack([bg_rgba] * 3, axis=-1)
+        alpha_channel = np.full((height, width, 1), 255, dtype=np.uint8)
+        bg_rgba = np.concatenate([bg_rgba, alpha_channel], axis=2)
+    elif bg_rgba.shape[2] == 3:
+        alpha_channel = np.full((height, width, 1), 255, dtype=np.uint8)
+        bg_rgba = np.concatenate([bg_rgba, alpha_channel], axis=2)
+
+    background_material = "default"
+    if background_path is not None:
+        background_material = detect_material_type(background_path.stem)
+    if background_material not in MATERIAL_SPECULAR_PROPERTIES:
+        background_material = "default"
+
+    bg_normal = generate_background_normal_map(
+        bg_rgba, intensity=BACKGROUND_NORMAL_INTENSITY
+    )
+    bg_specular = generate_background_specular_map(
+        bg_rgba,
+        material_type=background_material,
+        sharpness=BACKGROUND_SPECULAR_SHARPNESS,
+    )
 
     return bg_rgba, bg_normal, bg_specular, background_material
 
@@ -1045,7 +988,7 @@ def process_rotated_image(rot_img, base_name, rot_suffix, colors, output_dir):
         for img_array, output_name in generated_images:
             result_img = Image.fromarray(img_array.astype("uint8"), "RGBA")
 
-            bg = generate_synthetic_background(result_img.size)
+            bg = get_random_background(result_img.size)
             bg = adjust_background_contrast(bg, result_img)
 
             final_img = Image.alpha_composite(bg.convert("RGBA"), result_img)
@@ -1211,6 +1154,32 @@ def validate_config():
     if CONFIG["MAX_WORKERS"] > mp.cpu_count():
         CONFIG["MAX_WORKERS"] = max(1, mp.cpu_count() - 1)
         logging.info(f"Ajustando MAX_WORKERS a {CONFIG['MAX_WORKERS']}")
+
+    if CONFIG.get("USE_REAL_BACKGROUNDS_ONLY"):
+        backgrounds_dir = Path(CONFIG["BACKGROUNDS_DIR"])
+        valid_ext = {ext.lower() for ext in CONFIG["VALID_EXTENSIONS"]}
+
+        if not backgrounds_dir.exists():
+            backgrounds_dir.mkdir(parents=True, exist_ok=True)
+            logging.warning(
+                f"La carpeta de fondos no existía. Se creó en {backgrounds_dir.resolve()}"
+            )
+
+        if not backgrounds_dir.is_dir():
+            errors.append(
+                f"La ruta de fondos '{backgrounds_dir}' no es un directorio válido"
+            )
+        else:
+            background_files = [
+                path
+                for path in backgrounds_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in valid_ext
+            ]
+            if not background_files:
+                errors.append(
+                    "La carpeta de fondos no contiene imágenes válidas. "
+                    "Agrega archivos PNG/JPG/JPEG/BMP/TIFF a 'backgrounds'"
+                )
 
     if errors:
         for error in errors:
@@ -1530,26 +1499,14 @@ def save_pbr_maps(result_img, output_name, variants_dir):
         try:
             bg_rgba, bg_normal, bg_specular, bg_material = load_background_layers(
                 base_name,
-                img_array.shape[:2],
+                (img_array.shape[1], img_array.shape[0]),
                 BACKGROUNDS_DIR,
             )
         except Exception as exc:
-            logging.warning(f"No se pudieron cargar materiales de fondo: {exc}")
-            width = img_array.shape[1]
-            height = img_array.shape[0]
-            synthetic_bg = generate_synthetic_background((width, height)).convert("RGB")
-            bg_rgb = np.array(synthetic_bg, dtype=np.uint8)
-            bg_alpha = np.full((height, width, 1), 255, dtype=np.uint8)
-            bg_rgba = np.concatenate([bg_rgb, bg_alpha], axis=2)
-            bg_normal = generate_background_normal_map(bg_rgba, intensity=BACKGROUND_NORMAL_INTENSITY)
-            bg_material = detect_material_type(base_name)
-            if bg_material not in MATERIAL_SPECULAR_PROPERTIES:
-                bg_material = "default"
-            bg_specular = generate_background_specular_map(
-                bg_rgba,
-                material_type=bg_material,
-                sharpness=BACKGROUND_SPECULAR_SHARPNESS,
+            logging.error(
+                f"No se pudieron cargar fondos reales para {output_name}: {exc}"
             )
+            raise
         else:
             if bg_normal is not None and bg_normal.shape[:2] != img_array.shape[:2]:
                 bg_normal = cv2.resize(
