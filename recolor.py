@@ -67,6 +67,121 @@ GENERATE_PBR_MAPS = True
 PBR_INTENSITY = 2.0
 SPECULAR_SHARPNESS = 1.5
 
+PBR_POLYGON_JSONL = Path("data/trainDataMinecraft.jsonl")
+ALPHA_CUTOFF_SPEC = 24
+EMISSIVE_ALPHA_CORE = 255
+EMISSIVE_ALPHA_RING_RATIO = 0.5
+EMISSIVE_ALPHA_NON_TARGET = 12
+EMISSIVE_ALPHA_BACKGROUND = 3
+EMISSIVE_COLOR_EYES = (255, 100, 50, 255)
+EMISSIVE_COLOR_WINGS = (100, 200, 255, 255)
+EMISSIVE_MIN_COMPONENT_PCT = 0.001
+ADD_NORMAL_ALPHA = False
+
+try:
+    PNG_PARAMS = [
+        cv2.IMWRITE_PNG_COMPRESSION,
+        9,
+        cv2.IMWRITE_PNG_STRATEGY,
+        cv2.IMWRITE_PNG_STRATEGY_RLE,
+    ]
+except AttributeError:  # pragma: no cover - OpenCV sin estrategia RLE
+    PNG_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 9]
+
+
+def rotate_point_90(x, y):
+    return y, 1 - x
+
+
+def rotate_point_180(x, y):
+    return 1 - x, 1 - y
+
+
+def rotate_point_270(x, y):
+    return 1 - y, x
+
+
+ROT_POINT_FUNCS = {
+    "rot90": rotate_point_90,
+    "rot180": rotate_point_180,
+    "rot270": rotate_point_270,
+}
+
+
+_POLYGON_CACHE = None
+
+
+def _load_polygon_annotations(jsonl_path=None):
+    global _POLYGON_CACHE
+    if _POLYGON_CACHE is not None:
+        return _POLYGON_CACHE
+
+    if jsonl_path is None:
+        jsonl_path = PBR_POLYGON_JSONL
+
+    annotations = {}
+    try:
+        path = Path(jsonl_path)
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    image_name = record.get("image")
+                    if not image_name:
+                        continue
+
+                    key = Path(image_name).stem.lower()
+                    objects = record.get("objects") or []
+                    if not isinstance(objects, list):
+                        continue
+
+                    if key not in annotations:
+                        annotations[key] = []
+                    annotations[key].extend(objects)
+    except Exception:
+        annotations = {}
+
+    _POLYGON_CACHE = annotations
+    return _POLYGON_CACHE
+
+
+def _get_polygon_objects(base_name, jsonl_path=None):
+    annotations = _load_polygon_annotations(jsonl_path)
+    if not annotations:
+        return None
+
+    if not base_name:
+        return None
+
+    return annotations.get(base_name.lower())
+
+
+def _parse_variant_metadata(output_name):
+    stem = Path(output_name).stem
+    rotation_suffix = "rot0"
+    base_key = stem
+
+    for rot_tag in ("_rot90", "_rot180", "_rot270"):
+        if rot_tag in base_key:
+            rotation_suffix = rot_tag.lstrip("_")
+            base_key = base_key.split(rot_tag)[0]
+            break
+
+    if "_color" in base_key:
+        base_key = base_key.split("_color")[0]
+
+    if not base_key:
+        base_key = stem
+
+    return base_key, rotation_suffix
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -620,7 +735,7 @@ def validate_config():
     return True
 
 
-def generate_normal_map(img_array, intensity=None):
+def generate_normal_map(img_array, intensity=None, add_alpha=ADD_NORMAL_ALPHA):
     """Genera un mapa normal a partir de una imagen RGBA/RGB."""
     if intensity is None:
         intensity = PBR_INTENSITY
@@ -631,13 +746,21 @@ def generate_normal_map(img_array, intensity=None):
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
 
     gray = gray.astype(np.float32) / 255.0
-    gray = ndimage.gaussian_filter(gray, sigma=1)
+    height, width = gray.shape
+    sigma = 1.0 if max(height, width) > 256 else 0.6
+    gray = ndimage.gaussian_filter(gray, sigma=sigma)
 
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
 
     gx *= intensity
     gy *= intensity
+
+    magnitude = np.sqrt(gx * gx + gy * gy)
+    clip_value = np.percentile(magnitude, 99) if magnitude.size else 0
+    if clip_value > 0:
+        gx = np.clip(gx, -clip_value, clip_value)
+        gy = np.clip(gy, -clip_value, clip_value)
 
     gz = np.ones_like(gray)
     normal = np.dstack((gx, gy, gz))
@@ -646,47 +769,265 @@ def generate_normal_map(img_array, intensity=None):
     normal = normal / norm
 
     normal = (normal + 1.0) * 127.5
-    return normal.astype(np.uint8)
+    normal = np.clip(normal, 0, 255).astype(np.uint8)
+
+    if add_alpha:
+        alpha_channel = np.full((height, width, 1), 255, dtype=np.uint8)
+        normal = np.concatenate((normal, alpha_channel), axis=2)
+
+    return normal
 
 
-def generate_specular_map(img_array, sharpness=None):
-    """Genera un mapa specular resaltando zonas de alta frecuencia."""
+def generate_specular_map(img_array, sharpness=None, alpha_cutoff=ALPHA_CUTOFF_SPEC):
+    """Genera un mapa specular que respeta transparencias y realza detalles físicos."""
     if sharpness is None:
         sharpness = SPECULAR_SHARPNESS
 
     if img_array.shape[2] == 4:
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGBA2GRAY)
+        rgb = img_array[:, :, :3]
+        alpha_channel = img_array[:, :, 3]
     else:
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        rgb = img_array
+        alpha_channel = np.full(rgb.shape[:2], 255, dtype=np.uint8)
 
-    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
-    laplacian = np.abs(laplacian)
+    if alpha_cutoff is None:
+        alpha_cutoff = ALPHA_CUTOFF_SPEC
 
-    specular = cv2.normalize(laplacian, None, 0, 255, cv2.NORM_MINMAX)
-    specular = np.clip(specular * sharpness, 0, 255).astype(np.uint8)
+    alpha_mask = alpha_channel > alpha_cutoff
 
-    return np.dstack([specular, specular, specular])
+    rgb_norm = rgb.astype(np.float32) / 255.0
+    rgb_lin = np.power(rgb_norm, 2.2)
+    luminance = (
+        0.2126 * rgb_lin[:, :, 0]
+        + 0.7152 * rgb_lin[:, :, 1]
+        + 0.0722 * rgb_lin[:, :, 2]
+    )
+
+    laplacian = cv2.Laplacian(luminance, cv2.CV_32F, ksize=3)
+    sobelx = cv2.Sobel(luminance, cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(luminance, cv2.CV_32F, 0, 1, ksize=3)
+    edges = np.abs(laplacian) + 0.5 * (np.abs(sobelx) + np.abs(sobely))
+    edges = cv2.bilateralFilter(edges.astype(np.float32), 9, 75, 75)
+    edges = np.clip(edges, 0.0, None)
+    if np.any(edges):
+        edges = cv2.normalize(edges, None, 0.0, 1.0, cv2.NORM_MINMAX)
+
+    specular_intensity = np.clip(edges * luminance * sharpness, 0.0, 1.0)
+    specular_values = np.power(specular_intensity, 1 / 2.2)
+    specular_values = np.clip(specular_values * 255.0, 0, 255).astype(np.uint8)
+
+    specular_rgb = np.dstack([specular_values] * 3)
+    specular_rgb[~alpha_mask] = 0
+
+    base_alpha = alpha_channel.astype(np.float32) / 255.0
+    spec_alpha_float = (specular_values.astype(np.float32) / 255.0) * base_alpha
+    specular_alpha = np.clip(spec_alpha_float * 255.0, 0, 255).astype(np.uint8)
+    specular_alpha[~alpha_mask] = 0
+
+    specular_map = np.dstack([specular_rgb, specular_alpha])
+    specular_map[~alpha_mask] = 0
+
+    return specular_map
 
 
-def generate_emissive_map(img_array, base_name, class_data=None):
-    """Genera un mapa emissive basado en zonas brillantes y nombre base."""
-    rgb_array = img_array[:, :, :3] if img_array.shape[2] == 4 else img_array
+def _rotate_normalized_points(points, rotation_key):
+    if rotation_key == "rot0":
+        return points
 
-    emissive = np.zeros_like(rgb_array)
+    rotate_func = ROT_POINT_FUNCS.get(rotation_key)
+    if rotate_func is None:
+        return points
 
-    hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV)
-    brightness = hsv[:, :, 2]
-    bright_mask = brightness > 200
+    return np.array([rotate_func(float(x), float(y)) for x, y in points], dtype=np.float32)
 
-    lower_name = base_name.lower()
-    if "eyes" in lower_name:
-        emissive[bright_mask] = [255, 100, 50]
-    elif "wings" in lower_name or "ala" in lower_name:
-        emissive[bright_mask] = [50, 100, 255]
-    elif "cristal" in lower_name or "crystal" in lower_name:
-        emissive[bright_mask] = [50, 255, 100]
+
+def _normalized_to_pixel(points, width, height):
+    points = np.asarray(points, dtype=np.float32)
+    points = np.clip(points, 0.0, 1.0)
+    x_coords = np.clip(np.round(points[:, 0] * (width - 1)), 0, width - 1).astype(np.int32)
+    y_coords = np.clip(np.round(points[:, 1] * (height - 1)), 0, height - 1).astype(np.int32)
+    return np.stack((x_coords, y_coords), axis=1)
+
+
+def _rotate_bbox(bbox, rotation_key):
+    if not bbox or len(bbox) != 4:
+        return None
+
+    x_min, y_min, x_max, y_max = bbox
+    corners = np.array(
+        [
+            [x_min, y_min],
+            [x_max, y_min],
+            [x_max, y_max],
+            [x_min, y_max],
+        ],
+        dtype=np.float32,
+    )
+
+    rotated = _rotate_normalized_points(corners, rotation_key)
+    if rotated.size == 0:
+        return None
+
+    x_vals = rotated[:, 0]
+    y_vals = rotated[:, 1]
+
+    return [
+        float(np.clip(np.min(x_vals), 0.0, 1.0)),
+        float(np.clip(np.min(y_vals), 0.0, 1.0)),
+        float(np.clip(np.max(x_vals), 0.0, 1.0)),
+        float(np.clip(np.max(y_vals), 0.0, 1.0)),
+    ]
+
+
+def generate_emissive_map(
+    img_array,
+    base_name,
+    class_data=None,
+    rotation_suffix="rot0",
+    emissive_alpha_core=EMISSIVE_ALPHA_CORE,
+    emissive_ring_ratio=EMISSIVE_ALPHA_RING_RATIO,
+):
+    """Genera un mapa emissive con fondo transparente y detección adaptativa de brillos."""
+    if img_array.shape[2] == 4:
+        rgb = img_array[:, :, :3]
+        alpha_channel = img_array[:, :, 3]
     else:
-        emissive[bright_mask] = [255, 255, 255]
+        rgb = img_array
+        alpha_channel = np.full(rgb.shape[:2], 255, dtype=np.uint8)
+
+    height, width = rgb.shape[:2]
+    emissive = np.zeros((height, width, 4), dtype=np.uint8)
+    emissive_rgb = emissive[:, :, :3]
+    emissive_alpha = emissive[:, :, 3]
+
+    valid_pixels = alpha_channel > 0
+    emissive_alpha[:] = EMISSIVE_ALPHA_BACKGROUND
+    emissive_alpha[valid_pixels] = EMISSIVE_ALPHA_NON_TARGET
+
+    class_masks = {}
+    if class_data:
+        for obj in class_data:
+            obj_class = (obj.get("class") or "").lower()
+            if obj_class not in {"eyes", "wings"}:
+                continue
+
+            polygon = obj.get("polygon") or []
+            if len(polygon) < 3:
+                continue
+
+            polygon = np.array(polygon, dtype=np.float32)
+            rotated_polygon = _rotate_normalized_points(polygon, rotation_suffix)
+            pixel_points = _normalized_to_pixel(rotated_polygon, width, height)
+            if pixel_points.size == 0:
+                continue
+
+            obj_mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.fillPoly(obj_mask, [pixel_points.reshape(-1, 1, 2)], 255)
+
+            bbox = obj.get("bbox")
+            rotated_bbox = _rotate_bbox(bbox, rotation_suffix)
+            if rotated_bbox:
+                x_min = int(np.floor(rotated_bbox[0] * (width - 1)))
+                y_min = int(np.floor(rotated_bbox[1] * (height - 1)))
+                x_max = int(np.ceil(rotated_bbox[2] * (width - 1)))
+                y_max = int(np.ceil(rotated_bbox[3] * (height - 1)))
+
+                x_min = int(np.clip(x_min, 0, width - 1))
+                y_min = int(np.clip(y_min, 0, height - 1))
+                x_max = int(np.clip(x_max, 0, width - 1))
+                y_max = int(np.clip(y_max, 0, height - 1))
+
+                mask_crop = np.zeros_like(obj_mask)
+                if x_min <= x_max and y_min <= y_max:
+                    mask_crop[y_min : y_max + 1, x_min : x_max + 1] = obj_mask[
+                        y_min : y_max + 1, x_min : x_max + 1
+                    ]
+                    obj_mask = mask_crop
+
+            obj_mask = (obj_mask > 0) & valid_pixels
+            if not np.any(obj_mask):
+                continue
+
+            if obj_class not in class_masks:
+                class_masks[obj_class] = np.zeros((height, width), dtype=bool)
+
+            class_masks[obj_class] |= obj_mask
+
+    ring_alpha_value = int(np.clip(emissive_alpha_core * emissive_ring_ratio, 0, 255))
+
+    if class_masks:
+        for obj_class, mask in class_masks.items():
+            if not np.any(mask):
+                continue
+
+            if obj_class == "eyes":
+                color = EMISSIVE_COLOR_EYES
+            else:
+                color = EMISSIVE_COLOR_WINGS
+
+            emissive_rgb[mask] = np.array(color[:3], dtype=np.uint8)
+            emissive_alpha[mask] = emissive_alpha_core
+
+            kernel = np.ones((3, 3), np.uint8)
+            core_uint8 = mask.astype(np.uint8)
+            ring = cv2.dilate(core_uint8, kernel, iterations=1).astype(bool) & ~mask & valid_pixels
+            if np.any(ring):
+                emissive_rgb[ring] = np.array(color[:3], dtype=np.uint8)
+                emissive_alpha[ring] = np.maximum(emissive_alpha[ring], ring_alpha_value)
+
+        emissive[alpha_channel == 0] = 0
+        return emissive
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    if np.any(valid_pixels):
+        p90 = np.percentile(gray[valid_pixels], 90)
+    else:
+        p90 = 0
+
+    threshold = 0.6 * p90 + 0.4 * 220
+    bright_mask = (gray >= threshold) & valid_pixels
+
+    if np.any(bright_mask):
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            bright_mask.astype(np.uint8), connectivity=8
+        )
+
+        min_component_size = max(4, int(height * width * EMISSIVE_MIN_COMPONENT_PCT))
+        final_mask = np.zeros_like(bright_mask, dtype=bool)
+
+        for label_idx in range(1, num_labels):
+            if stats[label_idx, cv2.CC_STAT_AREA] >= min_component_size:
+                final_mask[labels == label_idx] = True
+
+        final_mask &= valid_pixels
+    else:
+        final_mask = np.zeros_like(valid_pixels, dtype=bool)
+
+    if not np.any(final_mask):
+        emissive[alpha_channel == 0] = 0
+        return emissive
+
+    lower_name = (base_name or "").lower()
+    if "eyes" in lower_name or "eye" in lower_name:
+        emissive_color = EMISSIVE_COLOR_EYES
+    elif "wing" in lower_name or "ala" in lower_name:
+        emissive_color = EMISSIVE_COLOR_WINGS
+    elif "crystal" in lower_name or "cristal" in lower_name or "glow" in lower_name:
+        emissive_color = (80, 255, 120, 255)
+    else:
+        emissive_color = (255, 255, 255, 255)
+
+    emissive_rgb[final_mask] = np.array(emissive_color[:3], dtype=np.uint8)
+    emissive_alpha[final_mask] = emissive_alpha_core
+
+    kernel = np.ones((3, 3), np.uint8)
+    core_uint8 = final_mask.astype(np.uint8)
+    ring = cv2.dilate(core_uint8, kernel, iterations=1).astype(bool) & ~final_mask & valid_pixels
+    if np.any(ring):
+        emissive_rgb[ring] = np.array(emissive_color[:3], dtype=np.uint8)
+        emissive_alpha[ring] = np.maximum(emissive_alpha[ring], ring_alpha_value)
+
+    emissive[alpha_channel == 0] = 0
 
     return emissive
 
@@ -698,13 +1039,17 @@ def save_pbr_maps(result_img, output_name, variants_dir):
     else:
         img_array = np.array(result_img.convert("RGBA"))
 
-    base_name = Path(output_name).stem
-    for suffix in ["_color", "_rot90", "_rot180", "_rot270"]:
-        base_name = base_name.replace(suffix, "")
+    base_name, rotation_suffix = _parse_variant_metadata(output_name)
+    class_data = _get_polygon_objects(base_name)
 
     normal_map = generate_normal_map(img_array, intensity=PBR_INTENSITY)
     specular_map = generate_specular_map(img_array, sharpness=SPECULAR_SHARPNESS)
-    emissive_map = generate_emissive_map(img_array, base_name)
+    emissive_map = generate_emissive_map(
+        img_array,
+        base_name,
+        class_data=class_data,
+        rotation_suffix=rotation_suffix,
+    )
 
     variants_path = Path(variants_dir)
     pbr_dir = variants_path / "pbr_maps"
@@ -717,17 +1062,44 @@ def save_pbr_maps(result_img, output_name, variants_dir):
     specular_filename = f"{stem}_specular{suffix}"
     emissive_filename = f"{stem}_emissive{suffix}"
 
+    normal_map = np.ascontiguousarray(normal_map)
+    if normal_map.shape[2] == 3:
+        normal_out = cv2.cvtColor(normal_map, cv2.COLOR_RGB2BGR)
+    else:
+        normal_out = cv2.cvtColor(normal_map, cv2.COLOR_RGBA2BGRA)
+    normal_out = np.ascontiguousarray(normal_out)
+
     cv2.imwrite(
         str(pbr_dir / normal_filename),
-        cv2.cvtColor(normal_map, cv2.COLOR_RGB2BGR),
+        normal_out,
+        PNG_PARAMS,
     )
+
+    if specular_map.shape[2] == 3:
+        alpha_full = np.full(specular_map.shape[:2], 255, dtype=np.uint8)
+        specular_map = np.dstack([specular_map, alpha_full])
+    if emissive_map.shape[2] == 3:
+        alpha_full = np.full(emissive_map.shape[:2], 255, dtype=np.uint8)
+        emissive_map = np.dstack([emissive_map, alpha_full])
+
+    specular_map = np.ascontiguousarray(specular_map)
+    emissive_map = np.ascontiguousarray(emissive_map)
+
+    specular_bgra = cv2.cvtColor(specular_map, cv2.COLOR_RGBA2BGRA)
+    emissive_bgra = cv2.cvtColor(emissive_map, cv2.COLOR_RGBA2BGRA)
+
+    specular_bgra = np.ascontiguousarray(specular_bgra)
+    emissive_bgra = np.ascontiguousarray(emissive_bgra)
+
     cv2.imwrite(
         str(pbr_dir / specular_filename),
-        cv2.cvtColor(specular_map, cv2.COLOR_RGB2BGR),
+        specular_bgra,
+        PNG_PARAMS,
     )
     cv2.imwrite(
         str(pbr_dir / emissive_filename),
-        cv2.cvtColor(emissive_map, cv2.COLOR_RGB2BGR),
+        emissive_bgra,
+        PNG_PARAMS,
     )
 
     return [normal_filename, specular_filename, emissive_filename]
