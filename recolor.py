@@ -26,42 +26,52 @@ except ImportError:
 CONFIG = {
     "MIN_COLOR": 100,
     "INPUT_DIR": "input",
-    "OUTPUT_DIR": "variants", 
+    "OUTPUT_DIR": "variants",
     "COLORS_JSON": "colors.json",
+
     "MAX_DOMINANT_COLORS": 30,
     "MAX_VARIATIONS_PER_COLOR": 40,
     "MIN_VARIATIONS_PER_COLOR": 15,
     "COLOR_RANGE": {"min": 5, "max": 253},
     "ALPHA_RANGE": {"min": 0.08, "max": 0.98},
     "INTENSITY_VARIATION_RANGE": {"min": 0.5, "max": 1.8},
-    "SAMPLING_THRESHOLD": 80000,
-    "BUCKET_SIZE": 14,
+
+    # 🔥 mayor sampling por lote, mejora throughput con NVMe
+    "SAMPLING_THRESHOLD": 200000,
+    "BUCKET_SIZE": 28,
+
     "VALID_EXTENSIONS": {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"},
     "USE_REAL_BACKGROUNDS_ONLY": True,
     "BACKGROUNDS_DIR": "backgrounds",
+
     "PRESERVE_BRIGHTNESS": False,
     "USE_HLS_METHOD": True,
     "GENERATE_ROTATIONS": True,
     "ROTATION_ANGLES": [0, 90, 180, 270],
+
     "MIN_COLOR_DIFFERENCE": 8.0,
     "HUE_VARIATION_RANGE": [-0.3, 0.3],
     "SATURATION_VARIATION_RANGE": [-0.7, 0.7],
     "LIGHTNESS_VARIATION_RANGE": [-0.5, 0.5],
-    "MAX_GENERATION_ATTEMPTS": 1500,
+    "MAX_GENERATION_ATTEMPTS": 1000,  # ⚡ menor retry, ahorra CPU
+
     "SIMILARITY_THRESHOLD": 0.85,
     "ENSURE_MIN_VARIATIONS": True,
     "RANDOM_COLOR_PROBABILITY": 0.3,
     "CROSS_COLOR_MIXING": True,
-    "MAX_COLOR_MIXES": 128,
-    "NOISE_INTENSITY": 0.1,
-    "MAX_WORKERS": 10,
-    "CHUNK_SIZE": 1000,
+    "MAX_COLOR_MIXES": 256,  # doblado para explotar RAM sin swapping
+    "NOISE_INTENSITY": 0.08,
+
+    # ⚙️ Paralelismo agresivo
+    "MAX_WORKERS": 12,             # un hilo por logical core
+    "CHUNK_SIZE": 2500,            # lotes grandes = menos overhead
     "MEMORY_MONITORING": True,
-    "MAX_MEMORY_PERCENT": 95,
+    "MAX_MEMORY_PERCENT": 93,      # deja 7% margen OS
     "AUTO_ADJUST_CHUNKS": True,
-    "TARGET_MEMORY_GB": 13.0,
-    "MEMORY_PER_IMAGE_MB": 4.0,
+    "TARGET_MEMORY_GB": 13.5,      # todo lo que aguanta tu RAM sin swap
+    "MEMORY_PER_IMAGE_MB": 3.2,    # estimado realista (fue 4.0)
 }
+
 
 GENERATE_PBR_MAPS = True
 USE_BACKGROUND_MATERIALS = True

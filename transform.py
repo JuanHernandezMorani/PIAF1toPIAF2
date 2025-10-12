@@ -99,7 +99,7 @@ def convert_gui_to_yolo_segmentation(gui_data):
 
             class_name = obj.get("class_name", "unknown")
             class_id = obj.get("class_id", CLASS_MAP.get(class_name, -1))
-            layer_id = obj.get("layer_id", LAYER_MAP.get(layer, -1))
+            #layer_id = obj.get("layer_id", LAYER_MAP.get(layer, -1))
             polygon_points = obj.get("polygon", [])
             
             # Validar que tenemos un polígono válido (mínimo 3 puntos)
@@ -121,7 +121,7 @@ def convert_gui_to_yolo_segmentation(gui_data):
 
             rows.append({
                 "file_name": file_name,
-                "layer_id": layer_id,
+                #"layer_id": layer_id,
                 "layer": layer,
                 "class_id": class_id,
                 "class_name": class_name,
@@ -238,9 +238,9 @@ def transform():
             if detected_layer_id > 0:
                 base_variant_filename = (
                     file.name
-                    .replace("_normal", "")
-                    .replace("_specular", "")
-                    .replace("_emissive", "")
+                    .replace("_n", "")
+                    .replace("_s", "")
+                    .replace("_e", "")
                 )
                 base_lookup_name = Path(base_variant_filename).stem
             else:
@@ -286,7 +286,7 @@ def transform():
 
                 class_name = obj.get("class_name", "unknown")
                 class_id = obj.get("class_id", CLASS_MAP.get(class_name, -1))
-                object_layer_id = obj.get("layer_id", LAYER_MAP.get(base_layer, -1))
+                #object_layer_id = obj.get("layer_id", LAYER_MAP.get(base_layer, -1))
                 polygon_points = obj.get("polygon", [])
 
                 if len(polygon_points) < 3:
@@ -320,7 +320,7 @@ def transform():
 
                 rows.append({
                     "file_name": relative_file_name,
-                    "layer_id": detected_layer_id if detected_layer_id > 0 else object_layer_id,
+                    #"layer_id": detected_layer_id if detected_layer_id > 0 else object_layer_id,
                     "layer": current_layer,
                     "class_id": class_id,
                     "class_name": class_name,
@@ -363,7 +363,7 @@ def transform():
         return
 
     # Reorganizar columnas para mejor legibilidad
-    column_order = ["file_name", "layer_id", "layer", "class_id", "class_name", "polygon", "bbox"]
+    column_order = ["file_name", "layer", "class_id", "class_name", "polygon", "bbox"]#["file_name", "layer_id", "layer", "class_id", "class_name", "polygon", "bbox"]
     df = df[column_order]
 
     # --- Guardar dataset final ---

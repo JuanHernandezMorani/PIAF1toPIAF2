@@ -19,12 +19,12 @@ def convert_jsonl_to_yolo_txt(jsonl_path, output_dir):
             if base_name not in image_annotations:
                 image_annotations[base_name] = []
             
-            layer_id = item['layer_id']
+            #layer_id = item['layer_id']
             class_id = item['class_id']
             polygon = item['polygon']
             
             # Formato YOLO: class_id x1 y1 x2 y2 ... xn yn
-            annotation_line = [str(layer_id)] + [str(class_id)] + [str(coord) for coord in polygon]
+            annotation_line = [str(class_id)] + [str(coord) for coord in polygon] #[str(layer_id)] + 
             image_annotations[base_name].append(" ".join(annotation_line))
     
     # Escribir archivos TXT
