@@ -8,9 +8,8 @@ import numpy as np
 from colorsys import rgb_to_hls, hls_to_rgb
 from collections import defaultdict
 import platform
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 import multiprocessing as mp
-import psutil
 import gc
 import cv2
 from scipy import ndimage
@@ -53,7 +52,7 @@ CONFIG = {
     "HUE_VARIATION_RANGE": [-0.3, 0.3],
     "SATURATION_VARIATION_RANGE": [-0.7, 0.7],
     "LIGHTNESS_VARIATION_RANGE": [-0.5, 0.5],
-    "MAX_GENERATION_ATTEMPTS": 1000,  # ⚡ menor retry, ahorra CPU
+    "MAX_GENERATION_ATTEMPTS": 800,   # baja latencia
 
     "SIMILARITY_THRESHOLD": 0.85,
     "ENSURE_MIN_VARIATIONS": True,
@@ -62,14 +61,20 @@ CONFIG = {
     "MAX_COLOR_MIXES": 256,  # doblado para explotar RAM sin swapping
     "NOISE_INTENSITY": 0.08,
 
-    # ⚙️ Paralelismo agresivo
-    "MAX_WORKERS": 12,             # un hilo por logical core
-    "CHUNK_SIZE": 2500,            # lotes grandes = menos overhead
-    "MEMORY_MONITORING": True,
-    "MAX_MEMORY_PERCENT": 93,      # deja 7% margen OS
-    "AUTO_ADJUST_CHUNKS": True,
-    "TARGET_MEMORY_GB": 13.5,      # todo lo que aguanta tu RAM sin swap
-    "MEMORY_PER_IMAGE_MB": 3.2,    # estimado realista (fue 4.0)
+    # ⚡ Nuevo: Paralelismo real y mayor control
+    "MAX_WORKERS": 12,
+    "CHUNK_SIZE": 2000,
+    "MEMORY_MONITORING": False,
+    "AUTO_ADJUST_CHUNKS": False,
+    "TARGET_MEMORY_GB": 13.5,
+    "MAX_MEMORY_PERCENT": 94,
+    "MEMORY_PER_IMAGE_MB": 3.2,
+
+    # ⚡ Nuevo: Paralelismo agresivo por rotaciones y colores
+    "PARALLEL_ROTATIONS": True,
+    "PARALLEL_COLORS": True,
+    "MAX_ROTATION_WORKERS": 4,
+    "MAX_COLOR_WORKERS": 8,
 }
 
 
@@ -930,114 +935,208 @@ def generate_enhanced_pbr_maps(
     return final_normal, final_specular, emissive_map
 
 
-def process_rotated_image(rot_img, base_name, rot_suffix, colors, output_dir):
+def process_single_color(args):
+    """Procesa un solo color en paralelo"""
+    (
+        color_idx,
+        base_color,
+        img_array,
+        dominant_colors,
+        color_variations,
+        base_name,
+        rot_suffix,
+        output_dir,
+    ) = args
+
+    try:
+        color_mapping = {}
+        for i, original_color in enumerate(dominant_colors):
+            if CONFIG["CROSS_COLOR_MIXING"] and len(color_variations) > 1:
+                base_variation = color_variations[i % len(color_variations)]
+                if random.random() < 0.4:
+                    other_variation = color_variations[
+                        (i + random.randint(1, len(color_variations) - 1))
+                        % len(color_variations)
+                    ]
+                    mix_ratio = random.uniform(0.2, 0.8)
+                    color_mapping[original_color] = mix_colors(
+                        base_variation, other_variation, mix_ratio
+                    )
+                else:
+                    color_mapping[original_color] = base_variation
+            else:
+                color_mapping[original_color] = color_variations[
+                    i % len(color_variations)
+                ]
+
+        new_array = img_array.copy()
+
+        for y in range(img_array.shape[0]):
+            for x in range(img_array.shape[1]):
+                original_pixel = img_array[y, x]
+
+                if len(original_pixel) == 4 and original_pixel[3] == 0:
+                    continue
+
+                if len(original_pixel) >= 3:
+                    original_rgb = tuple(original_pixel[:3])
+
+                    closest_color = min(
+                        dominant_colors,
+                        key=lambda c: sum((a - b) ** 2 for a, b in zip(original_rgb, c[:3])),
+                    )
+
+                    if closest_color in color_mapping:
+                        target_variation = color_mapping[closest_color]
+                        new_pixel = apply_color_preserving_brightness(
+                            original_pixel, target_variation
+                        )
+                        new_array[y, x] = new_pixel
+
+        if rot_suffix:
+            output_name = f"{base_name}{rot_suffix}_color{color_idx+1:03d}.png"
+        else:
+            output_name = f"{base_name}_color{color_idx+1:03d}.png"
+
+        result_img = Image.fromarray(new_array.astype("uint8"), "RGBA")
+        bg = get_random_background(result_img.size)
+        bg = adjust_background_contrast(bg, result_img)
+        final_img = Image.alpha_composite(bg.convert("RGBA"), result_img)
+        output_path = os.path.join(output_dir, output_name)
+        final_img.save(output_path, optimize=True)
+
+        if GENERATE_PBR_MAPS:
+            try:
+                save_pbr_maps(result_img, output_name, output_dir)
+            except Exception as pbr_error:
+                logging.error(
+                    f"Error generando mapas PBR para {output_name}: {pbr_error}"
+                )
+
+        del new_array, result_img, final_img, bg
+        gc.collect()
+
+        return output_name
+
+    except Exception as e:
+        logging.error(
+            f"Error procesando color {color_idx} para {base_name}{rot_suffix}: {str(e)}"
+        )
+        return None
+
+
+def process_rotation_parallel(args):
+    """Procesa una rotación completa en paralelo con todos sus colores"""
+    rot_img, base_name, rot_suffix, colors, output_dir = args
+
     try:
         rot_img = rot_img.convert("RGBA")
         img_array = np.array(rot_img)
 
-        dominant_colors = get_dominant_colors(rot_img, CONFIG["MAX_DOMINANT_COLORS"])
+        dominant_colors = get_dominant_colors(
+            rot_img, CONFIG["MAX_DOMINANT_COLORS"]
+        )
         num_dominant_colors = len(dominant_colors)
 
-        logging.info(f"Procesando rotación {rot_suffix} - {num_dominant_colors} colores dominantes")
+        logging.info(
+            f"Iniciando procesamiento paralelo de rotación {rot_suffix} - {num_dominant_colors} colores dominantes"
+        )
 
-        generated_images = []
-
+        color_tasks = []
         for color_idx, base_color in enumerate(colors):
             color_variations = generate_high_variation_colors(
-                base_color,
-                CONFIG["MAX_VARIATIONS_PER_COLOR"],
-                colors
+                base_color, CONFIG["MAX_VARIATIONS_PER_COLOR"], colors
             )
 
-            color_mapping = {}
-            for i, original_color in enumerate(dominant_colors):
-                if CONFIG["CROSS_COLOR_MIXING"] and len(color_variations) > 1:
-                    base_variation = color_variations[i % len(color_variations)]
-                    if random.random() < 0.4:
-                        other_variation = color_variations[(i + random.randint(1, len(color_variations)-1)) % len(color_variations)]
-                        mix_ratio = random.uniform(0.2, 0.8)
-                        color_mapping[original_color] = mix_colors(base_variation, other_variation, mix_ratio)
-                    else:
-                        color_mapping[original_color] = base_variation
-                else:
-                    color_mapping[original_color] = color_variations[i % len(color_variations)]
+            color_tasks.append(
+                (
+                    color_idx,
+                    base_color,
+                    img_array,
+                    dominant_colors,
+                    color_variations,
+                    base_name,
+                    rot_suffix,
+                    output_dir,
+                )
+            )
 
-            new_array = img_array.copy()
+        generated_count = 0
+        if CONFIG["PARALLEL_COLORS"] and len(color_tasks) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(CONFIG["MAX_COLOR_WORKERS"], len(color_tasks))
+            ) as executor:
+                futures = [executor.submit(process_single_color, task) for task in color_tasks]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        generated_count += 1
+        else:
+            for task in color_tasks:
+                result = process_single_color(task)
+                if result:
+                    generated_count += 1
 
-            for y in range(img_array.shape[0]):
-                for x in range(img_array.shape[1]):
-                    original_pixel = img_array[y, x]
+        logging.info(
+            f"Completadas {generated_count} variantes para rotación {rot_suffix}"
+        )
 
-                    if len(original_pixel) == 4 and original_pixel[3] == 0:
-                        continue
-
-                    if len(original_pixel) >= 3:
-                        original_rgb = tuple(original_pixel[:3])
-
-                        closest_color = min(
-                            dominant_colors,
-                            key=lambda c: sum(
-                                (a - b) ** 2 for a, b in zip(original_rgb, c[:3])
-                            ),
-                        )
-
-                        if closest_color in color_mapping:
-                            target_variation = color_mapping[closest_color]
-                            new_pixel = apply_color_preserving_brightness(
-                                original_pixel, target_variation
-                            )
-                            new_array[y, x] = new_pixel
-
-            if rot_suffix:
-                output_name = f"{base_name}{rot_suffix}_color{color_idx+1:03d}.png"
-            else:
-                output_name = f"{base_name}_color{color_idx+1:03d}.png"
-
-            generated_images.append((new_array, output_name))
-
-        for img_array, output_name in generated_images:
-            result_img = Image.fromarray(img_array.astype("uint8"), "RGBA")
-
-            bg = get_random_background(result_img.size)
-            bg = adjust_background_contrast(bg, result_img)
-
-            final_img = Image.alpha_composite(bg.convert("RGBA"), result_img)
-            output_path = os.path.join(output_dir, output_name)
-            final_img.save(output_path, optimize=True)
-
-            if GENERATE_PBR_MAPS:
-                try:
-                    save_pbr_maps(result_img, output_name, output_dir)
-                except Exception as pbr_error:
-                    logging.error(
-                        f"Error generando mapas PBR para {output_name}: {pbr_error}",
-                        exc_info=True,
-                    )
-
-        logging.info(f"Generadas {len(generated_images)} variantes para rotación {rot_suffix}")
-
-        # Liberar memoria explícitamente
-        del img_array, new_array, generated_images
+        del img_array, color_tasks
         gc.collect()
 
+        return f"Rotación {rot_suffix}: {generated_count} variantes"
+
     except Exception as e:
-        logging.error(f"Error procesando rotación {rot_suffix}: {str(e)}", exc_info=True)
+        logging.error(
+            f"Error procesando rotación {rot_suffix}: {str(e)}", exc_info=True
+        )
+        return f"Error en rotación {rot_suffix}: {str(e)}"
+
 
 def process_single_image(args):
     image_path, colors, output_dir = args
-    
+
     try:
         with Image.open(image_path) as img:
             base_name = os.path.splitext(os.path.basename(image_path))[0]
 
             if CONFIG["GENERATE_ROTATIONS"]:
                 rotations = generate_rotations(img)
-                for rot_suffix, rot_img in rotations.items():
-                    process_rotated_image(rot_img, base_name, rot_suffix, colors, output_dir)
-            else:
-                process_rotated_image(img, base_name, "", colors, output_dir)
 
-            return f"Completada: {base_name}"
+                if CONFIG["PARALLEL_ROTATIONS"] and len(rotations) > 1:
+                    rotation_tasks = []
+                    for rot_suffix, rot_img in rotations.items():
+                        rotation_tasks.append(
+                            (rot_img, base_name, rot_suffix, colors, output_dir)
+                        )
+
+                    with ThreadPoolExecutor(
+                        max_workers=min(
+                            CONFIG["MAX_ROTATION_WORKERS"], len(rotations)
+                        )
+                    ) as executor:
+                        futures = [
+                            executor.submit(process_rotation_parallel, task)
+                            for task in rotation_tasks
+                        ]
+                        results = []
+                        for future in as_completed(futures):
+                            results.append(future.result())
+
+                        return f"Completada: {base_name} - {' | '.join(results)}"
+                else:
+                    results = []
+                    for rot_suffix, rot_img in rotations.items():
+                        result = process_rotation_parallel(
+                            (rot_img, base_name, rot_suffix, colors, output_dir)
+                        )
+                        results.append(result)
+                    return f"Completada: {base_name} - {' | '.join(results)}"
+            else:
+                result = process_rotation_parallel(
+                    (img, base_name, "", colors, output_dir)
+                )
+                return f"Completada: {base_name} - {result}"
 
     except Exception as e:
         return f"Error en {image_path}: {str(e)}"
@@ -1053,43 +1152,6 @@ def process_image_batch(image_batch, colors, output_dir):
         
     return results
 
-def safe_process_image_batch(image_batch, colors, output_dir):
-    if CONFIG["MEMORY_MONITORING"]:
-        memory_percent = psutil.virtual_memory().percent
-        if memory_percent > CONFIG["MAX_MEMORY_PERCENT"]:
-            reduced_batch = image_batch[:len(image_batch)//2]
-            logging.warning(f"Memoria alta ({memory_percent}%), reduciendo chunk a {len(reduced_batch)} imágenes")
-            return process_image_batch(reduced_batch, colors, output_dir)
-    
-    return process_image_batch(image_batch, colors, output_dir)
-
-def calculate_dynamic_chunk_size(total_images, max_workers):
-    # Usar el mínimo entre memoria disponible y TARGET_MEMORY_GB
-    available_memory = min(
-        CONFIG["TARGET_MEMORY_GB"], 
-        psutil.virtual_memory().available / (1024**3)
-    )
-    
-    memory_per_image = CONFIG["MEMORY_PER_IMAGE_MB"] / 1024  # Convertir MB a GB
-    max_chunk_by_memory = int((available_memory * 0.8) / (memory_per_image * max_workers))
-    
-    # También considerar límite por número de imágenes
-    dynamic_chunk = min(CONFIG["CHUNK_SIZE"], max_chunk_by_memory, total_images)
-    
-    logging.info(f"Chunk size dinámico: {dynamic_chunk} (memoria objetivo: {CONFIG['TARGET_MEMORY_GB']}GB, disponible: {available_memory:.1f}GB)")
-    return max(1, dynamic_chunk)
-
-def optimize_memory_usage():
-    """Optimiza el uso de memoria del proceso actual"""
-    try:
-        import resource
-        # En sistemas Unix: aumentar límite de memoria
-        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-        new_limit = int(CONFIG["TARGET_MEMORY_GB"] * 1024**3)  # Convertir a bytes
-        resource.setrlimit(resource.RLIMIT_AS, (new_limit, hard))
-    except:
-        pass  # No disponible en Windows
-
 def main():
     if not validate_config():
         return
@@ -1098,9 +1160,6 @@ def main():
         logging.warning("colormath no disponible. Usando método alternativo")
 
     os.makedirs(CONFIG["OUTPUT_DIR"], exist_ok=True)
-
-    # Optimizar uso de memoria
-    optimize_memory_usage()
 
     base_colors = load_colors(CONFIG["COLORS_JSON"])
     if len(base_colors) < CONFIG["MIN_COLOR"]:
@@ -1111,7 +1170,9 @@ def main():
 
     logging.info(f"Total de colores: {len(base_colors)}")
     logging.info(f"Usando {CONFIG['MAX_WORKERS']} procesos paralelos")
-    logging.info(f"Objetivo de memoria: {CONFIG['TARGET_MEMORY_GB']}GB")
+    logging.info(f"Paralelismo por rotaciones: {CONFIG['PARALLEL_ROTATIONS']}")
+    logging.info(f"Paralelismo por colores: {CONFIG['PARALLEL_COLORS']}")
+    logging.info(f"Objetivo de memoria (referencia): {CONFIG['TARGET_MEMORY_GB']}GB")
 
     image_files = [
         os.path.join(CONFIG["INPUT_DIR"], f)
@@ -1124,23 +1185,23 @@ def main():
         logging.warning("No se encontraron imágenes válidas")
         return
 
-    if CONFIG["AUTO_ADJUST_CHUNKS"]:
-        dynamic_chunk_size = calculate_dynamic_chunk_size(len(image_files), CONFIG["MAX_WORKERS"])
-        chunk_size = dynamic_chunk_size
-    else:
-        chunk_size = CONFIG["CHUNK_SIZE"]
+    chunk_size = CONFIG["CHUNK_SIZE"]
 
     image_batches = [image_files[i:i + chunk_size] for i in range(0, len(image_files), chunk_size)]
 
-    logging.info(f"Procesando {len(image_files)} imágenes en {len(image_batches)} lotes")
+    logging.info(
+        f"🚀 Procesando {len(image_files)} imágenes en {len(image_batches)} lotes (chunk size: {chunk_size})"
+    )
 
     with ProcessPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
         futures = []
-        
+
         for batch in image_batches:
-            future = executor.submit(safe_process_image_batch, batch, base_colors, CONFIG["OUTPUT_DIR"])
+            future = executor.submit(
+                process_image_batch, batch, base_colors, CONFIG["OUTPUT_DIR"]
+            )
             futures.append(future)
-        
+
         completed = 0
         for future in as_completed(futures):
             batch_results = future.result()
@@ -1148,9 +1209,11 @@ def main():
                 logging.info(result)
                 completed += 1
                 progress_percent = (completed / len(image_files)) * 100
-                logging.info(f"Progreso: {completed}/{len(image_files)} imágenes ({progress_percent:.1f}%)")
+                logging.info(
+                    f"📊 Progreso: {completed}/{len(image_files)} imágenes ({progress_percent:.1f}%)"
+                )
 
-    logging.info("Procesamiento completado")
+    logging.info("✅ Procesamiento completado")
 
 def validate_config():
     errors = []
