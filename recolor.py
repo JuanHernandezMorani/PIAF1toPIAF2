@@ -2,12 +2,12 @@ import os
 import json
 import logging
 import random
+import sys
 from pathlib import Path
 from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 from colorsys import rgb_to_hls, hls_to_rgb
 from collections import defaultdict
-import platform
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 import multiprocessing as mp
 import gc
@@ -275,11 +275,64 @@ def _parse_variant_metadata(output_name):
 
     return base_key, rotation_suffix
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("processing.log", mode='w'), logging.StreamHandler()],
-)
+def remove_problematic_unicode(text):
+    import re
+
+    pattern = re.compile(r"[^\u0000-\uFFFF]")
+    return pattern.sub("", text)
+
+
+def setup_cross_platform_logging():
+    logger = logging.getLogger()
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    if sys.platform == "win32":
+        handler = logging.StreamHandler(sys.stderr)
+        try:
+            if hasattr(sys.stderr, "reconfigure"):
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            else:
+                import io
+
+                sys.stderr = io.TextIOWrapper(
+                    sys.stderr.buffer,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+        except Exception:
+            class SafeHandler(logging.StreamHandler):
+                def emit(self, record):
+                    try:
+                        msg = self.format(record)
+                        msg = remove_problematic_unicode(msg)
+                        stream = self.stream
+                        stream.write(msg + self.terminator)
+                        self.flush()
+                    except Exception:
+                        pass
+
+            handler = SafeHandler(sys.stderr)
+    else:
+        handler = logging.StreamHandler()
+
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    try:
+        file_handler = logging.FileHandler("processing.log", mode="w", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception as error:
+        logger.warning(f"No fue posible iniciar logging en archivo: {error}")
+
+
+setup_cross_platform_logging()
 
 def calculate_color_difference(color1, color2):
     if not COLOR_MATH_AVAILABLE or len(color1) < 3 or len(color2) < 3:
@@ -1045,6 +1098,317 @@ def extract_group_from_filename(filename):
     return "base"
 
 
+def calculate_image_statistics(image):
+    rgb_image = image.convert("RGB")
+    rgb_array = np.array(rgb_image, dtype=np.float32) / 255.0
+
+    brightness = float(rgb_array.mean())
+    color_diversity = float(np.mean(np.std(rgb_array, axis=(0, 1))))
+
+    gray = np.array(rgb_image.convert("L"), dtype=np.float32) / 255.0
+    gx = ndimage.sobel(gray, axis=0, mode="reflect")
+    gy = ndimage.sobel(gray, axis=1, mode="reflect")
+    texture_complexity = float(np.mean(np.hypot(gx, gy)))
+
+    return {
+        "brightness": brightness,
+        "color_diversity": color_diversity,
+        "texture_complexity": texture_complexity,
+    }
+
+
+def create_adaptive_perceptual_metrics():
+    image_profiles = {
+        "dark_image": {"contrast_tolerance": 0.15, "color_variance_threshold": 0.1},
+        "light_image": {"contrast_tolerance": 0.2, "color_variance_threshold": 0.15},
+        "monochrome": {"contrast_tolerance": 0.1, "color_variance_threshold": 0.05},
+        "colorful": {"contrast_tolerance": 0.25, "color_variance_threshold": 0.3},
+    }
+
+    def classify_profile(stats):
+        brightness = stats.get("brightness", 0.5)
+        color_diversity = stats.get("color_diversity", 0.0)
+
+        if brightness < 0.3:
+            return "dark_image"
+        if brightness > 0.7:
+            return "light_image"
+        if color_diversity < 0.1:
+            return "monochrome"
+        return "colorful"
+
+    def analyze(image_or_path):
+        if isinstance(image_or_path, (str, os.PathLike)):
+            with Image.open(image_or_path) as img:
+                stats = calculate_image_statistics(img)
+        elif isinstance(image_or_path, Image.Image):
+            stats = calculate_image_statistics(image_or_path)
+        else:
+            stats = {"brightness": 0.5, "color_diversity": 0.2, "texture_complexity": 0.1}
+
+        profile = classify_profile(stats)
+        thresholds = image_profiles.get(profile, image_profiles["colorful"]).copy()
+        thresholds.setdefault("background_variation_threshold", 0.02)
+        thresholds.setdefault("edge_strength_min", 0.05)
+
+        return {
+            "profile": profile,
+            "statistics": stats,
+            "thresholds": thresholds,
+        }
+
+    return analyze
+
+
+def extract_contrast(image):
+    gray = np.array(image.convert("L"), dtype=np.float32) / 255.0
+    return float(gray.std())
+
+
+def check_contrast_issues(variants, thresholds=None):
+    contrast_values = []
+    for path in variants:
+        try:
+            with Image.open(path) as img:
+                contrast_values.append(extract_contrast(img))
+        except Exception:
+            continue
+
+    range_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
+        "LOW_CONTRAST_RANGE",
+        {"min": 0.2, "max": 0.6},
+    )
+
+    analysis = {
+        "passed": True,
+        "reason": "",
+        "min_contrast": min(contrast_values) if contrast_values else 0.0,
+        "max_contrast": max(contrast_values) if contrast_values else 0.0,
+        "target_range": range_cfg,
+    }
+
+    if not contrast_values:
+        analysis.update({"passed": False, "reason": "No fue posible calcular contraste"})
+        return analysis
+
+    tolerance = (thresholds or {}).get("contrast_tolerance", 0.2)
+    allowed_min = range_cfg.get("min", 0.2) - tolerance
+    allowed_max = range_cfg.get("max", 0.6) + tolerance
+
+    if analysis["min_contrast"] < allowed_min or analysis["max_contrast"] > allowed_max:
+        analysis.update(
+            {
+                "passed": False,
+                "reason": (
+                    f"Contraste fuera de rango permitido ({analysis['min_contrast']:.3f}-{analysis['max_contrast']:.3f})"
+                ),
+            }
+        )
+
+    return analysis
+
+
+def check_color_issues(variants, thresholds=None):
+    variances = []
+    for path in variants:
+        try:
+            with Image.open(path) as img:
+                rgb = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+                variances.append(float(np.mean(np.var(rgb, axis=(0, 1)))))
+        except Exception:
+            continue
+
+    analysis = {
+        "passed": True,
+        "reason": "",
+        "average_variance": float(np.mean(variances)) if variances else 0.0,
+    }
+
+    if not variances:
+        analysis.update({"passed": False, "reason": "No fue posible calcular variación de color"})
+        return analysis
+
+    threshold = (thresholds or {}).get("color_variance_threshold", 0.1)
+    if analysis["average_variance"] < threshold:
+        analysis.update(
+            {
+                "passed": False,
+                "reason": (
+                    f"Variación cromática insuficiente ({analysis['average_variance']:.3f} < {threshold:.3f})"
+                ),
+            }
+        )
+
+    return analysis
+
+
+def check_group_issues(variants):
+    cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+    groups_cfg = cfg.get("VARIANT_GROUPS", {})
+    expected = cfg.get("VARIANTS_PER_GROUP")
+
+    counts = defaultdict(int)
+    for variant in variants:
+        group = extract_group_from_filename(variant)
+        counts[group] += 1
+
+    enabled_groups = [
+        name for name, meta in groups_cfg.items() if meta.get("enabled", False)
+    ]
+
+    analysis = {
+        "passed": True,
+        "reason": "",
+        "counts": dict(counts),
+        "expected": expected,
+    }
+
+    if not enabled_groups:
+        return analysis
+
+    if expected:
+        missing = [
+            group for group in enabled_groups if counts.get(group, 0) != expected
+        ]
+        if missing:
+            analysis.update(
+                {
+                    "passed": False,
+                    "reason": f"Distribución inesperada para grupos: {missing}",
+                }
+            )
+        return analysis
+
+    minimum = cfg.get("TOTAL_VARIANTS", 0) // max(len(enabled_groups), 1)
+    missing = [
+        group for group in enabled_groups if counts.get(group, 0) < minimum
+    ]
+    if missing:
+        analysis.update(
+            {
+                "passed": False,
+                "reason": f"Grupos con menos variantes de las esperadas: {missing}",
+            }
+        )
+
+    return analysis
+
+
+def check_background_issues(variants, thresholds=None):
+    color_means = []
+    for path in variants:
+        try:
+            with Image.open(path) as img:
+                rgb = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+                color_means.append(np.mean(rgb, axis=(0, 1)))
+        except Exception:
+            continue
+
+    analysis = {
+        "passed": True,
+        "reason": "",
+        "spread": float(np.mean(np.std(color_means, axis=0))) if color_means else 0.0,
+    }
+
+    if len(color_means) < 2:
+        analysis.update({"passed": False, "reason": "Fondos insuficientes para análisis"})
+        return analysis
+
+    threshold = (thresholds or {}).get("background_variation_threshold", 0.02)
+    if analysis["spread"] < threshold:
+        analysis.update(
+            {
+                "passed": False,
+                "reason": f"Variación de fondo limitada ({analysis['spread']:.3f} < {threshold:.3f})",
+            }
+        )
+
+    return analysis
+
+
+def create_diagnostic_perceptual_validator():
+    def validate_metrics_with_diagnostics(variants, adaptive_context=None):
+        thresholds = (adaptive_context or {}).get("thresholds")
+
+        diagnostics = {
+            "contrast_range": check_contrast_issues(variants, thresholds),
+            "color_distribution": check_color_issues(variants, thresholds),
+            "group_balance": check_group_issues(variants),
+            "background_variation": check_background_issues(variants, thresholds),
+        }
+
+        failed_metrics = [k for k, v in diagnostics.items() if not v["passed"]]
+
+        if failed_metrics:
+            logging.warning(
+                "Métricas fallidas: %s. Razones: %s",
+                failed_metrics,
+                [diagnostics[m]["reason"] for m in failed_metrics],
+            )
+
+        return len(failed_metrics) == 0, diagnostics
+
+    return validate_metrics_with_diagnostics
+
+
+def log_diagnostic_details(variants, base_name, rot_suffix, diagnostics, adaptive_context):
+    logging.info(
+        "Diagnóstico perceptual para %s%s - perfil %s",
+        base_name,
+        rot_suffix,
+        (adaptive_context or {}).get("profile", "desconocido"),
+    )
+    for metric, result in diagnostics.items():
+        detail = result.get("reason") or "En rango"
+        logging.info("  %s: %s", metric, detail)
+
+
+def create_health_monitor():
+    health_stats = {
+        "total_images_processed": 0,
+        "images_with_warnings": 0,
+        "common_warnings": defaultdict(int),
+        "success_rate": 0.0,
+    }
+
+    def update_health_stats(image_name, warnings):
+        health_stats["total_images_processed"] += 1
+        if warnings:
+            health_stats["images_with_warnings"] += 1
+            for warning in warnings:
+                health_stats["common_warnings"][warning] += 1
+
+        if health_stats["total_images_processed"]:
+            success = (
+                health_stats["total_images_processed"]
+                - health_stats["images_with_warnings"]
+            )
+            health_stats["success_rate"] = (success / health_stats["total_images_processed"]) * 100
+
+    def print_health_report():
+        logging.info("=== REPORTE DE SALUD DEL PROCESAMIENTO ===")
+        logging.info(
+            "Imágenes procesadas: %s",
+            health_stats["total_images_processed"],
+        )
+        logging.info(
+            "Tasa de éxito: %.1f%%",
+            health_stats["success_rate"],
+        )
+
+        if health_stats["common_warnings"]:
+            logging.info("Advertencias comunes:")
+            for warning, count in health_stats["common_warnings"].items():
+                logging.info("  - %s: %s ocurrencias", warning, count)
+
+    return update_health_stats, print_health_report
+
+
+adaptive_metric_analyzer = create_adaptive_perceptual_metrics()
+validate_metrics_with_diagnostics = create_diagnostic_perceptual_validator()
+update_health_stats, print_health_report = create_health_monitor()
+
+
 def check_contrast_distribution(generated_variants):
     """Comprueba que el contraste medio esté dentro del rango humano."""
     contrasts = []
@@ -1147,24 +1511,26 @@ def verify_group_distribution(variants):
     return all(counts.get(group, 0) >= minimum for group in enabled_groups)
 
 
-def validate_perceptual_metrics(generated_variants):
-    """Valida métricas perceptuales fundamentales de las variantes generadas."""
-    metrics = {
-        "contrast_range": check_contrast_distribution(generated_variants),
-        "color_diversity": measure_color_variance(generated_variants),
-        "edge_preservation": validate_edge_consistency(generated_variants),
-        "background_variation": analyze_background_diversity(generated_variants),
-        "group_balance": verify_group_distribution(generated_variants),
-    }
+def validate_perceptual_metrics(generated_variants, base_name=None, rot_suffix=""):
+    """Valida métricas perceptuales y devuelve diagnósticos detallados."""
+    if not generated_variants:
+        return False, {}, None
 
-    failed = [name for name, ok in metrics.items() if not ok]
-    if failed:
-        logging.debug(
-            "Métricas perceptuales no superadas: %s",
-            ", ".join(failed),
+    adaptive_context = adaptive_metric_analyzer(generated_variants[0])
+    passed, diagnostics = validate_metrics_with_diagnostics(
+        generated_variants, adaptive_context
+    )
+
+    if not passed and base_name is not None:
+        log_diagnostic_details(
+            generated_variants,
+            base_name,
+            rot_suffix,
+            diagnostics,
+            adaptive_context,
         )
 
-    return not failed
+    return passed, diagnostics, adaptive_context
 
 
 def extract_luminance_linear(img_array):
@@ -1584,8 +1950,7 @@ def generate_enhanced_pbr_maps(
     return final_normal, final_specular, emissive_map
 
 
-def process_single_color(args):
-    """Procesa un solo color aplicando el sistema perceptual de variantes."""
+def _unpack_color_args(args):
     if len(args) == 8:
         (
             color_idx,
@@ -1612,6 +1977,73 @@ def process_single_color(args):
         ) = args
     else:
         raise ValueError("Argumentos inválidos para process_single_color")
+
+    return (
+        color_idx,
+        base_color,
+        img_array,
+        dominant_colors,
+        color_variations,
+        base_name,
+        rot_suffix,
+        output_dir,
+        variant_index,
+    )
+
+
+def generate_basic_color_variants(args):
+    (
+        color_idx,
+        _,
+        img_array,
+        _,
+        _,
+        base_name,
+        rot_suffix,
+        output_dir,
+        variant_index,
+    ) = _unpack_color_args(args)
+
+    base_array = np.array(img_array, dtype=np.uint8)
+    if base_array.ndim == 2:
+        base_array = np.stack([base_array] * 4, axis=-1)
+    if base_array.shape[2] == 3:
+        basic_image = Image.fromarray(base_array, "RGB").convert("RGBA")
+    else:
+        basic_image = Image.fromarray(base_array, "RGBA")
+    output_name = generate_perceptual_filename(
+        base_name,
+        rot_suffix,
+        color_idx,
+        "fallback",
+        variant_index,
+    )
+    output_path = os.path.join(output_dir, output_name)
+    basic_image.save(output_path, optimize=True)
+    return output_path
+
+
+def fallback_output_generation(args):
+    fallback_path = generate_basic_color_variants(args)
+    logging.warning(
+        "[WARN] Usando generación básica de fallback. Las métricas perceptuales no se aplicarán."
+    )
+    return fallback_path
+
+
+def process_single_color(args):
+    """Procesa un solo color aplicando el sistema perceptual de variantes."""
+    (
+        color_idx,
+        base_color,
+        img_array,
+        dominant_colors,
+        color_variations,
+        base_name,
+        rot_suffix,
+        output_dir,
+        variant_index,
+    ) = _unpack_color_args(args)
 
     try:
         perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
@@ -1667,6 +2099,10 @@ def process_single_color(args):
 
         return output_path
 
+    except UnicodeEncodeError as error:
+        logging.error(f"Error de codificación: {error}. Usando fallback seguro.")
+        return fallback_output_generation(args)
+
     except Exception as e:
         logging.error(
             f"Error procesando color {color_idx} para {base_name}{rot_suffix}: {str(e)}",
@@ -1707,9 +2143,16 @@ def process_rotation_parallel(args):
 
         if not colors:
             logging.warning(
-                f"No hay colores base definidos para {base_name}{rot_suffix}, se omiten variantes"
+                f"[WARN] No hay colores base definidos para {base_name}{rot_suffix}, se omiten variantes"
             )
-            return f"Rotación {rot_suffix}: 0 variantes"
+            warning_msg = "[WARN] Sin colores base para generar variantes"
+            return {
+                "image": base_name,
+                "rotation": rot_suffix,
+                "message": f"Rotación {rot_suffix}: 0 variantes",
+                "warnings": [warning_msg],
+                "diagnostics": {},
+            }
 
         color_variations_pool = []
         for base_color in colors:
@@ -1761,41 +2204,86 @@ def process_rotation_parallel(args):
             f"Completadas {generated_count} variantes para rotación {rot_suffix}"
         )
 
+        warnings = []
+        diagnostics = {}
+
         if generated_variants:
             try:
-                if not validate_perceptual_metrics(generated_variants):
-                    logging.warning(
-                        "Las métricas perceptuales no se cumplieron totalmente para %s%s",
-                        base_name,
-                        rot_suffix,
-                    )
-            except Exception as metrics_error:
-                logging.warning(
-                    "No se pudieron validar métricas perceptuales para %s%s: %s",
+                validation_passed, diagnostics, adaptive_context = validate_perceptual_metrics(
+                    generated_variants,
                     base_name,
                     rot_suffix,
-                    metrics_error,
                 )
+                if not validation_passed:
+                    reasons = [diagnostics[m]["reason"] for m in diagnostics if not diagnostics[m]["passed"]]
+                    warning_msg = (
+                        "[WARN] Variantes generadas con métricas subóptimas. Continuando procesamiento para evitar pérdida de datos."
+                    )
+                    logging.warning(warning_msg)
+                    warnings.append(warning_msg)
+                    for reason in reasons:
+                        if reason:
+                            warnings.append(reason)
+                else:
+                    logging.debug(
+                        "Métricas perceptuales validadas para %s%s (perfil %s)",
+                        base_name,
+                        rot_suffix,
+                        adaptive_context.get("profile") if adaptive_context else "desconocido",
+                    )
+            except Exception as metrics_error:
+                error_msg = (
+                    f"[WARN] No se pudieron validar métricas perceptuales para {base_name}{rot_suffix}: {metrics_error}"
+                )
+                logging.warning(error_msg)
+                warnings.append(error_msg)
 
         del img_array, color_tasks
         gc.collect()
 
-        return f"Rotación {rot_suffix}: {generated_count} variantes"
+        return {
+            "image": base_name,
+            "rotation": rot_suffix,
+            "message": f"Rotación {rot_suffix}: {generated_count} variantes",
+            "warnings": warnings,
+            "diagnostics": diagnostics,
+        }
 
     except Exception as e:
-        logging.error(
-            f"Error procesando rotación {rot_suffix}: {str(e)}", exc_info=True
-        )
-        return f"Error en rotación {rot_suffix}: {str(e)}"
+        error_message = f"Error procesando rotación {rot_suffix}: {str(e)}"
+        logging.error(error_message, exc_info=True)
+        return {
+            "image": base_name,
+            "rotation": rot_suffix,
+            "message": error_message,
+            "warnings": [error_message],
+            "diagnostics": {},
+        }
+
+
+def _summarize_image_results(base_name, rotation_results):
+    messages = [result.get("message") for result in rotation_results if result]
+    summary = " | ".join(messages)
+    if summary:
+        return f"Completada: {base_name} - {summary}"
+    return f"Completada: {base_name} - sin resultados"
+
+
+def _collect_warnings(rotation_results):
+    warnings = []
+    for result in rotation_results:
+        if not result:
+            continue
+        warnings.extend(result.get("warnings", []))
+    return [warning for warning in warnings if warning]
 
 
 def process_single_image(args):
     image_path, colors, output_dir = args
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
 
     try:
         with Image.open(image_path) as img:
-            base_name = os.path.splitext(os.path.basename(image_path))[0]
-
             if CONFIG["GENERATE_ROTATIONS"]:
                 rotations = generate_rotations(img)
 
@@ -1815,27 +2303,49 @@ def process_single_image(args):
                             executor.submit(process_rotation_parallel, task)
                             for task in rotation_tasks
                         ]
-                        results = []
+                        rotation_results = []
                         for future in as_completed(futures):
-                            results.append(future.result())
+                            rotation_results.append(future.result())
 
-                        return f"Completada: {base_name} - {' | '.join(results)}"
+                        return {
+                            "image": base_name,
+                            "message": _summarize_image_results(base_name, rotation_results),
+                            "warnings": _collect_warnings(rotation_results),
+                            "rotation_results": rotation_results,
+                        }
                 else:
-                    results = []
+                    rotation_results = []
                     for rot_suffix, rot_img in rotations.items():
-                        result = process_rotation_parallel(
+                        result_payload = process_rotation_parallel(
                             (rot_img, base_name, rot_suffix, colors, output_dir)
                         )
-                        results.append(result)
-                    return f"Completada: {base_name} - {' | '.join(results)}"
+                        rotation_results.append(result_payload)
+                    return {
+                        "image": base_name,
+                        "message": _summarize_image_results(base_name, rotation_results),
+                        "warnings": _collect_warnings(rotation_results),
+                        "rotation_results": rotation_results,
+                    }
             else:
-                result = process_rotation_parallel(
+                result_payload = process_rotation_parallel(
                     (img, base_name, "", colors, output_dir)
                 )
-                return f"Completada: {base_name} - {result}"
+                return {
+                    "image": base_name,
+                    "message": _summarize_image_results(base_name, [result_payload]),
+                    "warnings": _collect_warnings([result_payload]),
+                    "rotation_results": [result_payload],
+                }
 
     except Exception as e:
-        return f"Error en {image_path}: {str(e)}"
+        error_message = f"Error en {image_path}: {str(e)}"
+        logging.error(error_message, exc_info=True)
+        return {
+            "image": base_name,
+            "message": error_message,
+            "warnings": [error_message],
+            "rotation_results": [],
+        }
 
 def process_image_batch(image_batch, colors, output_dir):
     results = []
@@ -1886,7 +2396,7 @@ def main():
     image_batches = [image_files[i:i + chunk_size] for i in range(0, len(image_files), chunk_size)]
 
     logging.info(
-        f"🚀 Procesando {len(image_files)} imágenes en {len(image_batches)} lotes (chunk size: {chunk_size})"
+        f"[INICIO] Procesando {len(image_files)} imágenes en {len(image_batches)} lotes (chunk size: {chunk_size})"
     )
 
     with ProcessPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
@@ -1902,14 +2412,23 @@ def main():
         for future in as_completed(futures):
             batch_results = future.result()
             for result in batch_results:
-                logging.info(result)
+                if isinstance(result, dict):
+                    logging.info(result.get("message"))
+                    update_health_stats(
+                        result.get("image"),
+                        result.get("warnings", []),
+                    )
+                else:
+                    logging.info(result)
+                    update_health_stats(str(result), [])
                 completed += 1
                 progress_percent = (completed / len(image_files)) * 100
                 logging.info(
-                    f"📊 Progreso: {completed}/{len(image_files)} imágenes ({progress_percent:.1f}%)"
+                    f"[PROGRESO] {completed}/{len(image_files)} imágenes ({progress_percent:.1f}%)"
                 )
 
-    logging.info("✅ Procesamiento completado")
+    print_health_report()
+    logging.info("[OK] Procesamiento completado")
 
 def validate_config():
     errors = []
