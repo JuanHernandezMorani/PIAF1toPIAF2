@@ -85,7 +85,7 @@ CONFIG = {
     "MAX_COLOR_WORKERS": 8,
 
     "PERCEPTUAL_VARIANT_SYSTEM": {
-        "TOTAL_VARIANTS": 125,
+        "TOTAL_VARIANTS": 500,
         "VARIANTS_PER_GROUP": 25,
         "VARIANT_GROUPS": {
             "base": {"enabled": True, "description": "Línea base estándar"},
@@ -196,6 +196,33 @@ REQUIRED_GROUPS = [
 REBALANCE_VARIANTS = None
 
 
+def fix_variant_distribution():
+    """Synchroniza la configuración de variantes con el plan perceptual objetivo."""
+
+    perceptual_cfg = CONFIG.setdefault("PERCEPTUAL_VARIANT_SYSTEM", {})
+    rotations_enabled = CONFIG.get("GENERATE_ROTATIONS", True)
+    rotation_angles = CONFIG.get("ROTATION_ANGLES", [0]) if rotations_enabled else [0]
+    rotation_count = max(len(rotation_angles), 1)
+
+    variants_per_group = perceptual_cfg.get("VARIANTS_PER_GROUP") or 25
+    variants_per_group = max(int(variants_per_group), 1)
+
+    active_groups = [group for group in REQUIRED_GROUPS]
+    groups_count = max(len(active_groups), 1)
+
+    total_variants_per_rotation = variants_per_group * groups_count
+    total_variants = total_variants_per_rotation * rotation_count
+
+    perceptual_cfg["VARIANTS_PER_GROUP"] = variants_per_group
+    perceptual_cfg["TOTAL_VARIANTS_PER_ROTATION"] = total_variants_per_rotation
+    perceptual_cfg["TOTAL_VARIANTS"] = total_variants
+
+    return total_variants_per_rotation, total_variants, rotation_count
+
+
+TOTAL_VARIANTS_PER_ROTATION, TOTAL_VARIANTS_EXPECTED, TOTAL_ROTATION_COUNT = fix_variant_distribution()
+
+
 def rotate_point_90(x, y):
     return y, 1 - x
 
@@ -275,7 +302,10 @@ def ensure_complete_group_distribution(variant_count=None, groups_count=None):
     perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
 
     if variant_count is None:
-        variant_count = perceptual_cfg.get("TOTAL_VARIANTS", 125)
+        variant_count = perceptual_cfg.get(
+            "TOTAL_VARIANTS_PER_ROTATION",
+            perceptual_cfg.get("TOTAL_VARIANTS", 125),
+        )
 
     if groups_count is None:
         groups_count = len(REQUIRED_GROUPS)
@@ -822,6 +852,58 @@ def detect_magnocellular_edges(image):
     return edges.astype(np.float32)
 
 
+def enhanced_edge_detection(image):
+    """Deducción multiescala de bordes perceptuales empleando luminancia Lab."""
+
+    if isinstance(image, Image.Image):
+        rgb = np.array(image.convert("RGB"), dtype=np.uint8)
+    else:
+        arr = np.asarray(image)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        rgb = np.clip(arr, 0, 255).astype(np.uint8)
+
+    lab_image = rgb_to_lab(rgb)
+    luminance = np.clip(lab_image[:, :, 0], 0, 255).astype(np.uint8)
+
+    edges_fine = cv2.Canny(luminance, 50, 150)
+    edges_coarse = cv2.Canny(luminance, 30, 100)
+    combined = np.maximum(edges_fine, edges_coarse).astype(np.float32)
+    combined = cv2.GaussianBlur(combined, (5, 5), 0)
+
+    return np.clip(combined / 255.0, 0.0, 1.0)
+
+
+def add_perceptual_edge_enhancement(image, edge_strength, enhancement_factor=0.3):
+    """Refuerza bordes relevantes respetando el canal alfa si existe."""
+
+    arr = np.asarray(image, dtype=np.float32)
+
+    if arr.ndim == 2:
+        rgb = np.stack([arr] * 3, axis=-1)
+        alpha = None
+    elif arr.shape[2] == 4:
+        rgb = arr[:, :, :3]
+        alpha = arr[:, :, 3:4]
+    else:
+        rgb = arr[:, :, :3]
+        alpha = None
+
+    edge_map = np.asarray(edge_strength, dtype=np.float32)
+    if edge_map.ndim == 2:
+        edge_map = edge_map[:, :, None]
+    edge_map = np.clip(edge_map, 0.0, 1.0)
+
+    enhancement = edge_map * 255.0 * float(max(enhancement_factor, 0.0))
+    enhanced_rgb = np.clip(rgb + enhancement, 0.0, 255.0).astype(np.uint8)
+
+    if alpha is not None:
+        alpha_channel = np.clip(alpha, 0.0, 255.0).astype(np.uint8)
+        return np.concatenate([enhanced_rgb, alpha_channel], axis=2)
+
+    return enhanced_rgb
+
+
 def enhance_parvocellular_color(image, factor):
     """Aumenta la saturación y detalle fino emulando células P."""
     if isinstance(image, Image.Image):
@@ -921,6 +1003,63 @@ def simulate_human_contrast_perception(image, contrast_level):
     if alpha is not None and result.shape[2] == 3:
         result = np.dstack([result, alpha])
     return result.astype(np.uint8)
+
+
+def apply_human_vision_simulation(image, intensity_factor=1.0):
+    """Combina sistemas magnocelular y parvocelular en una sola respuesta visual."""
+
+    base_rgba = _to_rgba_image(image)
+    base_array = np.array(base_rgba, dtype=np.uint8)
+    rgb = base_array[:, :, :3]
+    alpha = base_array[:, :, 3:4]
+
+    parvo_enhanced = enhance_parvocellular_color(rgb, intensity_factor)
+    magno_edges = detect_magnocellular_edges(rgb).astype(np.float32) / 255.0
+    multi_scale_edges = enhanced_edge_detection(rgb)
+    combined_edges = np.clip(np.maximum(magno_edges, multi_scale_edges), 0.0, 1.0)
+
+    blended_rgb = blend_vision_systems(
+        parvo_enhanced,
+        (combined_edges * 255.0).astype(np.uint8),
+        intensity_factor,
+    )
+
+    enhancement_factor = 0.2 + 0.3 * max(intensity_factor - 1.0, 0.0)
+    enhanced_rgb = add_perceptual_edge_enhancement(
+        blended_rgb, combined_edges, enhancement_factor
+    )
+
+    if enhanced_rgb.ndim == 2:
+        enhanced_rgb = np.stack([enhanced_rgb] * 3, axis=-1)
+
+    enhanced_rgb = np.clip(enhanced_rgb, 0, 255).astype(np.uint8)
+    return np.concatenate([enhanced_rgb, alpha], axis=2)
+
+
+def enhance_perceptual_contrast(image, contrast_level):
+    """Aplica contraste considerando visión fotópica/escotópica humana."""
+
+    base_rgba = _to_rgba_image(image)
+    contrasted = simulate_human_contrast_perception(base_rgba, contrast_level)
+    if isinstance(contrasted, Image.Image):
+        contrasted_arr = np.array(contrasted.convert("RGBA"), dtype=np.uint8)
+    else:
+        contrasted_arr = np.array(contrasted, dtype=np.uint8)
+
+    if contrast_level > 1.0:
+        adapted = apply_photopic_enhancement(contrasted_arr, contrast_level)
+    else:
+        adapted = apply_scotopic_adaptation(contrasted_arr, max(contrast_level, 0.1))
+
+    if isinstance(adapted, Image.Image):
+        adapted_arr = np.array(adapted.convert("RGBA"), dtype=np.uint8)
+    else:
+        adapted_arr = np.array(adapted, dtype=np.uint8)
+
+    edge_strength = enhanced_edge_detection(adapted_arr[:, :, :3])
+    edge_factor = 0.15 if contrast_level <= 1.0 else 0.25
+    enhanced = add_perceptual_edge_enhancement(adapted_arr, edge_strength, edge_factor)
+    return np.clip(enhanced, 0, 255).astype(np.uint8)
 
 
 def extract_perceptual_dominant_colors(lab_image, k=8):
@@ -1301,48 +1440,64 @@ def assign_variant_group(variant_index, total_variants=None):
     cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
     guaranteed_total = sum(GROUP_TARGET_DISTRIBUTION.values())
     if total_variants is None:
-        total_variants = cfg.get("TOTAL_VARIANTS", guaranteed_total)
+        total_variants = cfg.get(
+            "TOTAL_VARIANTS_PER_ROTATION", cfg.get("TOTAL_VARIANTS", guaranteed_total)
+        )
 
     total_variants = max(total_variants, guaranteed_total)
 
     return GROUP_ASSIGNER(variant_index, total_variants)
 
 
-def apply_group_specific_processing(image_array, group_type, variant_index):
-    """Aplica transformaciones perceptuales específicas por grupo."""
-    groups_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
-        "VARIANT_GROUPS", {}
-    )
-    group_cfg = groups_cfg.get(group_type, {})
+def enhanced_group_processing(image_array, group_type, variant_index):
+    """Procesamiento perceptual avanzado para cada grupo específico."""
 
-    if group_type == "base":
-        return image_array
-
+    base_image = _to_rgba_image(image_array)
     rng = random.Random(variant_index * 101 + 29)
 
+    if group_type == "base":
+        intensity = rng.uniform(0.8, 1.2)
+        return apply_human_vision_simulation(base_image, intensity)
+
     if group_type == "low_contrast":
-        variant = generate_low_contrast_variant(image_array, None, variant_index)
-        return np.array(_to_rgba_image(variant), dtype=np.uint8)
+        contrast = rng.uniform(0.3, 0.6)
+        return enhance_perceptual_contrast(base_image, contrast)
 
     if group_type == "high_contrast":
-        variant = generate_high_contrast_variant(image_array, None, variant_index)
-        return np.array(_to_rgba_image(variant), dtype=np.uint8)
+        contrast = rng.uniform(1.8, 2.2)
+        return enhance_perceptual_contrast(base_image, contrast)
 
     if group_type == "illumination":
-        return APPLY_ILLUMINATION_TRANSFORM(
-            image_array,
-            {
-                "brightness_range": group_cfg.get("brightness_range"),
-                "contrast_range": group_cfg.get("contrast_range"),
-                "variant_index": variant_index,
-            },
+        brightness = rng.uniform(0.4, 1.8)
+        simulated = apply_human_vision_simulation(base_image, brightness)
+        edge_strength = enhanced_edge_detection(np.array(base_image.convert("RGB")))
+        illuminated = add_perceptual_edge_enhancement(
+            simulated, edge_strength, 0.15 + 0.15 * max(brightness - 1.0, 0.0)
         )
+        return np.array(illuminated, dtype=np.uint8)
 
     if group_type == "concise_colors":
-        variant = generate_concise_colors_variant(image_array, None, variant_index)
-        return np.array(_to_rgba_image(variant), dtype=np.uint8)
+        groups_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
+            "VARIANT_GROUPS", {}
+        )
+        group_cfg = groups_cfg.get("concise_colors", {})
+        palette = generate_concise_color_palette(
+            base_image,
+            tolerance=group_cfg.get("color_tolerance", 12),
+            palette_size=group_cfg.get("palette_size", 8),
+        )
+        edge_strength = enhanced_edge_detection(np.array(base_image.convert("RGB")))
+        return add_perceptual_edge_enhancement(palette, edge_strength, 0.2)
 
-    return image_array
+    return np.array(base_image, dtype=np.uint8)
+
+
+def apply_group_specific_processing(image_array, group_type, variant_index):
+    """Aplica transformaciones perceptuales específicas por grupo."""
+    processed = enhanced_group_processing(image_array, group_type, variant_index)
+    if isinstance(processed, Image.Image):
+        return np.array(processed.convert("RGBA"), dtype=np.uint8)
+    return np.array(processed, dtype=np.uint8)
 
 
 def apply_color_mapping(img_array, dominant_colors, color_variations, variant_seed):
@@ -2025,7 +2180,8 @@ def validate_contrast_contextually(variants, thresholds, image_profile):
 
 def validate_group_balance_strict(variants):
     total_variants = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
-        "TOTAL_VARIANTS", 125
+        "TOTAL_VARIANTS_PER_ROTATION",
+        CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get("TOTAL_VARIANTS", 125),
     )
     validation_result, counts, expected = GROUP_VALIDATOR(variants, total_variants)
 
@@ -2064,10 +2220,15 @@ def contextual_metric_validation(variants, image_profile, image_name, thresholds
     else:
         group_result = validate_group_balance_strict(variants)
 
+    edge_result = evaluate_perceptual_edge_quality(variants)
+    vision_result = evaluate_human_vision_balance(variants)
+
     diagnostics = {
         "color_distribution": color_result,
         "contrast_range": contrast_result,
         "group_balance": group_result,
+        "edge_definition": edge_result,
+        "human_vision_balance": vision_result,
     }
 
     if image_name and any(keyword in image_name.lower() for keyword in ("black", "dark")):
@@ -2288,6 +2449,25 @@ def implement_batch_validation(
                 ),
             )
 
+        edge_report = evaluate_perceptual_edge_quality(variants_batch)
+        metrics["edge_strength"] = edge_report.get("average_strength", 0.0)
+        if not edge_report.get("passed", True):
+            register_warning("edge_definition", edge_report.get("reason", "Bordes débiles"))
+
+        vision_report = evaluate_human_vision_balance(variants_batch)
+        metrics["human_vision"] = {
+            "chroma": vision_report.get("average_chroma", 0.0),
+            "edges": vision_report.get("average_edge_strength", 0.0),
+        }
+        if not vision_report.get("passed", True):
+            register_warning(
+                "human_vision_balance",
+                vision_report.get(
+                    "reason",
+                    "Equilibrio magnocelular/parvocelular insuficiente",
+                ),
+            )
+
         passed = not warnings
         return {
             "passed": passed,
@@ -2492,22 +2672,99 @@ def measure_color_variance(generated_variants):
     return float(np.mean(variances)) > 50.0
 
 
-def validate_edge_consistency(generated_variants):
-    """Verifica que los bordes se mantengan definidos tras el procesamiento."""
-    edge_strengths = []
-    for path in generated_variants:
+def evaluate_perceptual_edge_quality(variants, min_strength=0.08):
+    """Evalúa la fortaleza promedio de los bordes perceptuales."""
+
+    strengths = []
+    for item in variants:
         try:
-            with Image.open(path) as img:
-                gray = np.array(img.convert("L"), dtype=np.uint8)
-                edges = cv2.Canny(gray, 40, 150)
-                edge_strengths.append(edges.mean() / 255.0)
+            if isinstance(item, str):
+                with Image.open(item) as img:
+                    edges = enhanced_edge_detection(img)
+            elif isinstance(item, Image.Image):
+                edges = enhanced_edge_detection(item)
+            else:
+                edges = enhanced_edge_detection(item)
+            strengths.append(float(np.mean(edges)))
         except Exception:
             continue
 
-    if not edge_strengths:
-        return False
+    if not strengths:
+        return {
+            "passed": False,
+            "reason": "No se pudo calcular fuerza de bordes",
+            "average_strength": 0.0,
+        }
 
-    return float(np.mean(edge_strengths)) > 0.05
+    average_strength = float(np.mean(strengths))
+    passed = average_strength >= min_strength
+    reason = "" if passed else (
+        f"Fuerza de borde promedio {average_strength:.3f} < {min_strength:.3f}"
+    )
+    return {
+        "passed": passed,
+        "reason": reason,
+        "average_strength": average_strength,
+    }
+
+
+def evaluate_human_vision_balance(variants, min_chroma=12.0, min_edge=0.06):
+    """Verifica equilibrio entre detección magnocelular y parvocelular."""
+
+    chroma_values = []
+    edge_values = []
+
+    for item in variants:
+        try:
+            if isinstance(item, str):
+                with Image.open(item) as img:
+                    rgb = np.array(img.convert("RGB"), dtype=np.uint8)
+            elif isinstance(item, Image.Image):
+                rgb = np.array(item.convert("RGB"), dtype=np.uint8)
+            else:
+                arr = np.asarray(item, dtype=np.uint8)
+                if arr.ndim == 3 and arr.shape[2] == 4:
+                    rgb = arr[:, :, :3]
+                else:
+                    rgb = arr
+
+            lab = rgb_to_lab(rgb)
+            chroma = np.sqrt(lab[:, :, 1] ** 2 + lab[:, :, 2] ** 2)
+            chroma_values.append(float(np.mean(chroma)))
+            edge_values.append(float(np.mean(enhanced_edge_detection(rgb))))
+        except Exception:
+            continue
+
+    if not chroma_values or not edge_values:
+        return {
+            "passed": False,
+            "reason": "Métricas de visión humana insuficientes",
+            "average_chroma": 0.0,
+            "average_edge_strength": 0.0,
+        }
+
+    avg_chroma = float(np.mean(chroma_values))
+    avg_edges = float(np.mean(edge_values))
+    passed = avg_chroma >= min_chroma and avg_edges >= min_edge
+    if passed:
+        reason = ""
+    else:
+        reason = (
+            f"Chroma {avg_chroma:.2f} (mín {min_chroma:.2f}), "
+            f"bordes {avg_edges:.3f} (mín {min_edge:.3f})"
+        )
+
+    return {
+        "passed": passed,
+        "reason": reason,
+        "average_chroma": avg_chroma,
+        "average_edge_strength": avg_edges,
+    }
+
+
+def validate_edge_consistency(generated_variants):
+    """Compatibilidad hacia atrás para validaciones existentes."""
+    return evaluate_perceptual_edge_quality(generated_variants).get("passed", False)
 
 
 def analyze_background_diversity(generated_variants):
@@ -2532,7 +2789,8 @@ def analyze_background_diversity(generated_variants):
 def verify_group_distribution(variants):
     """Verifica que cada grupo perceptual tenga la cantidad esperada de variantes."""
     total_variants = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
-        "TOTAL_VARIANTS", 125
+        "TOTAL_VARIANTS_PER_ROTATION",
+        CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get("TOTAL_VARIANTS", 125),
     )
     validation_result, counts, expected = GROUP_VALIDATOR(variants, total_variants)
     if not validation_result:
@@ -3166,7 +3424,10 @@ def process_rotation_parallel(args):
         color_tasks = []
         perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
         guaranteed_total = sum(GROUP_TARGET_DISTRIBUTION.values())
-        total_variants = perceptual_cfg.get("TOTAL_VARIANTS", len(colors) or 1)
+        total_variants = perceptual_cfg.get(
+            "TOTAL_VARIANTS_PER_ROTATION",
+            perceptual_cfg.get("TOTAL_VARIANTS", len(colors) or 1),
+        )
         enabled_groups = [
             name
             for name, meta in perceptual_cfg.get("VARIANT_GROUPS", {}).items()
