@@ -49,3 +49,6 @@ dist
 .tern-port
 package-lock.json
 tool/*
+*.jpg
+*.jpeg
+*.png
