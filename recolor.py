@@ -3,7 +3,7 @@ import json
 import logging
 import random
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 from colorsys import rgb_to_hls, hls_to_rgb
 from collections import defaultdict
@@ -21,6 +21,13 @@ try:
     COLOR_MATH_AVAILABLE = True
 except ImportError:
     COLOR_MATH_AVAILABLE = False
+
+try:
+    from sklearn.cluster import KMeans
+    SKLEARN_AVAILABLE = True
+except ImportError:  # pragma: no cover - dependencia opcional
+    KMeans = None
+    SKLEARN_AVAILABLE = False
 
 CONFIG = {
     "MIN_COLOR": 100,
@@ -75,6 +82,41 @@ CONFIG = {
     "PARALLEL_COLORS": True,
     "MAX_ROTATION_WORKERS": 4,
     "MAX_COLOR_WORKERS": 8,
+
+    "PERCEPTUAL_VARIANT_SYSTEM": {
+        "TOTAL_VARIANTS": 125,
+        "VARIANTS_PER_GROUP": 25,
+        "VARIANT_GROUPS": {
+            "base": {"enabled": True, "description": "Línea base estándar"},
+            "low_contrast": {"enabled": True, "contrast_range": [0.3, 0.5]},
+            "high_contrast": {"enabled": True, "contrast_range": [1.8, 2.2]},
+            "illumination": {
+                "enabled": True,
+                "brightness_range": [0.4, 1.8],
+                "contrast_range": [0.6, 1.4],
+            },
+            "concise_colors": {
+                "enabled": True,
+                "color_tolerance": 12,
+                "palette_size": 8,
+            },
+        },
+        "HUMAN_VISION_PARAMS": {
+            "WEBER_FRACTION": 0.02,
+            "CONTRAST_SENSITIVITY": {"low": 0.01, "high": 0.1},
+            "COLOR_ADAPTATION_SPEED": 0.3,
+            "LUMINANCE_PRESERVATION": True,
+        },
+        "DYNAMIC_BACKGROUNDS": {
+            "ENABLED": True,
+            "BRIGHTNESS_RANGE": [0.7, 1.3],
+            "CONTRAST_RANGE": [0.6, 1.6],
+            "ALPHA_RANGE": [0.65, 1.0],
+            "HUE_SHIFT_RANGE": [-15, 15],
+            "NOISE_LEVEL": 0.03,
+            "TEXTURE_VARIATION": True,
+        },
+    },
 }
 
 
@@ -337,12 +379,12 @@ def add_color_noise(color, intensity=0.1):
     return [r, g, b, color[3]]
 
 def generate_high_variation_colors(base_color, num_variations, all_colors=None):
-    variations = []
+    variations = [list(base_color)]
     r, g, b, a = base_color
     h_base, l_base, s_base = rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
 
     attempts = 0
-    generated_count = 0
+    generated_count = 1
     min_color = CONFIG["COLOR_RANGE"]["min"]
     max_color = CONFIG["COLOR_RANGE"]["max"]
 
@@ -516,6 +558,613 @@ def adjust_background_contrast(bg, fg, target_lum_diff=50):
         bg = Image.fromarray(np.clip(bg_np * factor, 0, 255).astype("uint8"), "L").convert("RGB")
 
     return bg
+
+
+def rgb_to_lab(image):
+    """Convierte una imagen RGB/RGBA a espacio Lab perceptual."""
+    if isinstance(image, Image.Image):
+        rgb = np.array(image.convert("RGB"), dtype=np.uint8)
+    else:
+        arr = np.asarray(image)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        rgb = arr
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    return lab.astype(np.float32)
+
+
+def lab_to_rgb(lab_image):
+    """Convierte una imagen Lab a RGB uint8."""
+    lab = np.asarray(lab_image, dtype=np.float32)
+    lab = np.clip(lab, 0, 255).astype(np.uint8)
+    rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def srgb_to_linear(image):
+    """Convierte valores sRGB (0-255) a espacio lineal [0,1]."""
+    arr = np.asarray(image, dtype=np.float32) / 255.0
+    mask = arr <= 0.04045
+    linear = np.empty_like(arr, dtype=np.float32)
+    linear[mask] = arr[mask] / 12.92
+    linear[~mask] = np.power((arr[~mask] + 0.055) / 1.055, 2.4)
+    return np.clip(linear, 0.0, 1.0)
+
+
+def linear_to_srgb(image):
+    """Convierte valores lineales [0,1] a sRGB uint8."""
+    arr = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    mask = arr <= 0.0031308
+    srgb = np.empty_like(arr, dtype=np.float32)
+    srgb[mask] = arr[mask] * 12.92
+    srgb[~mask] = 1.055 * np.power(arr[~mask], 1.0 / 2.4) - 0.055
+    return np.clip(srgb * 255.0, 0, 255).astype(np.uint8)
+
+
+def detect_magnocellular_edges(image):
+    """Detecta bordes de alta frecuencia simulando respuesta magnocelular."""
+    if isinstance(image, Image.Image):
+        rgb = np.array(image.convert("RGB"), dtype=np.uint8)
+    else:
+        rgb = np.asarray(image, dtype=np.uint8)
+        if rgb.ndim == 3 and rgb.shape[2] == 4:
+            rgb = rgb[:, :, :3]
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 32, 128)
+    edges = cv2.GaussianBlur(edges.astype(np.float32), (3, 3), 0)
+    return edges.astype(np.float32)
+
+
+def enhance_parvocellular_color(image, factor):
+    """Aumenta la saturación y detalle fino emulando células P."""
+    if isinstance(image, Image.Image):
+        rgb = np.array(image.convert("RGB"), dtype=np.uint8)
+    else:
+        rgb = np.asarray(image, dtype=np.uint8)
+        if rgb.ndim == 3 and rgb.shape[2] == 4:
+            rgb = rgb[:, :, :3]
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    saturation_scale = 1.0 + 0.5 * max(factor - 1.0, 0.0)
+    value_scale = 1.0 + 0.3 * max(factor - 1.0, 0.0)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation_scale, 0, 255)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * value_scale, 0, 255)
+    enhanced = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    return enhanced
+
+
+def blend_vision_systems(color_image, edge_map, factor):
+    """Combina la respuesta parvocelular con bordes magnocelulares."""
+    color = np.asarray(color_image, dtype=np.float32)
+    if color.ndim == 3 and color.shape[2] == 4:
+        alpha = color[:, :, 3]
+        color = color[:, :, :3]
+    else:
+        alpha = None
+
+    if edge_map.ndim == 2:
+        edges = edge_map[:, :, None]
+    else:
+        edges = edge_map
+
+    edges = np.clip(edges / 255.0, 0.0, 1.0)
+    enhancement_strength = min(max(factor - 1.0, 0.0), 2.0)
+    blended_rgb = color + edges * 255.0 * 0.5 * enhancement_strength
+    blended_rgb = np.clip(blended_rgb, 0, 255)
+    blended_rgb = blended_rgb.astype(np.uint8)
+
+    if alpha is not None:
+        return np.dstack([blended_rgb, alpha.astype(np.uint8)])
+    return blended_rgb
+
+
+def apply_scotopic_adaptation(image, factor):
+    """Simula visión nocturna reduciendo saturación y preservando luminancia."""
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        alpha = arr[:, :, 3]
+        rgb = arr[:, :, :3]
+    else:
+        alpha = None
+        rgb = arr
+
+    lab = rgb_to_lab(rgb)
+    lab[:, :, 1] *= factor * 0.7
+    lab[:, :, 2] *= factor * 0.7
+    lab[:, :, 1:] = np.clip(lab[:, :, 1:], 0, 255)
+    rgb_result = lab_to_rgb(lab)
+
+    if alpha is not None:
+        return np.dstack([rgb_result, alpha])
+    return rgb_result
+
+
+def apply_photopic_enhancement(image, factor):
+    """Simula visión fotópica realzando bordes y saturación."""
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        alpha = arr[:, :, 3]
+        rgb = arr[:, :, :3]
+    else:
+        alpha = None
+        rgb = arr
+
+    edges = detect_magnocellular_edges(rgb)
+    enhanced = enhance_parvocellular_color(rgb, factor)
+    blended = blend_vision_systems(enhanced, edges, factor)
+
+    if alpha is not None:
+        return np.dstack([blended, alpha])
+    return blended
+
+
+def simulate_human_contrast_perception(image, contrast_level):
+    """Aplica contraste basado en sensibilidad humana."""
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        alpha = arr[:, :, 3]
+    else:
+        alpha = None
+
+    if contrast_level < 1.0:
+        result = apply_scotopic_adaptation(arr, contrast_level)
+    else:
+        result = apply_photopic_enhancement(arr, contrast_level)
+
+    if alpha is not None and result.shape[2] == 3:
+        result = np.dstack([result, alpha])
+    return result.astype(np.uint8)
+
+
+def extract_perceptual_dominant_colors(lab_image, k=8):
+    """Extrae colores dominantes perceptualmente distintos."""
+    pixels = lab_image.reshape(-1, 3).astype(np.float32)
+    if pixels.size == 0 or k <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    if SKLEARN_AVAILABLE and pixels.shape[0] >= k:
+        try:
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            kmeans.fit(pixels)
+            return kmeans.cluster_centers_.astype(np.float32)
+        except Exception:
+            pass
+
+    indices = np.linspace(0, pixels.shape[0] - 1, k).astype(int)
+    return pixels[indices]
+
+
+def quantize_preserving_edges(lab_image, dominant_colors, tolerance):
+    """Cuantiza preservando bordes relevantes mediante Delta-E aproximada."""
+    if dominant_colors is None or len(dominant_colors) == 0:
+        return lab_image
+
+    lab = lab_image.reshape(-1, 3).astype(np.float32)
+    centers = np.asarray(dominant_colors, dtype=np.float32)
+    distances = np.linalg.norm(lab[:, None, :] - centers[None, :, :], axis=2)
+    nearest = np.argmin(distances, axis=1)
+    quantized = centers[nearest].reshape(lab_image.shape)
+
+    if tolerance and tolerance > 0:
+        original = lab_image.astype(np.float32)
+        delta = np.linalg.norm(original - quantized, axis=2)
+        edge_mask = delta > tolerance
+        if np.any(edge_mask):
+            quantized = quantized.copy()
+            quantized[edge_mask] = original[edge_mask]
+
+    return quantized
+
+
+def generate_concise_color_palette(image, tolerance=12, palette_size=8):
+    """Reduce colores conservando relaciones cromáticas perceptuales."""
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        alpha = arr[:, :, 3]
+        rgb = arr[:, :, :3]
+    else:
+        alpha = None
+        rgb = arr
+
+    lab_image = rgb_to_lab(rgb)
+    dominant_colors = extract_perceptual_dominant_colors(lab_image, palette_size)
+    quantized_lab = quantize_preserving_edges(lab_image, dominant_colors, tolerance)
+    rgb_quantized = lab_to_rgb(quantized_lab)
+
+    if alpha is not None:
+        return np.dstack([rgb_quantized, alpha])
+    return rgb_quantized
+
+
+def apply_light_transport(linear_rgb, brightness_factor, contrast_factor):
+    """Modelo simplificado de transporte de luz en espacio lineal."""
+    adjusted = linear_rgb * brightness_factor
+    mean = np.mean(adjusted, axis=(0, 1), keepdims=True)
+    adjusted = (adjusted - mean) * contrast_factor + mean
+    return np.clip(adjusted, 0.0, 1.0)
+
+
+def preserve_albedo_consistency(illuminated_linear, original_srgb):
+    """Preserva la coherencia albedo-iluminación mezclando con el original."""
+    original_linear = srgb_to_linear(original_srgb)
+    return np.clip(0.7 * illuminated_linear + 0.3 * original_linear, 0.0, 1.0)
+
+
+def apply_physically_based_illumination(image, brightness_factor, contrast_factor):
+    """Simula iluminación física manteniendo el albedo relativo."""
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        alpha = arr[:, :, 3]
+        rgb = arr[:, :, :3]
+    else:
+        alpha = None
+        rgb = arr
+
+    linear_rgb = srgb_to_linear(rgb)
+    illuminated = apply_light_transport(linear_rgb, brightness_factor, contrast_factor)
+    vision_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get("HUMAN_VISION_PARAMS", {})
+    if vision_cfg.get("LUMINANCE_PRESERVATION", False):
+        illuminated = preserve_albedo_consistency(illuminated, rgb)
+
+    srgb_result = linear_to_srgb(illuminated)
+    if alpha is not None:
+        return np.dstack([srgb_result, alpha])
+    return srgb_result
+
+
+def apply_ambient_light_variation(image, rng, background_cfg):
+    """Aplica variaciones de iluminación ambiente sobre el fondo."""
+    result = image
+    brightness_range = background_cfg.get("BRIGHTNESS_RANGE")
+    if brightness_range:
+        factor = rng.uniform(brightness_range[0], brightness_range[1])
+        result = ImageEnhance.Brightness(result).enhance(factor)
+
+    contrast_range = background_cfg.get("CONTRAST_RANGE")
+    if contrast_range:
+        factor = rng.uniform(contrast_range[0], contrast_range[1])
+        result = ImageEnhance.Contrast(result).enhance(factor)
+
+    return result
+
+
+def apply_depth_of_field(image, blur_radius):
+    """Aplica desenfoque gaussiano simulando profundidad de campo."""
+    if blur_radius and blur_radius > 0.0:
+        return image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    return image
+
+
+def add_perceptual_noise(image, noise_level, np_rng):
+    """Añade ruido perceptual suave emulando granulado visual."""
+    if noise_level <= 0:
+        return image
+
+    arr = np.array(image.convert("RGBA"), dtype=np.float32)
+    rgb = arr[:, :, :3]
+    noise = np_rng.normal(0.0, noise_level * 255.0, size=rgb.shape)
+    rgb = np.clip(rgb + noise, 0, 255)
+    arr[:, :, :3] = rgb
+    return Image.fromarray(arr.astype(np.uint8), "RGBA")
+
+
+def apply_environmental_color_shift(image, rng, background_cfg):
+    """Aplica desplazamientos cromáticos ambientales al fondo."""
+    arr = np.array(image.convert("RGBA"), dtype=np.uint8)
+    rgb = arr[:, :, :3]
+
+    hue_range = background_cfg.get("HUE_SHIFT_RANGE")
+    if hue_range:
+        hue_shift = rng.uniform(hue_range[0], hue_range[1])
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+        hsv[:, :, 0] = (hsv[:, :, 0] + (hue_shift / 360.0) * 180.0) % 180.0
+        rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        arr[:, :, :3] = rgb
+
+    alpha_range = background_cfg.get("ALPHA_RANGE")
+    if alpha_range:
+        alpha = arr[:, :, 3].astype(np.float32)
+        alpha_factor = rng.uniform(alpha_range[0], alpha_range[1])
+        alpha = np.clip(alpha * alpha_factor, 0, 255)
+        arr[:, :, 3] = alpha.astype(np.uint8)
+
+    return Image.fromarray(arr, "RGBA")
+
+
+def generate_perceptual_background(base_background, variant_index):
+    """Genera fondos dinámicos que fomentan separación figura-fondo."""
+    background_cfg = (
+        CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+        .get("DYNAMIC_BACKGROUNDS", {})
+    )
+
+    if not background_cfg.get("ENABLED", False):
+        return base_background
+
+    bg = base_background.copy().convert("RGBA")
+    rng = random.Random(variant_index * 7919 + 17)
+    np_rng = np.random.default_rng(variant_index + 1337)
+
+    bg = apply_ambient_light_variation(bg, rng, background_cfg)
+
+    if background_cfg.get("TEXTURE_VARIATION", False):
+        blur_radius = rng.uniform(0.5, 2.0)
+    else:
+        blur_radius = rng.uniform(0.0, 1.0)
+    bg = apply_depth_of_field(bg, blur_radius)
+
+    noise_level = background_cfg.get("NOISE_LEVEL", 0.0)
+    if noise_level:
+        bg = add_perceptual_noise(bg, noise_level, np_rng)
+
+    bg = apply_environmental_color_shift(bg, rng, background_cfg)
+    return bg
+
+
+def assign_variant_group(variant_index, total_variants=None):
+    """Asigna variante a un grupo perceptual equilibrado."""
+    cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+    if total_variants is None:
+        total_variants = cfg.get("TOTAL_VARIANTS", 1)
+
+    groups_cfg = cfg.get("VARIANT_GROUPS", {})
+    enabled_groups = [
+        name
+        for name, meta in groups_cfg.items()
+        if meta.get("enabled", False)
+    ]
+    if not enabled_groups:
+        return "base"
+
+    group_size = max(1, total_variants // len(enabled_groups))
+    group_index = min(len(enabled_groups) - 1, variant_index // group_size)
+    return enabled_groups[group_index]
+
+
+def apply_group_specific_processing(image_array, group_type, variant_index):
+    """Aplica transformaciones perceptuales específicas por grupo."""
+    groups_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
+        "VARIANT_GROUPS", {}
+    )
+    group_cfg = groups_cfg.get(group_type, {})
+
+    if group_type == "base":
+        return image_array
+
+    rng = random.Random(variant_index * 101 + 29)
+
+    if group_type in {"low_contrast", "high_contrast"}:
+        contrast_range = group_cfg.get("contrast_range", (0.8, 1.2))
+        contrast = rng.uniform(contrast_range[0], contrast_range[1])
+        return simulate_human_contrast_perception(image_array, contrast)
+
+    if group_type == "illumination":
+        brightness_range = group_cfg.get("brightness_range", (0.8, 1.2))
+        contrast_range = group_cfg.get("contrast_range", (0.8, 1.2))
+        brightness = rng.uniform(brightness_range[0], brightness_range[1])
+        contrast = rng.uniform(contrast_range[0], contrast_range[1])
+        return apply_physically_based_illumination(image_array, brightness, contrast)
+
+    if group_type == "concise_colors":
+        tolerance = group_cfg.get("color_tolerance", 12)
+        palette_size = group_cfg.get("palette_size", 8)
+        return generate_concise_color_palette(image_array, tolerance, palette_size)
+
+    return image_array
+
+
+def apply_color_mapping(img_array, dominant_colors, color_variations, variant_seed):
+    """Mapea colores dominantes a variaciones perceptuales."""
+    rng = random.Random(variant_seed * 53 + 11)
+    mapping = {}
+
+    if not color_variations:
+        return img_array.copy()
+
+    for i, original_color in enumerate(dominant_colors):
+        base_variation = color_variations[i % len(color_variations)]
+        if (
+            CONFIG.get("CROSS_COLOR_MIXING", False)
+            and len(color_variations) > 1
+            and rng.random() < 0.4
+        ):
+            other_variation = color_variations[
+                (i + rng.randint(1, len(color_variations) - 1))
+                % len(color_variations)
+            ]
+            mix_ratio = rng.uniform(0.2, 0.8)
+            mapping[original_color] = mix_colors(
+                base_variation, other_variation, mix_ratio
+            )
+        else:
+            mapping[original_color] = base_variation
+
+    new_array = img_array.copy()
+
+    height, width = img_array.shape[:2]
+    for y in range(height):
+        for x in range(width):
+            original_pixel = img_array[y, x]
+            if len(original_pixel) == 4 and original_pixel[3] == 0:
+                continue
+
+            if len(original_pixel) >= 3:
+                original_rgb = tuple(original_pixel[:3])
+                closest_color = min(
+                    dominant_colors,
+                    key=lambda c: sum((a - b) ** 2 for a, b in zip(original_rgb, c[:3])),
+                )
+
+                target_variation = mapping.get(closest_color)
+                if target_variation is not None:
+                    new_pixel = apply_color_preserving_brightness(
+                        original_pixel, target_variation
+                    )
+                    new_array[y, x] = new_pixel
+
+    return new_array
+
+
+def composite_with_alpha(foreground_array, background_image):
+    """Compone primer plano con fondo dinámico respetando alpha."""
+    if isinstance(foreground_array, Image.Image):
+        fg_img = foreground_array.convert("RGBA")
+    else:
+        fg_img = Image.fromarray(foreground_array.astype(np.uint8), "RGBA")
+
+    bg_img = background_image.convert("RGBA")
+    if bg_img.size != fg_img.size:
+        bg_img = bg_img.resize(fg_img.size, Image.LANCZOS)
+
+    return Image.alpha_composite(bg_img, fg_img)
+
+
+def generate_perceptual_filename(base_name, rot_suffix, color_idx, group_type, variant_index):
+    """Genera nombre de archivo con metadatos perceptuales."""
+    color_tag = f"color{color_idx + 1:03d}"
+    variant_tag = f"v{variant_index + 1:03d}"
+    return f"{base_name}{rot_suffix}_{color_tag}_{group_type}_{variant_tag}.png"
+
+
+def extract_group_from_filename(filename):
+    """Obtiene el grupo perceptual a partir del nombre de archivo."""
+    stem = Path(filename).stem
+    parts = stem.split("_")
+    valid_groups = set(
+        CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+        .get("VARIANT_GROUPS", {})
+        .keys()
+    )
+    for part in parts:
+        if part in valid_groups:
+            return part
+    return "base"
+
+
+def check_contrast_distribution(generated_variants):
+    """Comprueba que el contraste medio esté dentro del rango humano."""
+    contrasts = []
+    for path in generated_variants:
+        try:
+            with Image.open(path) as img:
+                gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
+                contrasts.append(float(gray.std()))
+        except Exception:
+            continue
+
+    if not contrasts:
+        return False
+
+    vision_params = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
+        "HUMAN_VISION_PARAMS", {}
+    )
+    contrast_cfg = vision_params.get("CONTRAST_SENSITIVITY", {})
+    low = contrast_cfg.get("low", 0.0)
+    high = contrast_cfg.get("high", 0.1) * 5
+
+    avg_contrast = float(np.mean(contrasts))
+    return low <= avg_contrast <= high
+
+
+def measure_color_variance(generated_variants):
+    """Evalúa la diversidad cromática promedio de las variantes."""
+    variances = []
+    for path in generated_variants:
+        try:
+            with Image.open(path) as img:
+                lab = rgb_to_lab(img.convert("RGB"))
+                flat = lab.reshape(-1, 3)
+                variances.append(float(np.mean(np.var(flat, axis=0))))
+        except Exception:
+            continue
+
+    if not variances:
+        return False
+
+    return float(np.mean(variances)) > 50.0
+
+
+def validate_edge_consistency(generated_variants):
+    """Verifica que los bordes se mantengan definidos tras el procesamiento."""
+    edge_strengths = []
+    for path in generated_variants:
+        try:
+            with Image.open(path) as img:
+                gray = np.array(img.convert("L"), dtype=np.uint8)
+                edges = cv2.Canny(gray, 40, 150)
+                edge_strengths.append(edges.mean() / 255.0)
+        except Exception:
+            continue
+
+    if not edge_strengths:
+        return False
+
+    return float(np.mean(edge_strengths)) > 0.05
+
+
+def analyze_background_diversity(generated_variants):
+    """Comprueba que los fondos generados sean perceptualmente diversos."""
+    color_means = []
+    for path in generated_variants:
+        try:
+            with Image.open(path) as img:
+                rgb = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+                color_means.append(np.mean(rgb, axis=(0, 1)))
+        except Exception:
+            continue
+
+    if len(color_means) < 2:
+        return False
+
+    color_means = np.array(color_means)
+    spread = np.mean(np.std(color_means, axis=0))
+    return spread > 0.02
+
+
+def verify_group_distribution(variants):
+    """Verifica que cada grupo perceptual tenga la cantidad esperada de variantes."""
+    cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+    groups_cfg = cfg.get("VARIANT_GROUPS", {})
+    expected = cfg.get("VARIANTS_PER_GROUP")
+
+    counts = defaultdict(int)
+    for variant in variants:
+        group = extract_group_from_filename(variant)
+        counts[group] += 1
+
+    enabled_groups = [
+        name for name, meta in groups_cfg.items() if meta.get("enabled", False)
+    ]
+
+    if expected:
+        return all(counts.get(group, 0) == expected for group in enabled_groups)
+
+    minimum = cfg.get("TOTAL_VARIANTS", 0) // max(len(enabled_groups) or 1, 1)
+    return all(counts.get(group, 0) >= minimum for group in enabled_groups)
+
+
+def validate_perceptual_metrics(generated_variants):
+    """Valida métricas perceptuales fundamentales de las variantes generadas."""
+    metrics = {
+        "contrast_range": check_contrast_distribution(generated_variants),
+        "color_diversity": measure_color_variance(generated_variants),
+        "edge_preservation": validate_edge_consistency(generated_variants),
+        "background_variation": analyze_background_diversity(generated_variants),
+        "group_balance": verify_group_distribution(generated_variants),
+    }
+
+    failed = [name for name, ok in metrics.items() if not ok]
+    if failed:
+        logging.debug(
+            "Métricas perceptuales no superadas: %s",
+            ", ".join(failed),
+        )
+
+    return not failed
 
 
 def extract_luminance_linear(img_array):
@@ -936,91 +1585,92 @@ def generate_enhanced_pbr_maps(
 
 
 def process_single_color(args):
-    """Procesa un solo color en paralelo"""
-    (
-        color_idx,
-        base_color,
-        img_array,
-        dominant_colors,
-        color_variations,
-        base_name,
-        rot_suffix,
-        output_dir,
-    ) = args
+    """Procesa un solo color aplicando el sistema perceptual de variantes."""
+    if len(args) == 8:
+        (
+            color_idx,
+            base_color,
+            img_array,
+            dominant_colors,
+            color_variations,
+            base_name,
+            rot_suffix,
+            output_dir,
+        ) = args
+        variant_index = color_idx
+    elif len(args) == 9:
+        (
+            color_idx,
+            base_color,
+            img_array,
+            dominant_colors,
+            color_variations,
+            base_name,
+            rot_suffix,
+            output_dir,
+            variant_index,
+        ) = args
+    else:
+        raise ValueError("Argumentos inválidos para process_single_color")
 
     try:
-        color_mapping = {}
-        for i, original_color in enumerate(dominant_colors):
-            if CONFIG["CROSS_COLOR_MIXING"] and len(color_variations) > 1:
-                base_variation = color_variations[i % len(color_variations)]
-                if random.random() < 0.4:
-                    other_variation = color_variations[
-                        (i + random.randint(1, len(color_variations) - 1))
-                        % len(color_variations)
-                    ]
-                    mix_ratio = random.uniform(0.2, 0.8)
-                    color_mapping[original_color] = mix_colors(
-                        base_variation, other_variation, mix_ratio
-                    )
-                else:
-                    color_mapping[original_color] = base_variation
-            else:
-                color_mapping[original_color] = color_variations[
-                    i % len(color_variations)
-                ]
+        perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+        group_type = assign_variant_group(
+            variant_index, perceptual_cfg.get("TOTAL_VARIANTS", variant_index + 1)
+        )
 
-        new_array = img_array.copy()
+        mapped_array = apply_color_mapping(
+            img_array, dominant_colors, color_variations, variant_index
+        )
+        perceptual_array = apply_group_specific_processing(
+            mapped_array, group_type, variant_index
+        )
 
-        for y in range(img_array.shape[0]):
-            for x in range(img_array.shape[1]):
-                original_pixel = img_array[y, x]
-
-                if len(original_pixel) == 4 and original_pixel[3] == 0:
-                    continue
-
-                if len(original_pixel) >= 3:
-                    original_rgb = tuple(original_pixel[:3])
-
-                    closest_color = min(
-                        dominant_colors,
-                        key=lambda c: sum((a - b) ** 2 for a, b in zip(original_rgb, c[:3])),
-                    )
-
-                    if closest_color in color_mapping:
-                        target_variation = color_mapping[closest_color]
-                        new_pixel = apply_color_preserving_brightness(
-                            original_pixel, target_variation
-                        )
-                        new_array[y, x] = new_pixel
-
-        if rot_suffix:
-            output_name = f"{base_name}{rot_suffix}_color{color_idx+1:03d}.png"
+        if isinstance(perceptual_array, Image.Image):
+            perceptual_array = np.array(perceptual_array.convert("RGBA"), dtype=np.uint8)
         else:
-            output_name = f"{base_name}_color{color_idx+1:03d}.png"
+            perceptual_array = np.array(perceptual_array, dtype=np.uint8)
 
-        result_img = Image.fromarray(new_array.astype("uint8"), "RGBA")
-        bg = get_random_background(result_img.size)
-        bg = adjust_background_contrast(bg, result_img)
-        final_img = Image.alpha_composite(bg.convert("RGBA"), result_img)
+        if perceptual_array.ndim == 2:
+            perceptual_array = np.stack([perceptual_array] * 4, axis=-1)
+        elif perceptual_array.shape[2] == 3:
+            alpha_channel = np.full(
+                (perceptual_array.shape[0], perceptual_array.shape[1], 1),
+                255,
+                dtype=np.uint8,
+            )
+            perceptual_array = np.concatenate([perceptual_array, alpha_channel], axis=2)
+
+        background = get_random_background(
+            (perceptual_array.shape[1], perceptual_array.shape[0])
+        )
+        dynamic_bg = generate_perceptual_background(background, variant_index)
+        final_img = composite_with_alpha(perceptual_array, dynamic_bg)
+
+        output_name = generate_perceptual_filename(
+            base_name, rot_suffix, color_idx, group_type, variant_index
+        )
         output_path = os.path.join(output_dir, output_name)
         final_img.save(output_path, optimize=True)
 
         if GENERATE_PBR_MAPS:
             try:
+                result_img = Image.fromarray(perceptual_array.astype("uint8"), "RGBA")
                 save_pbr_maps(result_img, output_name, output_dir)
             except Exception as pbr_error:
                 logging.error(
                     f"Error generando mapas PBR para {output_name}: {pbr_error}"
                 )
 
-        del new_array, result_img, final_img, bg
+        del mapped_array, perceptual_array, final_img, dynamic_bg
         gc.collect()
 
-        return output_name
+        return output_path
 
     except Exception as e:
         logging.error(
-            f"Error procesando color {color_idx} para {base_name}{rot_suffix}: {str(e)}"
+            f"Error procesando color {color_idx} para {base_name}{rot_suffix}: {str(e)}",
+            exc_info=True,
         )
         return None
 
@@ -1043,43 +1693,89 @@ def process_rotation_parallel(args):
         )
 
         color_tasks = []
-        for color_idx, base_color in enumerate(colors):
-            color_variations = generate_high_variation_colors(
+        perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+        total_variants = perceptual_cfg.get("TOTAL_VARIANTS", len(colors) or 1)
+        enabled_groups = [
+            name
+            for name, meta in perceptual_cfg.get("VARIANT_GROUPS", {}).items()
+            if meta.get("enabled", False)
+        ]
+        if enabled_groups:
+            group_variants = perceptual_cfg.get("VARIANTS_PER_GROUP")
+            if group_variants:
+                total_variants = max(total_variants, group_variants * len(enabled_groups))
+
+        if not colors:
+            logging.warning(
+                f"No hay colores base definidos para {base_name}{rot_suffix}, se omiten variantes"
+            )
+            return f"Rotación {rot_suffix}: 0 variantes"
+
+        color_variations_pool = []
+        for base_color in colors:
+            variations = generate_high_variation_colors(
                 base_color, CONFIG["MAX_VARIATIONS_PER_COLOR"], colors
             )
+            if not variations:
+                variations = [list(base_color)]
+            color_variations_pool.append(variations)
 
+        for variant_index in range(total_variants):
+            color_idx = variant_index % len(colors)
+            color_variations = color_variations_pool[color_idx]
             color_tasks.append(
                 (
                     color_idx,
-                    base_color,
+                    colors[color_idx],
                     img_array,
                     dominant_colors,
                     color_variations,
                     base_name,
                     rot_suffix,
                     output_dir,
+                    variant_index,
                 )
             )
 
-        generated_count = 0
+        generated_variants = []
         if CONFIG["PARALLEL_COLORS"] and len(color_tasks) > 1:
             with ThreadPoolExecutor(
                 max_workers=min(CONFIG["MAX_COLOR_WORKERS"], len(color_tasks))
             ) as executor:
-                futures = [executor.submit(process_single_color, task) for task in color_tasks]
+                futures = [
+                    executor.submit(process_single_color, task)
+                    for task in color_tasks
+                ]
                 for future in as_completed(futures):
                     result = future.result()
                     if result:
-                        generated_count += 1
+                        generated_variants.append(result)
         else:
             for task in color_tasks:
                 result = process_single_color(task)
                 if result:
-                    generated_count += 1
+                    generated_variants.append(result)
 
+        generated_count = len(generated_variants)
         logging.info(
             f"Completadas {generated_count} variantes para rotación {rot_suffix}"
         )
+
+        if generated_variants:
+            try:
+                if not validate_perceptual_metrics(generated_variants):
+                    logging.warning(
+                        "Las métricas perceptuales no se cumplieron totalmente para %s%s",
+                        base_name,
+                        rot_suffix,
+                    )
+            except Exception as metrics_error:
+                logging.warning(
+                    "No se pudieron validar métricas perceptuales para %s%s: %s",
+                    base_name,
+                    rot_suffix,
+                    metrics_error,
+                )
 
         del img_array, color_tasks
         gc.collect()
