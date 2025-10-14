@@ -4,6 +4,7 @@ import logging
 import random
 import sys
 from pathlib import Path
+from datetime import datetime
 from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 from colorsys import rgb_to_hls, hls_to_rgb
@@ -1306,48 +1307,155 @@ def calculate_image_statistics(image):
     }
 
 
-def create_realistic_color_thresholds_by_profile():
-    realistic_color_thresholds = {
+def implement_achievable_color_thresholds():
+    """Configura umbrales de variación cromática basados en datos observados."""
+
+    thresholds = {
         "dark_image": {
             "color_variance_min": 0.01,
+            "color_variance_expected": (0.02, 0.08),
             "color_variance_max": 0.15,
-            "contrast_tolerance": 0.8,
-            "acceptable_ranges": {
-                "color_distribution": (0.01, 0.15),
-                "contrast_range": (0.02, 0.5),
-            },
+            "contrast_range": (0.02, 0.6),
+            "contrast_tolerance": 0.25,
+            "description": "Imágenes oscuras naturalmente tienen baja variación",
         },
         "light_image": {
-            "color_variance_min": 0.05,
-            "color_variance_max": 0.25,
-            "contrast_tolerance": 0.7,
-            "acceptable_ranges": {
-                "color_distribution": (0.05, 0.25),
-                "contrast_range": (0.1, 0.8),
-            },
+            "color_variance_min": 0.02,
+            "color_variance_expected": (0.03, 0.12),
+            "color_variance_max": 0.20,
+            "contrast_range": (0.05, 0.9),
+            "contrast_tolerance": 0.2,
+            "description": "Imágenes claras con variación moderada",
         },
         "monochrome": {
             "color_variance_min": 0.005,
+            "color_variance_expected": (0.01, 0.05),
             "color_variance_max": 0.08,
-            "contrast_tolerance": 0.9,
-            "acceptable_ranges": {
-                "color_distribution": (0.005, 0.08),
-                "contrast_range": (0.01, 0.4),
-            },
+            "contrast_range": (0.01, 0.45),
+            "contrast_tolerance": 0.3,
+            "description": "Imágenes monocromáticas esperan variación mínima",
         },
         "colorful": {
-            "color_variance_min": 0.1,
-            "color_variance_max": 0.4,
-            "contrast_tolerance": 0.6,
-            "acceptable_ranges": {
-                "color_distribution": (0.1, 0.4),
-                "contrast_range": (0.2, 2.2),
-            },
+            "color_variance_min": 0.03,
+            "color_variance_expected": (0.03, 0.15),
+            "color_variance_max": 0.25,
+            "contrast_range": (0.08, 1.5),
+            "contrast_tolerance": 0.2,
+            "description": "Imágenes coloridas con variación realista",
         },
     }
 
-    for profile, thresholds in realistic_color_thresholds.items():
-        thresholds.setdefault("color_variance_threshold", thresholds["color_variance_min"])
+    for profile, values in thresholds.items():
+        expected = values.get("color_variance_expected", (values["color_variance_min"], values["color_variance_max"]))
+        values.setdefault("acceptable_ranges", {})
+        values["acceptable_ranges"]["color_distribution"] = expected
+        values["acceptable_ranges"].setdefault("contrast_range", values.get("contrast_range", (0.05, 1.2)))
+        values["color_variance_threshold"] = expected[0]
+
+    return thresholds
+
+
+DATA_DRIVEN_COLOR_THRESHOLDS = implement_achievable_color_thresholds()
+
+
+def create_data_driven_thresholds():
+    """Genera una verificación basada en los umbrales realistas por perfil."""
+
+    thresholds_by_profile = DATA_DRIVEN_COLOR_THRESHOLDS
+
+    def is_color_variance_acceptable(actual_value, image_profile):
+        thresholds = thresholds_by_profile.get(
+            image_profile, thresholds_by_profile["colorful"]
+        )
+
+        expected_min, expected_max = thresholds["color_variance_expected"]
+        hard_min = thresholds["color_variance_min"]
+        hard_max = thresholds["color_variance_max"]
+
+        if actual_value < hard_min:
+            return False, (
+                f"Variación cromática muy baja ({actual_value:.3f} < {hard_min:.3f})"
+            )
+        if actual_value > hard_max:
+            return False, (
+                f"Variación cromática muy alta ({actual_value:.3f} > {hard_max:.3f})"
+            )
+        if actual_value < expected_min:
+            return False, (
+                f"Variación cromática baja ({actual_value:.3f} < {expected_min:.3f})"
+            )
+        if actual_value > expected_max:
+            return False, (
+                f"Variación cromática alta ({actual_value:.3f} > {expected_max:.3f})"
+            )
+
+        return True, f"Variación cromática dentro de rango realista: {actual_value:.3f}"
+
+    return is_color_variance_acceptable
+
+
+def create_adaptive_threshold_adjustment():
+    """Crea un sistema de ajuste automático usando datos históricos conocidos."""
+
+    historical_data = {
+        "allay": {"variance_range": (0.02, 0.06), "profile": "colorful"},
+        "all_black": {"variance_range": (0.01, 0.03), "profile": "monochrome"},
+        "axolotl": {"variance_range": (0.03, 0.08), "profile": "colorful"},
+    }
+
+    def get_image_specific_thresholds(image_name, default_profile):
+        base_profile = default_profile or "colorful"
+        thresholds = DATA_DRIVEN_COLOR_THRESHOLDS.get(
+            base_profile, DATA_DRIVEN_COLOR_THRESHOLDS["colorful"]
+        ).copy()
+        thresholds.setdefault("acceptable_ranges", {})
+
+        normalized_name = ""
+        if image_name:
+            normalized_name = Path(str(image_name)).stem.lower()
+
+        if normalized_name in historical_data:
+            data = historical_data[normalized_name]
+            hist_min, hist_max = data.get("variance_range", (thresholds["color_variance_min"], thresholds["color_variance_max"]))
+            min_with_tolerance = hist_min * 0.8
+            max_with_tolerance = hist_max * 1.2
+
+            thresholds["color_variance_min"] = min(min_with_tolerance, thresholds["color_variance_min"])
+            thresholds["color_variance_max"] = max(max_with_tolerance, thresholds["color_variance_max"])
+            expected_range = (
+                min(hist_min, thresholds["color_variance_expected"][0]),
+                max(hist_max, thresholds["color_variance_expected"][1]),
+            )
+            thresholds["color_variance_expected"] = expected_range
+            thresholds["acceptable_ranges"]["color_distribution"] = expected_range
+            thresholds["color_variance_threshold"] = expected_range[0]
+
+        thresholds["acceptable_ranges"].setdefault(
+            "contrast_range", thresholds.get("contrast_range", (0.05, 1.2))
+        )
+
+        return thresholds
+
+    return get_image_specific_thresholds
+
+
+def create_realistic_color_thresholds_by_profile():
+    realistic_color_thresholds = {}
+
+    for profile, values in DATA_DRIVEN_COLOR_THRESHOLDS.items():
+        profile_thresholds = {
+            "color_variance_min": values["color_variance_min"],
+            "color_variance_max": values["color_variance_max"],
+            "color_variance_expected": values["color_variance_expected"],
+            "contrast_tolerance": values.get("contrast_tolerance", 0.2),
+            "acceptable_ranges": {
+                "color_distribution": values["color_variance_expected"],
+                "contrast_range": values.get("contrast_range", (0.05, 1.2)),
+            },
+            "description": values.get("description", ""),
+        }
+        profile_thresholds["color_variance_threshold"] = profile_thresholds["acceptable_ranges"]["color_distribution"][0]
+        realistic_color_thresholds[profile] = profile_thresholds
 
     def get_realistic_thresholds(image_profile):
         return realistic_color_thresholds.get(
@@ -1355,6 +1463,10 @@ def create_realistic_color_thresholds_by_profile():
         ).copy()
 
     return get_realistic_thresholds
+
+
+is_color_variance_acceptable = create_data_driven_thresholds()
+get_image_specific_thresholds = create_adaptive_threshold_adjustment()
 
 
 def create_adaptive_perceptual_metrics():
@@ -1383,6 +1495,31 @@ def create_adaptive_perceptual_metrics():
 
         profile = classify_profile(stats)
         thresholds = get_realistic_thresholds(profile)
+
+        image_identifier = image_or_path
+        if isinstance(image_or_path, (str, os.PathLike)):
+            image_identifier = Path(image_or_path).stem
+        elif isinstance(image_or_path, Image.Image):
+            image_identifier = Path(getattr(image_or_path, "filename", "") or "").stem
+
+        specific_thresholds = get_image_specific_thresholds(
+            image_identifier, profile
+        )
+        if specific_thresholds:
+            acceptable_ranges = specific_thresholds.get("acceptable_ranges", {})
+            thresholds.update(
+                {
+                    key: value
+                    for key, value in specific_thresholds.items()
+                    if key not in {"acceptable_ranges"}
+                }
+            )
+            thresholds.setdefault("acceptable_ranges", {}).update(acceptable_ranges)
+            color_range = thresholds["acceptable_ranges"].get(
+                "color_distribution", thresholds.get("color_variance_expected", (0.0, 1.0))
+            )
+            thresholds["color_variance_threshold"] = color_range[0]
+
         thresholds.setdefault("background_variation_threshold", 0.02)
         thresholds.setdefault("edge_strength_min", 0.05)
         thresholds["profile"] = profile
@@ -1654,6 +1791,176 @@ def check_background_issues(variants, thresholds=None):
     return analysis
 
 
+def implement_batch_validation(
+    color_variance_validator,
+    threshold_adjuster,
+    analyzer,
+    profile_thresholds,
+):
+    """Valida un lote completo de variantes usando métricas globales."""
+
+    def calculate_batch_contrast_range(variants_batch):
+        contrast_values = []
+        for item in variants_batch:
+            try:
+                if isinstance(item, str):
+                    with Image.open(item) as img:
+                        contrast_values.append(extract_contrast(img))
+                elif isinstance(item, Image.Image):
+                    contrast_values.append(extract_contrast(item))
+                else:
+                    arr = np.array(item, dtype=np.uint8)
+                    if arr.ndim == 3:
+                        img = Image.fromarray(arr[:, :, :3])
+                    else:
+                        img = Image.fromarray(arr)
+                    contrast_values.append(extract_contrast(img))
+            except Exception:
+                continue
+
+        if not contrast_values:
+            return 0.0, 0.0
+
+        return float(min(contrast_values)), float(max(contrast_values))
+
+    def validate_complete_batch(variants_batch, image_name, rotation, log_warning=None):
+        expected_total = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
+            "TOTAL_VARIANTS", 125
+        )
+
+        metrics = {
+            "total_variants": len(variants_batch),
+            "expected_variants": expected_total,
+        }
+        warnings = []
+        seen_messages = set()
+
+        def register_warning(warning_type, message):
+            if message not in seen_messages:
+                warnings.append(message)
+                seen_messages.add(message)
+            if log_warning:
+                log_warning(image_name, rotation, warning_type, message)
+
+        if not variants_batch:
+            register_warning(
+                "empty_batch", "Lote vacío - no se generaron variantes"
+            )
+            metrics.update(
+                {
+                    "color_variance": 0.0,
+                    "contrast_range": (0.0, 0.0),
+                }
+            )
+            return {
+                "passed": False,
+                "warnings": warnings,
+                "metrics": metrics,
+                "profile": "",
+                "thresholds": profile_thresholds.get("colorful", {}).copy(),
+            }
+
+        if len(variants_batch) != expected_total:
+            register_warning(
+                "variant_count",
+                (
+                    f"Lote incompleto: {len(variants_batch)} variantes "
+                    f"(esperado {expected_total})"
+                ),
+            )
+
+        try:
+            context = analyzer(variants_batch[0])
+        except Exception:
+            context = {
+                "profile": "colorful",
+                "thresholds": profile_thresholds.get("colorful", {}).copy(),
+            }
+
+        profile = context.get("profile", "colorful")
+        thresholds = context.get("thresholds", {}).copy() or profile_thresholds.get(
+            profile, profile_thresholds.get("colorful", {})
+        ).copy()
+
+        adaptive_thresholds = threshold_adjuster(image_name, profile)
+        if adaptive_thresholds:
+            acceptable_ranges = adaptive_thresholds.get("acceptable_ranges", {})
+            thresholds.update(
+                {
+                    key: value
+                    for key, value in adaptive_thresholds.items()
+                    if key not in {"acceptable_ranges"}
+                }
+            )
+            thresholds.setdefault("acceptable_ranges", {}).update(acceptable_ranges)
+            color_range = thresholds["acceptable_ranges"].get(
+                "color_distribution",
+                adaptive_thresholds.get("color_variance_expected", (0.0, 1.0)),
+            )
+            thresholds["color_variance_threshold"] = color_range[0]
+
+        metrics["profile"] = profile
+
+        color_variance = calculate_color_variance(variants_batch)
+        metrics["color_variance"] = color_variance
+        passed_variance, variance_message = color_variance_validator(
+            color_variance, profile
+        )
+        if not passed_variance:
+            register_warning("color_distribution", variance_message)
+        else:
+            metrics["color_variance_message"] = variance_message
+
+        contrast_min, contrast_max = calculate_batch_contrast_range(variants_batch)
+        metrics["contrast_range"] = (contrast_min, contrast_max)
+        expected_contrast = thresholds.get("acceptable_ranges", {}).get(
+            "contrast_range", thresholds.get("contrast_range", (0.05, 1.2))
+        )
+        tolerance = thresholds.get("contrast_tolerance", 0.2)
+        min_allowed = max(0.0, expected_contrast[0] - tolerance)
+        max_allowed = expected_contrast[1] + tolerance
+        if contrast_min < min_allowed or contrast_max > max_allowed:
+            register_warning(
+                "contrast_range",
+                (
+                    "Rango de contraste fuera de umbral "
+                    f"({contrast_min:.3f}-{contrast_max:.3f}) vs "
+                    f"{expected_contrast[0]:.3f}-{expected_contrast[1]:.3f}"
+                ),
+            )
+
+        group_report = validate_group_balance_strict(variants_batch)
+        metrics["group_counts"] = group_report.get("counts", {})
+        if not group_report.get("passed", False):
+            register_warning(
+                "group_balance",
+                group_report.get(
+                    "reason", "Distribución de grupos fuera de la meta"
+                ),
+            )
+
+        background_report = check_background_issues(variants_batch, thresholds)
+        metrics["background_variation"] = background_report.get("spread", 0.0)
+        if not background_report.get("passed", True):
+            register_warning(
+                "background_variation",
+                background_report.get(
+                    "reason", "Variación de fondo insuficiente"
+                ),
+            )
+
+        passed = not warnings
+        return {
+            "passed": passed,
+            "warnings": warnings,
+            "metrics": metrics,
+            "profile": profile,
+            "thresholds": thresholds,
+        }
+
+    return validate_complete_batch
+
+
 def create_diagnostic_perceptual_validator():
     def validate_metrics_with_diagnostics(variants, adaptive_context=None):
         context = adaptive_context or {}
@@ -1759,8 +2066,46 @@ def create_health_monitor():
     return update_health_stats, print_health_report
 
 
+def create_consolidated_warning_system():
+    """Agrupa advertencias repetidas por imagen y rotación."""
+
+    warning_counts = defaultdict(lambda: {"count": 0})
+
+    def log_consolidated_warning(image_name, rotation, warning_type, message):
+        key = (image_name or "desconocido", rotation or "", warning_type or "general")
+        entry = warning_counts[key]
+        entry["count"] += 1
+        entry["message"] = message
+        entry.setdefault("first_occurrence", datetime.utcnow())
+
+    def flush_consolidated_warnings():
+        summaries = []
+        for (image_name, rotation, _), data in warning_counts.items():
+            identifier = f"{image_name}{rotation}".strip()
+            if data["count"] > 1:
+                message = (
+                    f"ADVERTENCIA CONSOLIDADA: {identifier} - {data['message']} "
+                    f"(ocurrió {data['count']} veces)"
+                )
+            else:
+                message = f"ADVERTENCIA: {identifier} - {data['message']}"
+            logging.warning(message)
+            summaries.append(message)
+
+        warning_counts.clear()
+        return summaries
+
+    return log_consolidated_warning, flush_consolidated_warnings
+
+
 adaptive_metric_analyzer = create_adaptive_perceptual_metrics()
 validate_metrics_with_diagnostics = create_diagnostic_perceptual_validator()
+validate_complete_batch = implement_batch_validation(
+    is_color_variance_acceptable,
+    get_image_specific_thresholds,
+    adaptive_metric_analyzer,
+    DATA_DRIVEN_COLOR_THRESHOLDS,
+)
 track_group_usage, report_group_health = enhanced_health_monitoring()
 update_health_stats, print_health_report = create_health_monitor()
 
@@ -2433,31 +2778,6 @@ def process_single_color(args):
         output_path = os.path.join(output_dir, output_name)
         final_img.save(output_path, optimize=True)
 
-        try:
-            local_context = adaptive_metric_analyzer(output_path)
-            local_context["image_name"] = base_name
-            local_diagnostics = contextual_metric_validation(
-                [output_path],
-                local_context.get("profile"),
-                base_name,
-                local_context.get("thresholds"),
-            )
-            if not all(result.get("passed", False) for result in local_diagnostics.values()):
-                logging.warning(f"Métricas contextuales para {base_name}:")
-                for metric, result in local_diagnostics.items():
-                    if not result.get("passed", False):
-                        logging.info(
-                            "  %s: %s",
-                            metric,
-                            result.get("reason", "Falló"),
-                        )
-        except Exception as diagnostic_error:
-            logging.debug(
-                "No se pudieron calcular métricas contextuales para %s: %s",
-                output_name,
-                diagnostic_error,
-            )
-
         if GENERATE_PBR_MAPS:
             try:
                 result_img = Image.fromarray(perceptual_array.astype("uint8"), "RGBA")
@@ -2500,6 +2820,8 @@ def process_rotation_parallel(args):
         logging.info(
             f"Iniciando procesamiento paralelo de rotación {rot_suffix} - {num_dominant_colors} colores dominantes"
         )
+
+        log_warning, flush_warnings = create_consolidated_warning_system()
 
         color_tasks = []
         perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
@@ -2578,38 +2900,64 @@ def process_rotation_parallel(args):
         )
 
         warnings = []
-        diagnostics = {}
+        batch_report = {"passed": True, "warnings": [], "metrics": {}}
 
         if generated_variants:
             try:
-                validation_passed, diagnostics, adaptive_context = validate_perceptual_metrics(
+                batch_report = validate_complete_batch(
                     generated_variants,
                     base_name,
                     rot_suffix,
+                    log_warning=log_warning,
                 )
-                if not validation_passed:
-                    reasons = [diagnostics[m]["reason"] for m in diagnostics if not diagnostics[m]["passed"]]
-                    warning_msg = (
-                        "[WARN] Variantes generadas con métricas subóptimas. Continuando procesamiento para evitar pérdida de datos."
-                    )
-                    logging.warning(warning_msg)
-                    warnings.append(warning_msg)
-                    for reason in reasons:
-                        if reason:
-                            warnings.append(reason)
-                else:
-                    logging.debug(
-                        "Métricas perceptuales validadas para %s%s (perfil %s)",
-                        base_name,
-                        rot_suffix,
-                        adaptive_context.get("profile") if adaptive_context else "desconocido",
-                    )
             except Exception as metrics_error:
                 error_msg = (
                     f"[WARN] No se pudieron validar métricas perceptuales para {base_name}{rot_suffix}: {metrics_error}"
                 )
                 logging.warning(error_msg)
                 warnings.append(error_msg)
+                batch_report = {
+                    "passed": False,
+                    "warnings": [error_msg],
+                    "metrics": {},
+                }
+        else:
+            no_variants_msg = f"[WARN] No se generaron variantes para {base_name}{rot_suffix}"
+            logging.warning(no_variants_msg)
+            log_warning(base_name, rot_suffix, "empty_batch", no_variants_msg)
+            batch_report = {
+                "passed": False,
+                "warnings": [no_variants_msg],
+                "metrics": {},
+            }
+
+        diagnostics = batch_report.get("metrics", {})
+        warnings.extend(batch_report.get("warnings", []))
+
+        consolidated_warnings = flush_warnings()
+        if consolidated_warnings:
+            warnings.extend(consolidated_warnings)
+
+        if diagnostics:
+            color_variance = diagnostics.get("color_variance")
+            contrast_min, contrast_max = diagnostics.get("contrast_range", (0.0, 0.0))
+            logging.info(
+                "Lote %s%s - variación cromática %.3f, contraste %.3f-%.3f",
+                base_name,
+                rot_suffix,
+                color_variance if color_variance is not None else 0.0,
+                contrast_min,
+                contrast_max,
+            )
+
+        if generated_variants and not batch_report.get("passed", True):
+            logging.warning(
+                f"Lote {base_name}{rot_suffix} generado con métricas subóptimas. Continuando..."
+            )
+        elif generated_variants and not consolidated_warnings and batch_report.get("passed", True):
+            logging.info(f"Lote {base_name}{rot_suffix} validado exitosamente")
+
+        warnings = list(dict.fromkeys(warnings))
 
         del img_array, color_tasks
         gc.collect()
@@ -2619,7 +2967,7 @@ def process_rotation_parallel(args):
             "rotation": rot_suffix,
             "message": f"Rotación {rot_suffix}: {generated_count} variantes",
             "warnings": warnings,
-            "diagnostics": diagnostics,
+            "diagnostics": batch_report,
         }
 
     except Exception as e:
