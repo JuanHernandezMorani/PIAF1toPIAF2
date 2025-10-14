@@ -192,6 +192,10 @@ REQUIRED_GROUPS = [
 ]
 
 
+# Se asignará más adelante con la implementación completa de rebalanceo
+REBALANCE_VARIANTS = None
+
+
 def rotate_point_90(x, y):
     return y, 1 - x
 
@@ -229,50 +233,74 @@ def detect_missing_groups(current_groups):
 
 def attempt_group_rebalancing(variants, current_counts, target_count):
     """Intenta rebalancear automáticamente la distribución de grupos."""
-    # Actualmente solo generamos advertencias; la lógica de regeneración puede añadirse después.
-    deficit = {
-        group: count for group, count in current_counts.items() if count < target_count
+
+    target_distribution = {group: target_count for group in current_counts}
+
+    missing = {
+        group: target_count - current_counts.get(group, 0)
+        for group in target_distribution
+        if current_counts.get(group, 0) < target_count
     }
     surplus = {
-        group: count for group, count in current_counts.items() if count > target_count
+        group: current_counts.get(group, 0) - target_count
+        for group in current_counts
+        if current_counts.get(group, 0) > target_count
     }
 
-    if deficit:
+    if missing:
         logging.warning(
             "Intento de rebalanceo requerido. Grupos con déficit: %s, exceso: %s",
-            deficit,
+            missing,
             surplus,
         )
 
-    # En esta versión solo notificamos; retornar False indica que no se logró rebalancear.
-    return False
+    if not variants or REBALANCE_VARIANTS is None:
+        return False
+
+    try:
+        success = REBALANCE_VARIANTS(variants, target_distribution)
+        if success:
+            logging.info("Rebalanceo completado exitosamente: %s", target_distribution)
+        else:
+            logging.warning("No se logró el rebalanceo completo para: %s", target_distribution)
+        return success
+    except Exception as exc:
+        logging.error("Error durante el rebalanceo automático: %s", exc)
+        return False
 
 
 def ensure_complete_group_distribution(variant_count=None, groups_count=None):
     """Garantiza distribución completa y validable de grupos perceptuales."""
 
+    perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+
     if variant_count is None:
-        variant_count = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
-            "TOTAL_VARIANTS", 125
-        )
+        variant_count = perceptual_cfg.get("TOTAL_VARIANTS", 125)
 
     if groups_count is None:
         groups_count = len(REQUIRED_GROUPS)
 
     active_groups = REQUIRED_GROUPS[:groups_count]
-    variants_per_group = max(1, variant_count // max(len(active_groups), 1))
+    variants_per_group = perceptual_cfg.get("VARIANTS_PER_GROUP")
+    if not variants_per_group:
+        variants_per_group = max(1, variant_count // max(len(active_groups), 1))
+
+    target_distribution = {group: variants_per_group for group in active_groups}
+    guaranteed_total = sum(target_distribution.values())
+
+    group_plan = [
+        group
+        for group in active_groups
+        for _ in range(variants_per_group)
+    ]
 
     def assign_variant_group_fixed(variant_index, total_variants=None):
-        total = total_variants or variant_count
-        total = max(total, variants_per_group * len(active_groups))
-
-        cycle = variants_per_group * len(active_groups)
-        if cycle == 0:
+        total = total_variants or guaranteed_total
+        if total <= 0:
             return active_groups[0]
 
-        local_index = variant_index % cycle
-        group_index = min(len(active_groups) - 1, local_index // variants_per_group)
-        return active_groups[group_index]
+        plan_index = variant_index % len(group_plan)
+        return group_plan[plan_index]
 
     def extract_group_from_variant(variant):
         if isinstance(variant, str):
@@ -280,36 +308,48 @@ def ensure_complete_group_distribution(variant_count=None, groups_count=None):
         return extract_group_from_filename(str(variant))
 
     def validate_group_distribution(variants, total_variants=None):
-        total = total_variants or variant_count
-        total = max(total, len(active_groups))
-        expected_count = max(1, total // max(len(active_groups), 1))
-
         counts = {group: 0 for group in active_groups}
         for variant in variants:
             group = extract_group_from_variant(variant)
             if group in counts:
                 counts[group] += 1
 
-        missing = detect_missing_groups([group for group, count in counts.items() if count])
-
-        validation_result = not missing and all(
-            count == expected_count for count in counts.values()
+        validation_result = all(
+            counts.get(group, 0) == target_distribution.get(group, 0)
+            for group in active_groups
         )
 
         if not validation_result:
             logging.warning(f"Distribución de grupos: {counts}")
+            expected_target = (
+                target_distribution.get(active_groups[0], variants_per_group)
+                if active_groups
+                else variants_per_group
+            )
             rebalance_success = attempt_group_rebalancing(
-                variants, counts, expected_count
+                variants, counts, expected_target
             )
             if rebalance_success:
-                validation_result = True
+                counts = {group: 0 for group in active_groups}
+                for variant in variants:
+                    group = extract_group_from_variant(variant)
+                    if group in counts:
+                        counts[group] += 1
+                validation_result = all(
+                    counts.get(group, 0) == target_distribution.get(group, 0)
+                    for group in active_groups
+                )
 
-        return validation_result, counts, expected_count
+        expected_return = (
+            target_distribution.get(active_groups[0], variants_per_group)
+            if active_groups
+            else variants_per_group
+        )
 
-    return assign_variant_group_fixed, validate_group_distribution
+        return validation_result, counts, expected_return
 
+    return assign_variant_group_fixed, validate_group_distribution, target_distribution
 
-GROUP_ASSIGNER, GROUP_VALIDATOR = ensure_complete_group_distribution()
 
 _POLYGON_CACHE = None
 
@@ -1008,58 +1048,155 @@ def _images_are_nearly_identical(arr_a, arr_b, tolerance=1.0):
     return float(np.mean(diff)) <= tolerance
 
 
+def images_are_identical(image_a, image_b, tolerance=1.0):
+    arr_a = np.array(_to_rgba_image(image_a), dtype=np.float32)
+    arr_b = np.array(_to_rgba_image(image_b), dtype=np.float32)
+    if arr_a.shape != arr_b.shape:
+        return False
+    diff = np.abs(arr_a - arr_b)
+    return float(np.mean(diff)) <= tolerance
+
+
+def apply_basic_illumination(image, brightness=None, contrast=None, rng=None):
+    rng = rng or random
+    brightness = brightness if brightness is not None else rng.uniform(0.5, 1.8)
+    contrast = contrast if contrast is not None else rng.uniform(0.7, 1.5)
+    brightened = ImageEnhance.Brightness(image).enhance(brightness)
+    return ImageEnhance.Contrast(brightened).enhance(contrast)
+
+
+def apply_hsv_illumination(image, value_factor=None):
+    factor = value_factor if value_factor is not None else random.uniform(0.6, 1.6)
+    hsv = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * factor, 0, 255)
+    rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    return Image.fromarray(rgb, "RGB").convert("RGBA")
+
+
+def apply_gamma_illumination(image, gamma=None):
+    gamma = gamma if gamma is not None else random.uniform(0.6, 1.6)
+    gamma = max(gamma, 1e-3)
+    arr = np.array(image.convert("RGBA"), dtype=np.float32) / 255.0
+    rgb = np.power(arr[:, :, :3], 1.0 / gamma)
+    arr[:, :, :3] = np.clip(rgb, 0.0, 1.0)
+    return Image.fromarray((arr * 255).astype(np.uint8), "RGBA")
+
+
+def apply_guaranteed_illumination(image, seed=None):
+    rng = random.Random(seed if seed is not None else random.randint(1, 10_000_000))
+    change = rng.randint(-30, 30)
+    arr = np.array(image.convert("RGBA"), dtype=np.int16)
+    arr[:, :, :3] = np.clip(arr[:, :, :3] + change, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8), "RGBA")
+
+
+def generate_low_contrast_variant(image, colors=None, index=0):
+    base_image = _to_rgba_image(image)
+    rng = random.Random(index * 37 + 7)
+    try:
+        factor = rng.uniform(0.3, 0.6)
+        return ImageEnhance.Contrast(base_image).enhance(factor)
+    except Exception:
+        return base_image.copy()
+
+
+def generate_high_contrast_variant(image, colors=None, index=0):
+    base_image = _to_rgba_image(image)
+    rng = random.Random(index * 53 + 11)
+    try:
+        factor = rng.uniform(1.8, 2.2)
+        return ImageEnhance.Contrast(base_image).enhance(factor)
+    except Exception:
+        return base_image.copy()
+
+
+def generate_robust_illumination_variant(image, colors=None, index=0, variant_params=None):
+    base_image = _to_rgba_image(image)
+    params = variant_params or {}
+    rng = random.Random(index * 101 + 23)
+    brightness_range = params.get("brightness_range")
+    contrast_range = params.get("contrast_range")
+
+    def basic_strategy():
+        brightness = None
+        contrast = None
+        if brightness_range and len(brightness_range) == 2:
+            brightness = rng.uniform(brightness_range[0], brightness_range[1])
+        if contrast_range and len(contrast_range) == 2:
+            contrast = rng.uniform(contrast_range[0], contrast_range[1])
+        return apply_basic_illumination(base_image, brightness, contrast, rng)
+
+    strategies = [
+        basic_strategy,
+        lambda: apply_hsv_illumination(base_image, rng.uniform(0.6, 1.6)),
+        lambda: apply_gamma_illumination(base_image, rng.uniform(0.6, 1.6)),
+    ]
+
+    for strategy in strategies:
+        try:
+            candidate = strategy()
+            if candidate and not images_are_identical(base_image, candidate):
+                return candidate
+        except Exception:
+            continue
+
+    try:
+        fallback = apply_guaranteed_illumination(base_image, index)
+        if not images_are_identical(base_image, fallback):
+            return fallback
+    except Exception:
+        pass
+
+    # Último recurso: variación básica pero garantizando cambio mínimo
+    safe_variant = apply_basic_illumination(base_image, rng=rng)
+    if images_are_identical(base_image, safe_variant):
+        safe_variant = apply_guaranteed_illumination(base_image, index + 9973)
+    return safe_variant
+
+
+def reduce_color_palette_simple(image):
+    arr = np.array(_to_rgba_image(image), dtype=np.uint8)
+    rgb = arr[:, :, :3]
+    for channel in range(3):
+        rgb[:, :, channel] = (rgb[:, :, channel] // 32) * 32
+    arr[:, :, :3] = rgb
+    return Image.fromarray(arr, "RGBA")
+
+
+def generate_concise_colors_variant(image, colors=None, index=0):
+    base_image = _to_rgba_image(image)
+    try:
+        quantized = base_image.quantize(colors=8, method=Image.MEDIANCUT).convert("RGBA")
+        if not images_are_identical(base_image, quantized):
+            return quantized
+    except Exception:
+        pass
+
+    try:
+        simplified = reduce_color_palette_simple(base_image)
+        if not images_are_identical(base_image, simplified):
+            return simplified
+    except Exception:
+        pass
+
+    return base_image.copy()
+
+
 def ensure_illumination_group_generation():
     """Garantiza transformaciones robustas para el grupo illumination."""
 
-    def apply_aggressive_illumination(image):
-        strategies = [
-            lambda img: apply_brightness_variation(img, 0.3),
-            lambda img: apply_brightness_variation(img, 1.7),
-            lambda img: apply_contrast_variation(img, 0.4),
-            lambda img: apply_contrast_variation(img, 1.8),
-        ]
-        choice = random.choice(strategies)
-        return choice(image)
-
-    def apply_illumination_fallback(image):
-        darker = apply_brightness_variation(image, 0.6)
-        return apply_contrast_variation(darker, 1.4)
-
     def apply_illumination_characteristics_fixed(image, variant_params=None):
         try:
-            base_image = _to_rgba_image(image)
-            base_array = np.array(base_image, dtype=np.uint8)
-
-            brightness_range = variant_params.get("brightness_range") if variant_params else None
-            contrast_range = variant_params.get("contrast_range") if variant_params else None
-
-            brightness_factor = random.uniform(0.4, 1.8)
-            contrast_factor = random.uniform(0.6, 1.4)
-            if brightness_range and len(brightness_range) == 2:
-                brightness_factor = random.uniform(brightness_range[0], brightness_range[1])
-            if contrast_range and len(contrast_range) == 2:
-                contrast_factor = random.uniform(contrast_range[0], contrast_range[1])
-
-            illuminated = apply_physically_based_illumination(
-                base_image, brightness_factor, contrast_factor
+            variant_index = (variant_params or {}).get("variant_index", 0)
+            variant = generate_robust_illumination_variant(
+                image,
+                index=variant_index,
+                variant_params=variant_params,
             )
-            if isinstance(illuminated, Image.Image):
-                illuminated_array = np.array(illuminated.convert("RGBA"), dtype=np.uint8)
-            else:
-                illuminated_array = np.array(illuminated, dtype=np.uint8)
-
-            if _images_are_nearly_identical(base_array, illuminated_array):
-                logging.warning(
-                    "Transformación de iluminación falló, usando fallback"
-                )
-                fallback_image = apply_aggressive_illumination(base_image)
-                illuminated_array = np.array(fallback_image.convert("RGBA"), dtype=np.uint8)
-
-            return illuminated_array
-
+            return np.array(_to_rgba_image(variant), dtype=np.uint8)
         except Exception as exc:
             logging.error(f"Error en illumination group: {exc}")
-            fallback = apply_illumination_fallback(_to_rgba_image(image))
+            fallback = apply_guaranteed_illumination(_to_rgba_image(image), None)
             return np.array(fallback.convert("RGBA"), dtype=np.uint8)
 
     return apply_illumination_characteristics_fixed
@@ -1156,11 +1293,17 @@ def generate_perceptual_background(base_background, variant_index):
     return bg
 
 
+GROUP_ASSIGNER, GROUP_VALIDATOR, GROUP_TARGET_DISTRIBUTION = ensure_complete_group_distribution()
+
+
 def assign_variant_group(variant_index, total_variants=None):
     """Asigna variante a un grupo perceptual equilibrado."""
     cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+    guaranteed_total = sum(GROUP_TARGET_DISTRIBUTION.values())
     if total_variants is None:
-        total_variants = cfg.get("TOTAL_VARIANTS", 1)
+        total_variants = cfg.get("TOTAL_VARIANTS", guaranteed_total)
+
+    total_variants = max(total_variants, guaranteed_total)
 
     return GROUP_ASSIGNER(variant_index, total_variants)
 
@@ -1177,10 +1320,13 @@ def apply_group_specific_processing(image_array, group_type, variant_index):
 
     rng = random.Random(variant_index * 101 + 29)
 
-    if group_type in {"low_contrast", "high_contrast"}:
-        contrast_range = group_cfg.get("contrast_range", (0.8, 1.2))
-        contrast = rng.uniform(contrast_range[0], contrast_range[1])
-        return simulate_human_contrast_perception(image_array, contrast)
+    if group_type == "low_contrast":
+        variant = generate_low_contrast_variant(image_array, None, variant_index)
+        return np.array(_to_rgba_image(variant), dtype=np.uint8)
+
+    if group_type == "high_contrast":
+        variant = generate_high_contrast_variant(image_array, None, variant_index)
+        return np.array(_to_rgba_image(variant), dtype=np.uint8)
 
     if group_type == "illumination":
         return APPLY_ILLUMINATION_TRANSFORM(
@@ -1193,9 +1339,8 @@ def apply_group_specific_processing(image_array, group_type, variant_index):
         )
 
     if group_type == "concise_colors":
-        tolerance = group_cfg.get("color_tolerance", 12)
-        palette_size = group_cfg.get("palette_size", 8)
-        return generate_concise_color_palette(image_array, tolerance, palette_size)
+        variant = generate_concise_colors_variant(image_array, None, variant_index)
+        return np.array(_to_rgba_image(variant), dtype=np.uint8)
 
     return image_array
 
@@ -1273,6 +1418,45 @@ def generate_perceptual_filename(base_name, rot_suffix, color_idx, group_type, v
     return f"{base_name}{rot_suffix}_{color_tag}_{group_type}_{variant_tag}.png"
 
 
+def parse_variant_filename_metadata(filename):
+    """Extrae metadatos clave desde un nombre de variante generado."""
+    stem = Path(filename).stem
+    parts = stem.split("_")
+    if len(parts) < 4:
+        return None
+
+    base_rot = parts[0]
+    color_tag = parts[1]
+    group_tag = parts[2]
+    variant_tag = parts[3]
+
+    rot_suffix = "rot0"
+    base_name = base_rot
+    for candidate in ("rot270", "rot180", "rot90", "rot0"):
+        if base_rot.endswith(candidate):
+            base_name = base_rot[: -len(candidate)] or base_rot
+            rot_suffix = candidate
+            break
+
+    try:
+        color_idx = max(0, int(color_tag.replace("color", "")) - 1)
+    except ValueError:
+        color_idx = 0
+
+    try:
+        variant_index = max(0, int(variant_tag.replace("v", "")) - 1)
+    except ValueError:
+        variant_index = 0
+
+    return {
+        "base_name": base_name,
+        "rot_suffix": rot_suffix,
+        "color_idx": color_idx,
+        "variant_index": variant_index,
+        "group": group_tag,
+    }
+
+
 def extract_group_from_filename(filename):
     """Obtiene el grupo perceptual a partir del nombre de archivo."""
     stem = Path(filename).stem
@@ -1286,6 +1470,165 @@ def extract_group_from_filename(filename):
         if part in valid_groups:
             return part
     return "base"
+
+
+def count_group_distribution(variants):
+    counts = {}
+    for variant in variants:
+        group = extract_group_from_filename(Path(variant).name if isinstance(variant, (str, Path)) else str(variant))
+        counts[group] = counts.get(group, 0) + 1
+    return counts
+
+
+def find_group_with_excess(current_counts, target_distribution):
+    for group, count in sorted(current_counts.items(), key=lambda item: item[1], reverse=True):
+        if count > target_distribution.get(group, 0):
+            return group
+    return None
+
+
+def convert_variant_between_groups(variants, source_index, to_group, new_variant_index):
+    source_path = Path(variants[source_index])
+    metadata = parse_variant_filename_metadata(source_path.name)
+    if metadata is None:
+        return None
+
+    try:
+        with Image.open(source_path) as img:
+            base_image = img.convert("RGBA")
+    except Exception as exc:
+        logging.error("No se pudo cargar %s para rebalancear: %s", source_path, exc)
+        return None
+
+    from_group = metadata.get("group", "base")
+
+    if to_group == "low_contrast":
+        transformed = generate_low_contrast_variant(base_image, None, new_variant_index)
+    elif to_group == "high_contrast":
+        transformed = generate_high_contrast_variant(base_image, None, new_variant_index)
+    elif to_group == "illumination":
+        transformed = generate_robust_illumination_variant(
+            base_image,
+            index=new_variant_index,
+            variant_params={}
+        )
+    elif to_group == "concise_colors":
+        transformed = generate_concise_colors_variant(base_image, None, new_variant_index)
+    else:
+        transformed = base_image.copy()
+
+    transformed = _to_rgba_image(transformed)
+
+    base_name = metadata.get("base_name") or source_path.stem
+    rot_suffix = metadata.get("rot_suffix", "rot0")
+    color_idx = metadata.get("color_idx", 0)
+
+    candidate_index = max(0, new_variant_index)
+    while True:
+        new_name = generate_perceptual_filename(
+            base_name,
+            rot_suffix,
+            color_idx,
+            to_group,
+            candidate_index,
+        )
+        new_path = source_path.parent / new_name
+        if not new_path.exists() or new_path == source_path:
+            break
+        candidate_index += 1
+
+    transformed.save(new_path, optimize=True)
+    if new_path != source_path:
+        try:
+            os.remove(source_path)
+        except OSError:
+            pass
+
+    logging.info(
+        "Rebalanceo: %s → %s (%s → %s)",
+        from_group,
+        to_group,
+        source_path.name,
+        new_path.name,
+    )
+
+    return str(new_path)
+
+
+def implement_actual_rebalancing_system():
+    """Crea un sistema de rebalanceo automático entre grupos."""
+
+    def rebalance_variants_automatically(variants, target_distribution):
+        if not variants:
+            return False
+
+        current_counts = count_group_distribution(variants)
+        for group in target_distribution:
+            current_counts.setdefault(group, 0)
+
+        if all(
+            current_counts.get(group, 0) == target_distribution.get(group, 0)
+            for group in target_distribution
+        ):
+            return True
+
+        next_variant_index = {
+            group: current_counts.get(group, 0)
+            for group in target_distribution
+        }
+
+        changed = False
+
+        for missing_group, expected_count in target_distribution.items():
+            needed = expected_count - current_counts.get(missing_group, 0)
+            attempts = 0
+            while needed > 0:
+                excess_group = find_group_with_excess(current_counts, target_distribution)
+                if not excess_group:
+                    break
+
+                try:
+                    source_index = next(
+                        idx
+                        for idx, path in enumerate(variants)
+                        if extract_group_from_filename(Path(path).name) == excess_group
+                    )
+                except StopIteration:
+                    current_counts[excess_group] = target_distribution.get(excess_group, 0)
+                    break
+
+                new_path = convert_variant_between_groups(
+                    variants,
+                    source_index,
+                    missing_group,
+                    next_variant_index.get(missing_group, 0),
+                )
+
+                attempts += 1
+
+                if not new_path:
+                    if attempts > len(variants):
+                        break
+                    continue
+
+                variants[source_index] = new_path
+                current_counts[excess_group] = max(
+                    0, current_counts.get(excess_group, 0) - 1
+                )
+                current_counts[missing_group] = current_counts.get(missing_group, 0) + 1
+                next_variant_index[missing_group] = current_counts[missing_group]
+                needed -= 1
+                changed = True
+
+        return changed and all(
+            current_counts.get(group, 0) == target_distribution.get(group, 0)
+            for group in target_distribution
+        )
+
+    return rebalance_variants_automatically
+
+
+REBALANCE_VARIANTS = implement_actual_rebalancing_system()
 
 
 def calculate_image_statistics(image):
@@ -1523,9 +1866,7 @@ def create_adaptive_perceptual_metrics():
         thresholds.setdefault("background_variation_threshold", 0.02)
         thresholds.setdefault("edge_strength_min", 0.05)
         thresholds["profile"] = profile
-        thresholds["total_variants"] = CONFIG.get(
-            "PERCEPTUAL_VARIANT_SYSTEM", {}
-        ).get("TOTAL_VARIANTS", 125)
+        thresholds["total_variants"] = sum(GROUP_TARGET_DISTRIBUTION.values())
 
         return {
             "profile": profile,
@@ -1824,9 +2165,7 @@ def implement_batch_validation(
         return float(min(contrast_values)), float(max(contrast_values))
 
     def validate_complete_batch(variants_batch, image_name, rotation, log_warning=None):
-        expected_total = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
-            "TOTAL_VARIANTS", 125
-        )
+        expected_total = sum(GROUP_TARGET_DISTRIBUTION.values())
 
         metrics = {
             "total_variants": len(variants_batch),
@@ -2740,7 +3079,8 @@ def process_single_color(args):
     try:
         perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
         group_type = assign_variant_group(
-            variant_index, perceptual_cfg.get("TOTAL_VARIANTS", variant_index + 1)
+            variant_index,
+            sum(GROUP_TARGET_DISTRIBUTION.values()),
         )
         track_group_usage(group_type)
 
@@ -2825,6 +3165,7 @@ def process_rotation_parallel(args):
 
         color_tasks = []
         perceptual_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
+        guaranteed_total = sum(GROUP_TARGET_DISTRIBUTION.values())
         total_variants = perceptual_cfg.get("TOTAL_VARIANTS", len(colors) or 1)
         enabled_groups = [
             name
@@ -2835,6 +3176,14 @@ def process_rotation_parallel(args):
             group_variants = perceptual_cfg.get("VARIANTS_PER_GROUP")
             if group_variants:
                 total_variants = max(total_variants, group_variants * len(enabled_groups))
+
+        if total_variants != guaranteed_total:
+            logging.warning(
+                "Ajustando total de variantes de %s a %s para garantizar distribución",
+                total_variants,
+                guaranteed_total,
+            )
+        total_variants = guaranteed_total
 
         if not colors:
             logging.warning(
@@ -2898,6 +3247,20 @@ def process_rotation_parallel(args):
         logging.info(
             f"Completadas {generated_count} variantes para rotación {rot_suffix}"
         )
+
+        if generated_variants and REBALANCE_VARIANTS is not None:
+            try:
+                REBALANCE_VARIANTS(
+                    generated_variants,
+                    dict(GROUP_TARGET_DISTRIBUTION),
+                )
+            except Exception as rebalance_error:
+                logging.error(
+                    "Error intentando rebalancear variantes de %s%s: %s",
+                    base_name,
+                    rot_suffix,
+                    rebalance_error,
+                )
 
         warnings = []
         batch_report = {"passed": True, "warnings": [], "metrics": {}}
