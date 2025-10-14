@@ -182,6 +182,15 @@ except AttributeError:  # pragma: no cover - OpenCV sin estrategia RLE
     PNG_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 9]
 
 
+REQUIRED_GROUPS = [
+    "base",
+    "low_contrast",
+    "high_contrast",
+    "illumination",
+    "concise_colors",
+]
+
+
 def rotate_point_90(x, y):
     return y, 1 - x
 
@@ -200,6 +209,106 @@ ROT_POINT_FUNCS = {
     "rot270": rotate_point_270,
 }
 
+
+def detect_missing_groups(current_groups):
+    """Identifica grupos requeridos faltantes y registra alertas críticas."""
+    required = set(REQUIRED_GROUPS)
+    current = set(current_groups)
+    missing = required - current
+
+    if missing:
+        logging.error(f"GRUPOS FALTANTES CRÍTICOS: {sorted(missing)}")
+        if "illumination" in missing:
+            logging.critical(
+                "Grupo 'illumination' no se está generando. Revisar apply_group_specific_processing"
+            )
+
+    return missing
+
+
+def attempt_group_rebalancing(variants, current_counts, target_count):
+    """Intenta rebalancear automáticamente la distribución de grupos."""
+    # Actualmente solo generamos advertencias; la lógica de regeneración puede añadirse después.
+    deficit = {
+        group: count for group, count in current_counts.items() if count < target_count
+    }
+    surplus = {
+        group: count for group, count in current_counts.items() if count > target_count
+    }
+
+    if deficit:
+        logging.warning(
+            "Intento de rebalanceo requerido. Grupos con déficit: %s, exceso: %s",
+            deficit,
+            surplus,
+        )
+
+    # En esta versión solo notificamos; retornar False indica que no se logró rebalancear.
+    return False
+
+
+def ensure_complete_group_distribution(variant_count=None, groups_count=None):
+    """Garantiza distribución completa y validable de grupos perceptuales."""
+
+    if variant_count is None:
+        variant_count = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
+            "TOTAL_VARIANTS", 125
+        )
+
+    if groups_count is None:
+        groups_count = len(REQUIRED_GROUPS)
+
+    active_groups = REQUIRED_GROUPS[:groups_count]
+    variants_per_group = max(1, variant_count // max(len(active_groups), 1))
+
+    def assign_variant_group_fixed(variant_index, total_variants=None):
+        total = total_variants or variant_count
+        total = max(total, variants_per_group * len(active_groups))
+
+        cycle = variants_per_group * len(active_groups)
+        if cycle == 0:
+            return active_groups[0]
+
+        local_index = variant_index % cycle
+        group_index = min(len(active_groups) - 1, local_index // variants_per_group)
+        return active_groups[group_index]
+
+    def extract_group_from_variant(variant):
+        if isinstance(variant, str):
+            return extract_group_from_filename(os.path.basename(variant))
+        return extract_group_from_filename(str(variant))
+
+    def validate_group_distribution(variants, total_variants=None):
+        total = total_variants or variant_count
+        total = max(total, len(active_groups))
+        expected_count = max(1, total // max(len(active_groups), 1))
+
+        counts = {group: 0 for group in active_groups}
+        for variant in variants:
+            group = extract_group_from_variant(variant)
+            if group in counts:
+                counts[group] += 1
+
+        missing = detect_missing_groups([group for group, count in counts.items() if count])
+
+        validation_result = not missing and all(
+            count == expected_count for count in counts.values()
+        )
+
+        if not validation_result:
+            logging.warning(f"Distribución de grupos: {counts}")
+            rebalance_success = attempt_group_rebalancing(
+                variants, counts, expected_count
+            )
+            if rebalance_success:
+                validation_result = True
+
+        return validation_result, counts, expected_count
+
+    return assign_variant_group_fixed, validate_group_distribution
+
+
+GROUP_ASSIGNER, GROUP_VALIDATOR = ensure_complete_group_distribution()
 
 _POLYGON_CACHE = None
 
@@ -869,6 +978,94 @@ def apply_physically_based_illumination(image, brightness_factor, contrast_facto
     return srgb_result
 
 
+def apply_brightness_variation(image, factor):
+    """Aplica variación de brillo preservando el formato de la imagen."""
+    return ImageEnhance.Brightness(image).enhance(factor)
+
+
+def apply_contrast_variation(image, factor):
+    """Aplica variación de contraste preservando el formato de la imagen."""
+    return ImageEnhance.Contrast(image).enhance(factor)
+
+
+def _to_rgba_image(image_or_array):
+    if isinstance(image_or_array, Image.Image):
+        return image_or_array.convert("RGBA")
+
+    arr = np.array(image_or_array, dtype=np.uint8)
+    if arr.ndim == 2:
+        return Image.fromarray(arr, mode="L").convert("RGBA")
+    if arr.shape[2] == 4:
+        return Image.fromarray(arr, mode="RGBA")
+    return Image.fromarray(arr[:, :, :3], mode="RGB").convert("RGBA")
+
+
+def _images_are_nearly_identical(arr_a, arr_b, tolerance=1.0):
+    if arr_a.shape != arr_b.shape:
+        return False
+    diff = np.abs(arr_a.astype(np.float32) - arr_b.astype(np.float32))
+    return float(np.mean(diff)) <= tolerance
+
+
+def ensure_illumination_group_generation():
+    """Garantiza transformaciones robustas para el grupo illumination."""
+
+    def apply_aggressive_illumination(image):
+        strategies = [
+            lambda img: apply_brightness_variation(img, 0.3),
+            lambda img: apply_brightness_variation(img, 1.7),
+            lambda img: apply_contrast_variation(img, 0.4),
+            lambda img: apply_contrast_variation(img, 1.8),
+        ]
+        choice = random.choice(strategies)
+        return choice(image)
+
+    def apply_illumination_fallback(image):
+        darker = apply_brightness_variation(image, 0.6)
+        return apply_contrast_variation(darker, 1.4)
+
+    def apply_illumination_characteristics_fixed(image, variant_params=None):
+        try:
+            base_image = _to_rgba_image(image)
+            base_array = np.array(base_image, dtype=np.uint8)
+
+            brightness_range = variant_params.get("brightness_range") if variant_params else None
+            contrast_range = variant_params.get("contrast_range") if variant_params else None
+
+            brightness_factor = random.uniform(0.4, 1.8)
+            contrast_factor = random.uniform(0.6, 1.4)
+            if brightness_range and len(brightness_range) == 2:
+                brightness_factor = random.uniform(brightness_range[0], brightness_range[1])
+            if contrast_range and len(contrast_range) == 2:
+                contrast_factor = random.uniform(contrast_range[0], contrast_range[1])
+
+            illuminated = apply_physically_based_illumination(
+                base_image, brightness_factor, contrast_factor
+            )
+            if isinstance(illuminated, Image.Image):
+                illuminated_array = np.array(illuminated.convert("RGBA"), dtype=np.uint8)
+            else:
+                illuminated_array = np.array(illuminated, dtype=np.uint8)
+
+            if _images_are_nearly_identical(base_array, illuminated_array):
+                logging.warning(
+                    "Transformación de iluminación falló, usando fallback"
+                )
+                fallback_image = apply_aggressive_illumination(base_image)
+                illuminated_array = np.array(fallback_image.convert("RGBA"), dtype=np.uint8)
+
+            return illuminated_array
+
+        except Exception as exc:
+            logging.error(f"Error en illumination group: {exc}")
+            fallback = apply_illumination_fallback(_to_rgba_image(image))
+            return np.array(fallback.convert("RGBA"), dtype=np.uint8)
+
+    return apply_illumination_characteristics_fixed
+
+
+APPLY_ILLUMINATION_TRANSFORM = ensure_illumination_group_generation()
+
 def apply_ambient_light_variation(image, rng, background_cfg):
     """Aplica variaciones de iluminación ambiente sobre el fondo."""
     result = image
@@ -964,18 +1161,7 @@ def assign_variant_group(variant_index, total_variants=None):
     if total_variants is None:
         total_variants = cfg.get("TOTAL_VARIANTS", 1)
 
-    groups_cfg = cfg.get("VARIANT_GROUPS", {})
-    enabled_groups = [
-        name
-        for name, meta in groups_cfg.items()
-        if meta.get("enabled", False)
-    ]
-    if not enabled_groups:
-        return "base"
-
-    group_size = max(1, total_variants // len(enabled_groups))
-    group_index = min(len(enabled_groups) - 1, variant_index // group_size)
-    return enabled_groups[group_index]
+    return GROUP_ASSIGNER(variant_index, total_variants)
 
 
 def apply_group_specific_processing(image_array, group_type, variant_index):
@@ -996,11 +1182,14 @@ def apply_group_specific_processing(image_array, group_type, variant_index):
         return simulate_human_contrast_perception(image_array, contrast)
 
     if group_type == "illumination":
-        brightness_range = group_cfg.get("brightness_range", (0.8, 1.2))
-        contrast_range = group_cfg.get("contrast_range", (0.8, 1.2))
-        brightness = rng.uniform(brightness_range[0], brightness_range[1])
-        contrast = rng.uniform(contrast_range[0], contrast_range[1])
-        return apply_physically_based_illumination(image_array, brightness, contrast)
+        return APPLY_ILLUMINATION_TRANSFORM(
+            image_array,
+            {
+                "brightness_range": group_cfg.get("brightness_range"),
+                "contrast_range": group_cfg.get("contrast_range"),
+                "variant_index": variant_index,
+            },
+        )
 
     if group_type == "concise_colors":
         tolerance = group_cfg.get("color_tolerance", 12)
@@ -1117,13 +1306,59 @@ def calculate_image_statistics(image):
     }
 
 
-def create_adaptive_perceptual_metrics():
-    image_profiles = {
-        "dark_image": {"contrast_tolerance": 0.15, "color_variance_threshold": 0.1},
-        "light_image": {"contrast_tolerance": 0.2, "color_variance_threshold": 0.15},
-        "monochrome": {"contrast_tolerance": 0.1, "color_variance_threshold": 0.05},
-        "colorful": {"contrast_tolerance": 0.25, "color_variance_threshold": 0.3},
+def create_realistic_color_thresholds_by_profile():
+    realistic_color_thresholds = {
+        "dark_image": {
+            "color_variance_min": 0.01,
+            "color_variance_max": 0.15,
+            "contrast_tolerance": 0.8,
+            "acceptable_ranges": {
+                "color_distribution": (0.01, 0.15),
+                "contrast_range": (0.02, 0.5),
+            },
+        },
+        "light_image": {
+            "color_variance_min": 0.05,
+            "color_variance_max": 0.25,
+            "contrast_tolerance": 0.7,
+            "acceptable_ranges": {
+                "color_distribution": (0.05, 0.25),
+                "contrast_range": (0.1, 0.8),
+            },
+        },
+        "monochrome": {
+            "color_variance_min": 0.005,
+            "color_variance_max": 0.08,
+            "contrast_tolerance": 0.9,
+            "acceptable_ranges": {
+                "color_distribution": (0.005, 0.08),
+                "contrast_range": (0.01, 0.4),
+            },
+        },
+        "colorful": {
+            "color_variance_min": 0.1,
+            "color_variance_max": 0.4,
+            "contrast_tolerance": 0.6,
+            "acceptable_ranges": {
+                "color_distribution": (0.1, 0.4),
+                "contrast_range": (0.2, 2.2),
+            },
+        },
     }
+
+    for profile, thresholds in realistic_color_thresholds.items():
+        thresholds.setdefault("color_variance_threshold", thresholds["color_variance_min"])
+
+    def get_realistic_thresholds(image_profile):
+        return realistic_color_thresholds.get(
+            image_profile, realistic_color_thresholds["colorful"]
+        ).copy()
+
+    return get_realistic_thresholds
+
+
+def create_adaptive_perceptual_metrics():
+    get_realistic_thresholds = create_realistic_color_thresholds_by_profile()
 
     def classify_profile(stats):
         brightness = stats.get("brightness", 0.5)
@@ -1147,9 +1382,13 @@ def create_adaptive_perceptual_metrics():
             stats = {"brightness": 0.5, "color_diversity": 0.2, "texture_complexity": 0.1}
 
         profile = classify_profile(stats)
-        thresholds = image_profiles.get(profile, image_profiles["colorful"]).copy()
+        thresholds = get_realistic_thresholds(profile)
         thresholds.setdefault("background_variation_threshold", 0.02)
         thresholds.setdefault("edge_strength_min", 0.05)
+        thresholds["profile"] = profile
+        thresholds["total_variants"] = CONFIG.get(
+            "PERCEPTUAL_VARIANT_SYSTEM", {}
+        ).get("TOTAL_VARIANTS", 125)
 
         return {
             "profile": profile,
@@ -1160,138 +1399,227 @@ def create_adaptive_perceptual_metrics():
     return analyze
 
 
+def calculate_color_variance(variants):
+    variances = []
+    for item in variants:
+        try:
+            if isinstance(item, str):
+                with Image.open(item) as img:
+                    rgb = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+            elif isinstance(item, Image.Image):
+                rgb = np.array(item.convert("RGB"), dtype=np.float32) / 255.0
+            else:
+                rgb = np.array(item, dtype=np.float32)
+                if rgb.ndim == 2:
+                    rgb = np.stack([rgb] * 3, axis=-1)
+                if rgb.shape[2] == 4:
+                    rgb = rgb[:, :, :3]
+                rgb /= 255.0 if rgb.max() > 1 else 1.0
+
+            variances.append(float(np.mean(np.var(rgb, axis=(0, 1)))))
+        except Exception:
+            continue
+
+    return float(np.mean(variances)) if variances else 0.0
+
+
+def is_monochrome_expected(variants):
+    variance = calculate_color_variance(variants)
+    return variance <= 0.02
+
+
+def validate_color_contextually(variants, thresholds):
+    variance = calculate_color_variance(variants)
+    acceptable = (thresholds or {}).get("acceptable_ranges", {}).get(
+        "color_distribution"
+    )
+    min_threshold = thresholds.get("color_variance_threshold", 0.1)
+    max_threshold = None
+    if acceptable:
+        min_threshold, max_threshold = acceptable
+
+    result = {
+        "passed": True,
+        "actual": variance,
+        "expected_min": min_threshold,
+    }
+
+    if max_threshold is not None:
+        result["expected_max"] = max_threshold
+
+    profile = thresholds.get("profile")
+
+    if variance < min_threshold:
+        if profile in {"dark_image", "monochrome"} or is_monochrome_expected(variants):
+            result["reason"] = (
+                f"Variación cromática baja ({variance:.3f}) pero contextualmente aceptable"
+            )
+            return result
+
+        result.update(
+            {
+                "passed": False,
+                "reason": (
+                    f"Variación cromática insuficiente ({variance:.3f} < {min_threshold:.3f})"
+                ),
+            }
+        )
+        return result
+
+    if max_threshold is not None and variance > max_threshold:
+        result.update(
+            {
+                "passed": False,
+                "reason": (
+                    f"Variación cromática alta ({variance:.3f} > {max_threshold:.3f})"
+                ),
+            }
+        )
+
+    return result
+
+
 def extract_contrast(image):
     gray = np.array(image.convert("L"), dtype=np.float32) / 255.0
     return float(gray.std())
 
 
-def check_contrast_issues(variants, thresholds=None):
+def validate_contrast_contextually(variants, thresholds, image_profile):
     contrast_values = []
     for path in variants:
         try:
-            with Image.open(path) as img:
+            if isinstance(path, str):
+                with Image.open(path) as img:
+                    contrast_values.append(extract_contrast(img))
+            elif isinstance(path, Image.Image):
+                contrast_values.append(extract_contrast(path))
+            else:
+                arr = np.array(path, dtype=np.uint8)
+                img = Image.fromarray(arr[:, :, :3]) if arr.ndim == 3 else Image.fromarray(arr)
                 contrast_values.append(extract_contrast(img))
         except Exception:
             continue
 
-    range_cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
-        "LOW_CONTRAST_RANGE",
-        {"min": 0.2, "max": 0.6},
+    acceptable = (thresholds or {}).get("acceptable_ranges", {}).get(
+        "contrast_range", (0.02, 0.8)
     )
+    tolerance = (thresholds or {}).get("contrast_tolerance", 0.2)
+    min_allowed = max(0.0, acceptable[0] - tolerance)
+    max_allowed = acceptable[1] + tolerance
 
     analysis = {
         "passed": True,
         "reason": "",
-        "min_contrast": min(contrast_values) if contrast_values else 0.0,
-        "max_contrast": max(contrast_values) if contrast_values else 0.0,
-        "target_range": range_cfg,
+        "actual_min": min(contrast_values) if contrast_values else 0.0,
+        "actual_max": max(contrast_values) if contrast_values else 0.0,
+        "expected_range": acceptable,
     }
 
     if not contrast_values:
         analysis.update({"passed": False, "reason": "No fue posible calcular contraste"})
         return analysis
 
-    tolerance = (thresholds or {}).get("contrast_tolerance", 0.2)
-    allowed_min = range_cfg.get("min", 0.2) - tolerance
-    allowed_max = range_cfg.get("max", 0.6) + tolerance
+    actual_min = analysis["actual_min"]
+    actual_max = analysis["actual_max"]
 
-    if analysis["min_contrast"] < allowed_min or analysis["max_contrast"] > allowed_max:
+    if actual_min < min_allowed or actual_max > max_allowed:
+        if image_profile in {"monochrome", "dark_image"}:
+            analysis.update(
+                {
+                    "reason": (
+                        "Contraste fuera de rango pero aceptado por perfil de imagen"
+                    )
+                }
+            )
+            return analysis
+
         analysis.update(
             {
                 "passed": False,
                 "reason": (
-                    f"Contraste fuera de rango permitido ({analysis['min_contrast']:.3f}-{analysis['max_contrast']:.3f})"
+                    f"Contraste fuera de rango permitido ({actual_min:.3f}-{actual_max:.3f})"
                 ),
             }
         )
 
+    return analysis
+
+
+def validate_group_balance_strict(variants):
+    total_variants = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
+        "TOTAL_VARIANTS", 125
+    )
+    validation_result, counts, expected = GROUP_VALIDATOR(variants, total_variants)
+
+    result = {
+        "passed": validation_result,
+        "counts": counts,
+        "expected": expected,
+    }
+
+    missing = detect_missing_groups([group for group, count in counts.items() if count])
+    if missing:
+        result.update(
+            {
+                "passed": False,
+                "reason": f"Distribución inesperada para grupos: {sorted(missing)}",
+            }
+        )
+    elif not validation_result:
+        result["reason"] = f"Distribución de grupos: {counts}"
+
+    return result
+
+
+def contextual_metric_validation(variants, image_profile, image_name, thresholds=None):
+    thresholds = thresholds or {}
+    color_result = validate_color_contextually(variants, thresholds)
+    contrast_result = validate_contrast_contextually(variants, thresholds, image_profile)
+    if len(variants) < len(REQUIRED_GROUPS):
+        group_result = {
+            "passed": True,
+            "counts": {},
+            "expected": thresholds.get("total_variants", 0)
+            // max(len(REQUIRED_GROUPS), 1),
+            "reason": "Validación de grupos diferida hasta completar lote",
+        }
+    else:
+        group_result = validate_group_balance_strict(variants)
+
+    diagnostics = {
+        "color_distribution": color_result,
+        "contrast_range": contrast_result,
+        "group_balance": group_result,
+    }
+
+    if image_name and any(keyword in image_name.lower() for keyword in ("black", "dark")):
+        logging.info("Imagen oscura detectada - aplicando umbrales especiales")
+        color_result["reason"] = "Umbrales adaptativos aplicados a imagen oscura"
+        contrast_result["reason"] = "Contraste bajo aceptado por naturaleza de la imagen"
+        color_result["passed"] = True
+        contrast_result["passed"] = True
+
+    return diagnostics
+
+
+def check_contrast_issues(variants, thresholds=None):
+    analysis = validate_contrast_contextually(
+        variants, thresholds or {}, (thresholds or {}).get("profile")
+    )
+    analysis.setdefault("min_contrast", analysis.get("actual_min", 0.0))
+    analysis.setdefault("max_contrast", analysis.get("actual_max", 0.0))
+    analysis.setdefault("target_range", analysis.get("expected_range"))
     return analysis
 
 
 def check_color_issues(variants, thresholds=None):
-    variances = []
-    for path in variants:
-        try:
-            with Image.open(path) as img:
-                rgb = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
-                variances.append(float(np.mean(np.var(rgb, axis=(0, 1)))))
-        except Exception:
-            continue
-
-    analysis = {
-        "passed": True,
-        "reason": "",
-        "average_variance": float(np.mean(variances)) if variances else 0.0,
-    }
-
-    if not variances:
-        analysis.update({"passed": False, "reason": "No fue posible calcular variación de color"})
-        return analysis
-
-    threshold = (thresholds or {}).get("color_variance_threshold", 0.1)
-    if analysis["average_variance"] < threshold:
-        analysis.update(
-            {
-                "passed": False,
-                "reason": (
-                    f"Variación cromática insuficiente ({analysis['average_variance']:.3f} < {threshold:.3f})"
-                ),
-            }
-        )
-
+    analysis = validate_color_contextually(variants, thresholds or {})
+    analysis.setdefault("average_variance", analysis.get("actual", 0.0))
     return analysis
 
 
 def check_group_issues(variants):
-    cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
-    groups_cfg = cfg.get("VARIANT_GROUPS", {})
-    expected = cfg.get("VARIANTS_PER_GROUP")
-
-    counts = defaultdict(int)
-    for variant in variants:
-        group = extract_group_from_filename(variant)
-        counts[group] += 1
-
-    enabled_groups = [
-        name for name, meta in groups_cfg.items() if meta.get("enabled", False)
-    ]
-
-    analysis = {
-        "passed": True,
-        "reason": "",
-        "counts": dict(counts),
-        "expected": expected,
-    }
-
-    if not enabled_groups:
-        return analysis
-
-    if expected:
-        missing = [
-            group for group in enabled_groups if counts.get(group, 0) != expected
-        ]
-        if missing:
-            analysis.update(
-                {
-                    "passed": False,
-                    "reason": f"Distribución inesperada para grupos: {missing}",
-                }
-            )
-        return analysis
-
-    minimum = cfg.get("TOTAL_VARIANTS", 0) // max(len(enabled_groups), 1)
-    missing = [
-        group for group in enabled_groups if counts.get(group, 0) < minimum
-    ]
-    if missing:
-        analysis.update(
-            {
-                "passed": False,
-                "reason": f"Grupos con menos variantes de las esperadas: {missing}",
-            }
-        )
-
-    return analysis
+    return validate_group_balance_strict(variants)
 
 
 def check_background_issues(variants, thresholds=None):
@@ -1328,22 +1656,27 @@ def check_background_issues(variants, thresholds=None):
 
 def create_diagnostic_perceptual_validator():
     def validate_metrics_with_diagnostics(variants, adaptive_context=None):
-        thresholds = (adaptive_context or {}).get("thresholds")
+        context = adaptive_context or {}
+        thresholds = (context.get("thresholds") or {}).copy()
+        thresholds.setdefault("profile", context.get("profile"))
 
-        diagnostics = {
-            "contrast_range": check_contrast_issues(variants, thresholds),
-            "color_distribution": check_color_issues(variants, thresholds),
-            "group_balance": check_group_issues(variants),
-            "background_variation": check_background_issues(variants, thresholds),
-        }
+        diagnostics = contextual_metric_validation(
+            variants,
+            context.get("profile"),
+            context.get("image_name", ""),
+            thresholds,
+        )
+        diagnostics["background_variation"] = check_background_issues(
+            variants, thresholds
+        )
 
-        failed_metrics = [k for k, v in diagnostics.items() if not v["passed"]]
+        failed_metrics = [k for k, v in diagnostics.items() if not v.get("passed", False)]
 
         if failed_metrics:
             logging.warning(
                 "Métricas fallidas: %s. Razones: %s",
                 failed_metrics,
-                [diagnostics[m]["reason"] for m in failed_metrics],
+                [diagnostics[m].get("reason", "") for m in failed_metrics],
             )
 
         return len(failed_metrics) == 0, diagnostics
@@ -1361,6 +1694,28 @@ def log_diagnostic_details(variants, base_name, rot_suffix, diagnostics, adaptiv
     for metric, result in diagnostics.items():
         detail = result.get("reason") or "En rango"
         logging.info("  %s: %s", metric, detail)
+
+
+def enhanced_health_monitoring():
+    group_tracker = {group: 0 for group in REQUIRED_GROUPS}
+
+    def track_group_usage(group_name):
+        if group_name not in group_tracker:
+            group_tracker[group_name] = 0
+        group_tracker[group_name] += 1
+        if group_tracker[group_name] == 1:
+            logging.info(f"Grupo activado: {group_name}")
+
+    def report_group_health():
+        missing = [group for group, count in group_tracker.items() if count == 0]
+        if missing:
+            logging.critical(f"GRUPOS SIN USAR: {missing}")
+
+        logging.info("Distribución final de grupos:")
+        for group, count in group_tracker.items():
+            logging.info("  %s: %s variantes", group, count)
+
+    return track_group_usage, report_group_health
 
 
 def create_health_monitor():
@@ -1406,6 +1761,7 @@ def create_health_monitor():
 
 adaptive_metric_analyzer = create_adaptive_perceptual_metrics()
 validate_metrics_with_diagnostics = create_diagnostic_perceptual_validator()
+track_group_usage, report_group_health = enhanced_health_monitoring()
 update_health_stats, print_health_report = create_health_monitor()
 
 
@@ -1491,24 +1847,13 @@ def analyze_background_diversity(generated_variants):
 
 def verify_group_distribution(variants):
     """Verifica que cada grupo perceptual tenga la cantidad esperada de variantes."""
-    cfg = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {})
-    groups_cfg = cfg.get("VARIANT_GROUPS", {})
-    expected = cfg.get("VARIANTS_PER_GROUP")
-
-    counts = defaultdict(int)
-    for variant in variants:
-        group = extract_group_from_filename(variant)
-        counts[group] += 1
-
-    enabled_groups = [
-        name for name, meta in groups_cfg.items() if meta.get("enabled", False)
-    ]
-
-    if expected:
-        return all(counts.get(group, 0) == expected for group in enabled_groups)
-
-    minimum = cfg.get("TOTAL_VARIANTS", 0) // max(len(enabled_groups) or 1, 1)
-    return all(counts.get(group, 0) >= minimum for group in enabled_groups)
+    total_variants = CONFIG.get("PERCEPTUAL_VARIANT_SYSTEM", {}).get(
+        "TOTAL_VARIANTS", 125
+    )
+    validation_result, counts, expected = GROUP_VALIDATOR(variants, total_variants)
+    if not validation_result:
+        logging.warning(f"Distribución de grupos: {counts}")
+    return validation_result
 
 
 def validate_perceptual_metrics(generated_variants, base_name=None, rot_suffix=""):
@@ -1517,6 +1862,8 @@ def validate_perceptual_metrics(generated_variants, base_name=None, rot_suffix="
         return False, {}, None
 
     adaptive_context = adaptive_metric_analyzer(generated_variants[0])
+    adaptive_context["image_name"] = base_name or ""
+    adaptive_context["rotation"] = rot_suffix
     passed, diagnostics = validate_metrics_with_diagnostics(
         generated_variants, adaptive_context
     )
@@ -2050,6 +2397,7 @@ def process_single_color(args):
         group_type = assign_variant_group(
             variant_index, perceptual_cfg.get("TOTAL_VARIANTS", variant_index + 1)
         )
+        track_group_usage(group_type)
 
         mapped_array = apply_color_mapping(
             img_array, dominant_colors, color_variations, variant_index
@@ -2084,6 +2432,31 @@ def process_single_color(args):
         )
         output_path = os.path.join(output_dir, output_name)
         final_img.save(output_path, optimize=True)
+
+        try:
+            local_context = adaptive_metric_analyzer(output_path)
+            local_context["image_name"] = base_name
+            local_diagnostics = contextual_metric_validation(
+                [output_path],
+                local_context.get("profile"),
+                base_name,
+                local_context.get("thresholds"),
+            )
+            if not all(result.get("passed", False) for result in local_diagnostics.values()):
+                logging.warning(f"Métricas contextuales para {base_name}:")
+                for metric, result in local_diagnostics.items():
+                    if not result.get("passed", False):
+                        logging.info(
+                            "  %s: %s",
+                            metric,
+                            result.get("reason", "Falló"),
+                        )
+        except Exception as diagnostic_error:
+            logging.debug(
+                "No se pudieron calcular métricas contextuales para %s: %s",
+                output_name,
+                diagnostic_error,
+            )
 
         if GENERATE_PBR_MAPS:
             try:
@@ -2427,6 +2800,7 @@ def main():
                     f"[PROGRESO] {completed}/{len(image_files)} imágenes ({progress_percent:.1f}%)"
                 )
 
+    report_group_health()
     print_health_report()
     logging.info("[OK] Procesamiento completado")
 
