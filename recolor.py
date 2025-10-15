@@ -3,8 +3,10 @@ import json
 import logging
 import random
 import sys
+import uuid
 from pathlib import Path
 from datetime import datetime
+from threading import Lock
 from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 from colorsys import rgb_to_hls, hls_to_rgb
@@ -119,6 +121,217 @@ CONFIG = {
         },
     },
 }
+
+
+class VariantFileManifest:
+    """Thread-safe manifest tracking generated variant files."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._files = set()
+
+    def _resolve(self, path):
+        return Path(path).resolve()
+
+    def register(self, path):
+        resolved = self._resolve(path)
+        if not resolved.exists():
+            logging.warning(
+                "Intento de registrar archivo inexistente en el manifiesto: %s",
+                resolved,
+            )
+            return
+        with self._lock:
+            self._files.add(resolved)
+
+    def discard(self, path):
+        resolved = self._resolve(path)
+        with self._lock:
+            self._files.discard(resolved)
+
+    def ensure_exists(self, path):
+        resolved = self._resolve(path)
+        if resolved.exists():
+            with self._lock:
+                self._files.add(resolved)
+            return True
+        with self._lock:
+            self._files.discard(resolved)
+        return False
+
+    def filter_existing(self, paths, context=""):
+        existing = []
+        for candidate in paths:
+            if not candidate:
+                logging.warning(
+                    "Entrada vacía omitida%s",
+                    f" ({context})" if context else "",
+                )
+                continue
+            if self.ensure_exists(candidate):
+                existing.append(str(self._resolve(candidate)))
+            else:
+                logging.warning(
+                    "Archivo faltante omitido%s: %s",
+                    f" ({context})" if context else "",
+                    Path(candidate),
+                )
+        return existing
+
+    def list_for_directory(self, directory):
+        resolved_dir = Path(directory).resolve()
+        with self._lock:
+            return [
+                str(path)
+                for path in self._files
+                if path.parent == resolved_dir or resolved_dir in path.parents
+            ]
+
+    def initialize_from_directory(self, directory):
+        resolved_dir = Path(directory).resolve()
+        if not resolved_dir.exists():
+            return
+        count = 0
+        with self._lock:
+            for file_path in resolved_dir.rglob("*.png"):
+                resolved = file_path.resolve()
+                self._files.add(resolved)
+                count += 1
+        if count:
+            logging.info(
+                "Manifiesto inicializado con %d archivos existentes en %s",
+                count,
+                resolved_dir,
+            )
+
+
+class DirectoryVariantManager:
+    """Gestiona operaciones de E/S para un directorio de variantes."""
+
+    def __init__(self, directory):
+        self.directory = Path(directory).resolve()
+        self._lock = Lock()
+        self.temp_dir = self.directory / ".tmp_variants"
+
+    def _ensure_directories(self):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_image(self, image, filename, allow_replace=True):
+        """Guarda una imagen de forma atómica y registra el resultado."""
+
+        with self._lock:
+            self._ensure_directories()
+            final_path = self.directory / filename
+            temp_path = self.temp_dir / f"{filename}.{uuid.uuid4().hex}.tmp"
+
+            if isinstance(image, Image.Image):
+                image_to_save = image
+            else:
+                try:
+                    image_to_save = Image.fromarray(np.array(image, dtype=np.uint8))
+                except Exception as exc:
+                    logging.error(
+                        "Entrada inválida al guardar %s: %s",
+                        filename,
+                        exc,
+                    )
+                    return None
+
+            try:
+                image_to_save.save(temp_path, optimize=True)
+            except Exception as exc:
+                logging.error(
+                    "No se pudo escribir archivo temporal %s: %s",
+                    temp_path,
+                    exc,
+                )
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        logging.warning("No se pudo eliminar temporal %s", temp_path)
+                return None
+
+            if not temp_path.exists():
+                logging.error(
+                    "El archivo temporal no existe tras guardado: %s",
+                    temp_path,
+                )
+                return None
+
+            if final_path.exists() and not allow_replace:
+                logging.warning(
+                    "Archivo destino ya existe y no se permite reemplazo: %s",
+                    final_path,
+                )
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    logging.warning("No se pudo eliminar temporal %s", temp_path)
+                return None
+
+            try:
+                temp_path.replace(final_path)
+            except (FileNotFoundError, PermissionError, OSError) as exc:
+                logging.error(
+                    "No se pudo mover %s a %s: %s",
+                    temp_path,
+                    final_path,
+                    exc,
+                )
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    logging.warning("No se pudo eliminar temporal %s", temp_path)
+                return None
+
+            FILE_MANIFEST.register(final_path)
+            return str(final_path)
+
+    def remove_file(self, path):
+        resolved = Path(path).resolve()
+        with self._lock:
+            if resolved.exists():
+                try:
+                    resolved.unlink()
+                except (OSError, PermissionError) as exc:
+                    logging.warning(
+                        "No se pudo eliminar archivo %s: %s",
+                        resolved,
+                        exc,
+                    )
+            FILE_MANIFEST.discard(resolved)
+
+
+class VariantFileIORegistry:
+    """Registro de gestores de directorios para operaciones seguras."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._managers = {}
+
+    def for_directory(self, directory):
+        resolved = Path(directory).resolve()
+        with self._lock:
+            manager = self._managers.get(resolved)
+            if manager is None:
+                manager = DirectoryVariantManager(resolved)
+                self._managers[resolved] = manager
+        return manager
+
+    def save_image(self, image, directory, filename, allow_replace=True):
+        manager = self.for_directory(directory)
+        return manager.write_image(image, filename, allow_replace=allow_replace)
+
+    def remove_file(self, path):
+        directory = Path(path).resolve().parent
+        manager = self.for_directory(directory)
+        manager.remove_file(path)
+
+
+FILE_MANIFEST = VariantFileManifest()
+VARIANT_IO = VariantFileIORegistry()
 
 
 GENERATE_PBR_MAPS = True
@@ -1644,6 +1857,13 @@ def find_group_with_excess(current_counts, target_distribution):
 
 def convert_variant_between_groups(variants, source_index, to_group, new_variant_index):
     source_path = Path(variants[source_index])
+    if not FILE_MANIFEST.ensure_exists(source_path):
+        logging.warning(
+            "Archivo fuente para rebalanceo no encontrado: %s",
+            source_path,
+        )
+        return None
+
     metadata = parse_variant_filename_metadata(source_path.name)
     if metadata is None:
         return None
@@ -1692,22 +1912,26 @@ def convert_variant_between_groups(variants, source_index, to_group, new_variant
             break
         candidate_index += 1
 
-    transformed.save(new_path, optimize=True)
-    if new_path != source_path:
-        try:
-            os.remove(source_path)
-        except OSError:
-            pass
+    saved_path = VARIANT_IO.save_image(transformed, source_path.parent, new_name)
+    if not saved_path:
+        logging.warning(
+            "No se pudo guardar la variante rebalanceada %s", new_name
+        )
+        return None
+
+    saved_path_obj = Path(saved_path)
+    if saved_path_obj.resolve() != source_path.resolve():
+        VARIANT_IO.remove_file(source_path)
 
     logging.info(
         "Rebalanceo: %s → %s (%s → %s)",
         from_group,
         to_group,
         source_path.name,
-        new_path.name,
+        saved_path_obj.name,
     )
 
-    return str(new_path)
+    return saved_path
 
 
 def implement_actual_rebalancing_system():
@@ -1717,7 +1941,26 @@ def implement_actual_rebalancing_system():
         if not variants:
             return False
 
-        current_counts = count_group_distribution(variants)
+        working_variants = []
+        index_mapping = []
+
+        for idx, candidate in enumerate(list(variants)):
+            if FILE_MANIFEST.ensure_exists(candidate):
+                resolved = str(Path(candidate).resolve())
+                variants[idx] = resolved
+                working_variants.append(resolved)
+                index_mapping.append(idx)
+            else:
+                logging.warning(
+                    "Archivo faltante omitido (rebalanceo): %s",
+                    candidate,
+                )
+
+        if not working_variants:
+            logging.warning("No hay variantes válidas disponibles para rebalanceo")
+            return False
+
+        current_counts = count_group_distribution(working_variants)
         for group in target_distribution:
             current_counts.setdefault(group, 0)
 
@@ -1745,7 +1988,7 @@ def implement_actual_rebalancing_system():
                 try:
                     source_index = next(
                         idx
-                        for idx, path in enumerate(variants)
+                        for idx, path in enumerate(working_variants)
                         if extract_group_from_filename(Path(path).name) == excess_group
                     )
                 except StopIteration:
@@ -1753,7 +1996,7 @@ def implement_actual_rebalancing_system():
                     break
 
                 new_path = convert_variant_between_groups(
-                    variants,
+                    working_variants,
                     source_index,
                     missing_group,
                     next_variant_index.get(missing_group, 0),
@@ -1762,11 +2005,13 @@ def implement_actual_rebalancing_system():
                 attempts += 1
 
                 if not new_path:
-                    if attempts > len(variants):
+                    if attempts > len(working_variants):
                         break
                     continue
 
-                variants[source_index] = new_path
+                working_variants[source_index] = new_path
+                original_index = index_mapping[source_index]
+                variants[original_index] = new_path
                 current_counts[excess_group] = max(
                     0, current_counts.get(excess_group, 0) - 1
                 )
@@ -3307,8 +3552,12 @@ def generate_basic_color_variants(args):
         "fallback",
         variant_index,
     )
-    output_path = os.path.join(output_dir, output_name)
-    basic_image.save(output_path, optimize=True)
+    output_path = VARIANT_IO.save_image(basic_image, output_dir, output_name)
+    if not output_path:
+        logging.error(
+            "No se pudo guardar la variante básica de respaldo: %s",
+            output_name,
+        )
     return output_path
 
 
@@ -3373,8 +3622,13 @@ def process_single_color(args):
         output_name = generate_perceptual_filename(
             base_name, rot_suffix, color_idx, group_type, variant_index
         )
-        output_path = os.path.join(output_dir, output_name)
-        final_img.save(output_path, optimize=True)
+        output_path = VARIANT_IO.save_image(final_img, output_dir, output_name)
+        if not output_path:
+            logging.error(
+                "No se pudo guardar la variante generada: %s",
+                output_name,
+            )
+            return None
 
         if GENERATE_PBR_MAPS:
             try:
@@ -3504,6 +3758,11 @@ def process_rotation_parallel(args):
                 if result:
                     generated_variants.append(result)
 
+        generated_variants = FILE_MANIFEST.filter_existing(
+            generated_variants,
+            context=f"generación {base_name}{rot_suffix}",
+        )
+
         generated_count = len(generated_variants)
         logging.info(
             f"Completadas {generated_count} variantes para rotación {rot_suffix}"
@@ -3628,6 +3887,16 @@ def process_single_image(args):
     base_name = os.path.splitext(os.path.basename(image_path))[0]
 
     try:
+        if not Path(image_path).exists():
+            error_message = f"Archivo de entrada no encontrado: {image_path}"
+            logging.error(error_message)
+            return {
+                "image": base_name,
+                "message": error_message,
+                "warnings": [error_message],
+                "rotation_results": [],
+            }
+
         with Image.open(image_path) as img:
             if CONFIG["GENERATE_ROTATIONS"]:
                 rotations = generate_rotations(img)
@@ -3710,7 +3979,9 @@ def main():
     if not COLOR_MATH_AVAILABLE:
         logging.warning("colormath no disponible. Usando método alternativo")
 
-    os.makedirs(CONFIG["OUTPUT_DIR"], exist_ok=True)
+    output_dir = Path(CONFIG["OUTPUT_DIR"]).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    FILE_MANIFEST.initialize_from_directory(output_dir)
 
     base_colors = load_colors(CONFIG["COLORS_JSON"])
     if len(base_colors) < CONFIG["MIN_COLOR"]:
