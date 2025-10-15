@@ -519,7 +519,7 @@ class CrossProcessFileManager:
             logging.error("%s (pid=%s)", exc, os.getpid())
             return None
 
-        temp_path = temp_dir / f"{final_path.name}.{uuid.uuid4().hex}.tmp"
+        temp_path = temp_dir / f"{final_path.name}.{uuid.uuid4().hex}.png"
 
         logging.debug(
             "Guardando imagen temporal %s -> %s (pid=%s)",
