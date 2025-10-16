@@ -1,21 +1,28 @@
-import os
+import errno
+import hashlib
 import json
 import logging
+import os
+import platform
 import random
+import shutil
 import sys
-import threading
+import tempfile
+import time
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
 from datetime import datetime
-from PIL import Image, ImageEnhance, ImageFilter
-import numpy as np
-from colorsys import rgb_to_hls, hls_to_rgb
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
-import multiprocessing as mp
+from pathlib import Path
+from threading import Lock
 import gc
+import multiprocessing as mp
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from colorsys import hls_to_rgb, rgb_to_hls
+
 import cv2
+import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
 from scipy import ndimage
 
 try:
@@ -32,6 +39,14 @@ try:
 except ImportError:  # pragma: no cover - dependencia opcional
     KMeans = None
     SKLEARN_AVAILABLE = False
+
+if os.name == "nt":
+    try:
+        import msvcrt
+    except ImportError:  # pragma: no cover - entornos sin msvcrt
+        msvcrt = None
+else:  # pragma: no cover - solo se ejecuta en POSIX
+    import fcntl
 
 CONFIG = {
     "MIN_COLOR": 100,
@@ -122,6 +137,559 @@ CONFIG = {
         },
     },
 }
+
+
+class RetryMechanism:
+    """Implements exponential backoff with jitter for filesystem operations."""
+
+    DEFAULT_EXCEPTIONS = (PermissionError, OSError)
+
+    @staticmethod
+    def execute(operation, max_retries=5, base_delay=0.1, exceptions=None):
+        if exceptions is None:
+            exceptions = RetryMechanism.DEFAULT_EXCEPTIONS
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except exceptions as exc:  # pragma: no cover - requiere entorno concurrencia real
+                last_error = exc
+                if attempt == max_retries - 1:
+                    logging.error(
+                        "Operación de archivo falló tras %d reintentos: %s",
+                        max_retries,
+                        exc,
+                    )
+                    raise
+                delay = base_delay * (2**attempt)
+                delay += random.uniform(0, base_delay)
+                logging.debug(
+                    "Reintentando operación de archivo (intento %d/%d). Esperando %.3fs. Error: %s",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+        if last_error is not None:
+            raise last_error
+
+
+class AtomicOperationQueue:
+    """Serializa operaciones críticas por clave dentro del mismo proceso."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._locks = {}
+
+    @contextmanager
+    def acquire(self, key):
+        key = str(key)
+        with self._lock:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = Lock()
+                self._locks[key] = lock
+        logging.debug("Adquiriendo lock de cola atómica para %s (pid=%s)", key, os.getpid())
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            logging.debug("Liberando lock de cola atómica para %s (pid=%s)", key, os.getpid())
+
+
+class CrossProcessLock:
+    """Cross-platform file-based lock for synchronizing multiple processes."""
+
+    def __init__(self, lock_name, timeout=30.0, check_interval=0.1):
+        safe_name = hashlib.sha1(lock_name.encode("utf-8", "ignore")).hexdigest()
+        self.lock_name = f"global_{safe_name}.lock"
+        self.timeout = timeout
+        self.check_interval = check_interval
+        self._lock_path = Path(tempfile.gettempdir()) / self.lock_name
+        self._file_handle = None
+
+    def _acquire_lock(self):
+        if os.name == "nt" and msvcrt is not None:
+            # Bloquea 1 byte del archivo para garantizar exclusividad
+            msvcrt.locking(self._file_handle.fileno(), msvcrt.LK_NBLCK, 1)
+        elif os.name != "nt":  # pragma: no cover - requiere entorno POSIX
+            fcntl.flock(self._file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _release_lock(self):
+        if self._file_handle is None:
+            return
+        if os.name == "nt" and msvcrt is not None:
+            self._file_handle.seek(0)
+            msvcrt.locking(self._file_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        elif os.name != "nt":  # pragma: no cover - requiere entorno POSIX
+            fcntl.flock(self._file_handle.fileno(), fcntl.LOCK_UN)
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.timeout
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        logging.debug("Esperando lock global %s (pid=%s)", self.lock_name, os.getpid())
+        while True:
+            try:
+                self._file_handle = self._lock_path.open("a+")
+                self._acquire_lock()
+                self._file_handle.seek(0)
+                self._file_handle.truncate()
+                self._file_handle.write(
+                    f"pid={os.getpid()} time={datetime.utcnow().isoformat()}\n"
+                )
+                self._file_handle.flush()
+                logging.debug("Lock global %s adquirido (pid=%s)", self.lock_name, os.getpid())
+                return self
+            except (BlockingIOError, OSError) as exc:
+                if time.monotonic() >= deadline:
+                    logging.error(
+                        "Timeout al adquirir lock global %s (pid=%s): %s",
+                        self.lock_name,
+                        os.getpid(),
+                        exc,
+                    )
+                    raise TimeoutError(f"Timeout acquiring lock {self.lock_name}") from exc
+                time.sleep(self.check_interval)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self._release_lock()
+        finally:
+            if self._file_handle is not None:
+                self._file_handle.close()
+                self._file_handle = None
+            logging.debug("Lock global %s liberado (pid=%s)", self.lock_name, os.getpid())
+
+
+class WindowsPathHandler:
+    """Utility helpers for dealing with Windows-specific filesystem quirks."""
+
+    ONEDRIVE_TOKENS = ("OneDrive", "OneDrive -")
+
+    def __init__(self):
+        self.is_windows = os.name == "nt"
+        self._platform = platform.system().lower()
+
+    def normalize(self, path):
+        if isinstance(path, Path):
+            path = str(path)
+        if self.is_windows:
+            return Path(os.path.normpath(path))
+        return Path(path)
+
+    def is_onedrive_path(self, path):
+        if not path:
+            return False
+        path_str = str(path)
+        return self.is_windows and any(token in path_str for token in self.ONEDRIVE_TOKENS)
+
+    def resolve_temp_dir(self, base_dir):
+        base_dir = self.normalize(base_dir)
+        if self.is_onedrive_path(base_dir):
+            dir_hash = hashlib.sha1(str(base_dir).encode("utf-8", "ignore")).hexdigest()[:12]
+            alt_root = Path(tempfile.gettempdir()) / "piaf_variants" / dir_hash
+            alt_root.mkdir(parents=True, exist_ok=True)
+            return alt_root
+        return base_dir
+
+    def get_process_temp_dir(self, directory, process_id):
+        directory = self.normalize(directory)
+        temp_root = self.resolve_temp_dir(directory / ".tmp_variants")
+
+        def _ensure():
+            temp_root.mkdir(parents=True, exist_ok=True)
+
+        RetryMechanism.execute(_ensure)
+
+        process_dir = temp_root / f"process_{process_id}"
+
+        def _ensure_process():
+            process_dir.mkdir(parents=True, exist_ok=True)
+
+        RetryMechanism.execute(_ensure_process)
+        return process_dir
+
+    def safe_operation(
+        self,
+        path,
+        operation,
+        max_retries=5,
+        base_delay=0.1,
+        exceptions=None,
+    ):
+        normalized = self.normalize(path)
+
+        def _wrapped():
+            return operation(normalized)
+
+        return RetryMechanism.execute(
+            _wrapped,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            exceptions=exceptions,
+        )
+
+
+def robust_file_operation(operation, max_retries=5, base_delay=0.1, exceptions=None):
+    return RetryMechanism.execute(
+        operation,
+        max_retries=max_retries,
+        base_delay=base_delay,
+        exceptions=exceptions,
+    )
+
+
+def windows_safe_path_operation(
+    path,
+    operation,
+    max_retries=5,
+    base_delay=0.1,
+    exceptions=None,
+):
+    return WINDOWS_PATH_HANDLER.safe_operation(
+        path,
+        operation,
+        max_retries=max_retries,
+        base_delay=base_delay,
+        exceptions=exceptions,
+    )
+
+
+WINDOWS_PATH_HANDLER = WindowsPathHandler()
+ATOMIC_OPERATION_QUEUE = AtomicOperationQueue()
+
+
+class VariantFileManifest:
+    """Thread-safe manifest tracking generated variant files."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._files = set()
+
+    def _resolve(self, path):
+        return Path(path).resolve()
+
+    def register(self, path):
+        resolved = self._resolve(path)
+        if not resolved.exists():
+            logging.warning(
+                "Intento de registrar archivo inexistente en el manifiesto: %s",
+                resolved,
+            )
+            return
+        with self._lock:
+            self._files.add(resolved)
+
+    def discard(self, path):
+        resolved = self._resolve(path)
+        with self._lock:
+            self._files.discard(resolved)
+
+    def ensure_exists(self, path):
+        resolved = self._resolve(path)
+        if resolved.exists():
+            with self._lock:
+                self._files.add(resolved)
+            return True
+        with self._lock:
+            self._files.discard(resolved)
+        return False
+
+    def filter_existing(self, paths, context=""):
+        existing = []
+        for candidate in paths:
+            if not candidate:
+                logging.warning(
+                    "Entrada vacía omitida%s",
+                    f" ({context})" if context else "",
+                )
+                continue
+            if self.ensure_exists(candidate):
+                existing.append(str(self._resolve(candidate)))
+            else:
+                logging.warning(
+                    "Archivo faltante omitido%s: %s",
+                    f" ({context})" if context else "",
+                    Path(candidate),
+                )
+        return existing
+
+    def list_for_directory(self, directory):
+        resolved_dir = Path(directory).resolve()
+        with self._lock:
+            return [
+                str(path)
+                for path in self._files
+                if path.parent == resolved_dir or resolved_dir in path.parents
+            ]
+
+    def initialize_from_directory(self, directory):
+        resolved_dir = Path(directory).resolve()
+        if not resolved_dir.exists():
+            return
+        count = 0
+        with self._lock:
+            for file_path in resolved_dir.rglob("*.png"):
+                resolved = file_path.resolve()
+                self._files.add(resolved)
+                count += 1
+        if count:
+            logging.info(
+                "Manifiesto inicializado con %d archivos existentes en %s",
+                count,
+                resolved_dir,
+            )
+
+
+class CrossProcessFileManager:
+    """Gestor de archivos con locking entre procesos y rutas seguras."""
+
+    def __init__(self, directory, lock_timeout=45.0):
+        self.directory = WINDOWS_PATH_HANDLER.normalize(directory).resolve()
+        self.lock_timeout = lock_timeout
+        self._thread_lock = Lock()
+        self._process_id = os.getpid()
+        self._process_temp_dir = None
+
+    def _ensure_directories(self):
+        def _ensure_target():
+            self.directory.mkdir(parents=True, exist_ok=True)
+
+        RetryMechanism.execute(_ensure_target)
+        return self._refresh_temp_dir()
+
+    def _refresh_temp_dir(self):
+        self._process_temp_dir = WINDOWS_PATH_HANDLER.get_process_temp_dir(
+            self.directory,
+            self._process_id,
+        )
+        return self._process_temp_dir
+
+    def _prepare_image(self, image, filename):
+        if isinstance(image, Image.Image):
+            return image
+        try:
+            return Image.fromarray(np.array(image, dtype=np.uint8))
+        except Exception as exc:
+            raise ValueError(f"Entrada inválida al guardar {filename}: {exc}") from exc
+
+    def _cleanup_temp(self, temp_path):
+        def _remove(normalized):
+            if normalized.exists():
+                try:
+                    normalized.unlink()
+                except FileNotFoundError:
+                    return
+
+        try:
+            windows_safe_path_operation(
+                temp_path,
+                _remove,
+                max_retries=3,
+                exceptions=(PermissionError, OSError, FileNotFoundError),
+            )
+        except Exception as exc:  # pragma: no cover - solo en casos de error extremos
+            logging.debug(
+                "No se pudo limpiar temporal %s (pid=%s): %s",
+                temp_path,
+                os.getpid(),
+                exc,
+            )
+
+    def write_image(self, image, filename, allow_replace=True):
+        """Guarda una imagen de forma atómica y registra el resultado."""
+
+        final_path = self.directory / filename
+        lock_key = str(final_path)
+
+        with ATOMIC_OPERATION_QUEUE.acquire(lock_key):
+            with CrossProcessLock(lock_key, timeout=self.lock_timeout):
+                return self._write_with_lock(image, final_path, allow_replace)
+
+    def _write_with_lock(self, image, final_path, allow_replace):
+        with self._thread_lock:
+            temp_dir = self._ensure_directories()
+
+        try:
+            image_to_save = self._prepare_image(image, final_path.name)
+        except ValueError as exc:
+            logging.error("%s (pid=%s)", exc, os.getpid())
+            return None
+
+        temp_path = temp_dir / f"{final_path.name}.{uuid.uuid4().hex}.png"
+
+        logging.debug(
+            "Guardando imagen temporal %s -> %s (pid=%s)",
+            temp_path,
+            final_path,
+            os.getpid(),
+        )
+
+        try:
+            windows_safe_path_operation(
+                temp_path,
+                lambda normalized: image_to_save.save(normalized, optimize=True),
+                exceptions=(PermissionError, OSError, ValueError),
+            )
+        except Exception as exc:
+            logging.error(
+                "No se pudo escribir archivo temporal %s (pid=%s): %s",
+                temp_path,
+                os.getpid(),
+                exc,
+            )
+            self._cleanup_temp(temp_path)
+            return None
+
+        if not temp_path.exists():
+            logging.error(
+                "El archivo temporal no existe tras guardado: %s (pid=%s)",
+                temp_path,
+                os.getpid(),
+            )
+            self._cleanup_temp(temp_path)
+            return None
+
+        if final_path.exists() and not allow_replace:
+            logging.warning(
+                "Archivo destino ya existe y no se permite reemplazo: %s (pid=%s)",
+                final_path,
+                os.getpid(),
+            )
+            self._cleanup_temp(temp_path)
+            return None
+
+        if final_path.exists() and allow_replace:
+            try:
+                def _remove_existing(normalized):
+                    if normalized.exists():
+                        try:
+                            normalized.unlink()
+                        except FileNotFoundError:
+                            return
+
+                windows_safe_path_operation(
+                    final_path,
+                    _remove_existing,
+                    exceptions=(PermissionError, OSError, FileNotFoundError),
+                )
+            except Exception as exc:
+                logging.warning(
+                    "No se pudo eliminar archivo existente %s (pid=%s): %s",
+                    final_path,
+                    os.getpid(),
+                    exc,
+                )
+                self._cleanup_temp(temp_path)
+                return None
+
+        def _move():
+            try:
+                temp_path.replace(final_path)
+            except OSError as exc:
+                if getattr(exc, "errno", None) == errno.EXDEV:
+                    shutil.move(str(temp_path), str(final_path))
+                else:
+                    raise
+
+        try:
+            robust_file_operation(
+                _move,
+                exceptions=(PermissionError, OSError),
+            )
+        except Exception as exc:
+            logging.error(
+                "No se pudo mover %s a %s (pid=%s): %s",
+                temp_path,
+                final_path,
+                os.getpid(),
+                exc,
+            )
+            self._cleanup_temp(temp_path)
+            return None
+
+        FILE_MANIFEST.register(final_path)
+        logging.info("Imagen guardada %s (pid=%s)", final_path, os.getpid())
+        return str(final_path)
+
+    def remove_file(self, path):
+        resolved = WINDOWS_PATH_HANDLER.normalize(path).resolve()
+        lock_key = str(resolved)
+
+        with ATOMIC_OPERATION_QUEUE.acquire(lock_key):
+            with CrossProcessLock(lock_key, timeout=self.lock_timeout):
+                def _remove(normalized):
+                    if normalized.exists():
+                        try:
+                            normalized.unlink()
+                        except FileNotFoundError:
+                            return
+
+                try:
+                    windows_safe_path_operation(
+                        resolved,
+                        _remove,
+                        exceptions=(PermissionError, OSError, FileNotFoundError),
+                    )
+                    if not resolved.exists():
+                        logging.debug(
+                            "Archivo eliminado o inexistente %s (pid=%s)",
+                            resolved,
+                            os.getpid(),
+                        )
+                except Exception as exc:
+                    logging.warning(
+                        "No se pudo eliminar archivo %s (pid=%s): %s",
+                        resolved,
+                        os.getpid(),
+                        exc,
+                    )
+        FILE_MANIFEST.discard(resolved)
+
+
+class DirectoryVariantManager(CrossProcessFileManager):
+    """Compatibilidad retroactiva con el gestor anterior."""
+
+    def __init__(self, directory):
+        super().__init__(directory)
+
+
+class VariantFileIORegistry:
+    """Registro de gestores de directorios para operaciones seguras."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._managers = {}
+
+    def for_directory(self, directory):
+        resolved = Path(directory).resolve()
+        with self._lock:
+            manager = self._managers.get(resolved)
+            if manager is None:
+                manager = DirectoryVariantManager(resolved)
+                logging.debug(
+                    "Instanciado gestor de archivos para %s (pid=%s)",
+                    resolved,
+                    os.getpid(),
+                )
+                self._managers[resolved] = manager
+        return manager
+
+    def save_image(self, image, directory, filename, allow_replace=True):
+        manager = self.for_directory(directory)
+        return manager.write_image(image, filename, allow_replace=allow_replace)
+
+    def remove_file(self, path):
+        directory = Path(path).resolve().parent
+        manager = self.for_directory(directory)
+        manager.remove_file(path)
+
+
+FILE_MANIFEST = VariantFileManifest()
+VARIANT_IO = VariantFileIORegistry()
 
 
 GENERATE_PBR_MAPS = True
@@ -1891,15 +2459,12 @@ def find_group_with_excess(current_counts, target_distribution):
 
 
 def convert_variant_between_groups(variants, source_index, to_group, new_variant_index):
-    file_manager = get_file_manager()
-    source_path = Path(variants[source_index]).resolve()
-
-    if not source_path.exists():
+    source_path = Path(variants[source_index])
+    if not FILE_MANIFEST.ensure_exists(source_path):
         logging.warning(
-            "Variante faltante durante rebalanceo: %s",
+            "Archivo fuente para rebalanceo no encontrado: %s",
             source_path,
         )
-        file_manager.manifest.unregister(source_path)
         return None
 
     metadata = parse_variant_filename_metadata(source_path.name)
@@ -1956,32 +2521,26 @@ def convert_variant_between_groups(variants, source_index, to_group, new_variant
             break
         candidate_index += 1
 
-    try:
-        new_path = file_manager.save_variant_image(
-            transformed,
-            new_path,
-            optimize=True,
-        )
-    except Exception as exc:
-        logging.error(
-            "No se pudo guardar variante rebalanceada %s: %s",
-            new_path,
-            exc,
+    saved_path = VARIANT_IO.save_image(transformed, source_path.parent, new_name)
+    if not saved_path:
+        logging.warning(
+            "No se pudo guardar la variante rebalanceada %s", new_name
         )
         return None
 
-    if new_path != source_path:
-        file_manager.remove_variant(source_path)
+    saved_path_obj = Path(saved_path)
+    if saved_path_obj.resolve() != source_path.resolve():
+        VARIANT_IO.remove_file(source_path)
 
     logging.info(
         "Rebalanceo: %s → %s (%s → %s)",
         from_group,
         to_group,
         source_path.name,
-        new_path.name,
+        saved_path_obj.name,
     )
 
-    return str(new_path.resolve())
+    return saved_path
 
 
 def implement_actual_rebalancing_system():
@@ -1991,17 +2550,26 @@ def implement_actual_rebalancing_system():
         if not variants:
             return False
 
-        file_manager = get_file_manager()
-        filtered_variants = file_manager.filter_verified_variants(list(variants))
-        if not filtered_variants:
-            logging.warning(
-                "No hay variantes válidas disponibles para rebalancear"
-            )
-            variants[:] = []
+        working_variants = []
+        index_mapping = []
+
+        for idx, candidate in enumerate(list(variants)):
+            if FILE_MANIFEST.ensure_exists(candidate):
+                resolved = str(Path(candidate).resolve())
+                variants[idx] = resolved
+                working_variants.append(resolved)
+                index_mapping.append(idx)
+            else:
+                logging.warning(
+                    "Archivo faltante omitido (rebalanceo): %s",
+                    candidate,
+                )
+
+        if not working_variants:
+            logging.warning("No hay variantes válidas disponibles para rebalanceo")
             return False
 
-        variants[:] = filtered_variants
-        current_counts = count_group_distribution(filtered_variants)
+        current_counts = count_group_distribution(working_variants)
         for group in target_distribution:
             current_counts.setdefault(group, 0)
 
@@ -2029,16 +2597,15 @@ def implement_actual_rebalancing_system():
                 try:
                     source_index = next(
                         idx
-                        for idx, path in enumerate(variants)
-                        if extract_group_from_filename(Path(path).name)
-                        == excess_group
+                        for idx, path in enumerate(working_variants)
+                        if extract_group_from_filename(Path(path).name) == excess_group
                     )
                 except StopIteration:
                     current_counts[excess_group] = target_distribution.get(excess_group, 0)
                     break
 
                 new_path = convert_variant_between_groups(
-                    variants,
+                    working_variants,
                     source_index,
                     missing_group,
                     next_variant_index.get(missing_group, 0),
@@ -2047,11 +2614,13 @@ def implement_actual_rebalancing_system():
                 attempts += 1
 
                 if not new_path:
-                    if attempts > len(variants):
+                    if attempts > len(working_variants):
                         break
                     continue
 
-                variants[source_index] = new_path
+                working_variants[source_index] = new_path
+                original_index = index_mapping[source_index]
+                variants[original_index] = new_path
                 current_counts[excess_group] = max(
                     0, current_counts.get(excess_group, 0) - 1
                 )
@@ -3618,13 +4187,13 @@ def generate_basic_color_variants(args):
         "fallback",
         variant_index,
     )
-    file_manager = get_file_manager(output_dir)
-    final_path = file_manager.save_variant_image(
-        basic_image,
-        file_manager.build_variant_path(output_name),
-        optimize=True,
-    )
-    return str(final_path)
+    output_path = VARIANT_IO.save_image(basic_image, output_dir, output_name)
+    if not output_path:
+        logging.error(
+            "No se pudo guardar la variante básica de respaldo: %s",
+            output_name,
+        )
+    return output_path
 
 
 def fallback_output_generation(args):
@@ -3689,12 +4258,13 @@ def process_single_color(args):
         output_name = generate_perceptual_filename(
             base_name, rot_suffix, color_idx, group_type, variant_index
         )
-        final_path = file_manager.save_variant_image(
-            final_img,
-            file_manager.build_variant_path(output_name),
-            optimize=True,
-        )
-        output_path = str(final_path)
+        output_path = VARIANT_IO.save_image(final_img, output_dir, output_name)
+        if not output_path:
+            logging.error(
+                "No se pudo guardar la variante generada: %s",
+                output_name,
+            )
+            return None
 
         if GENERATE_PBR_MAPS:
             try:
@@ -3829,13 +4399,10 @@ def process_rotation_parallel(args):
                 if result:
                     generated_variants.append(result)
 
-        verified_variants = file_manager.filter_verified_variants(generated_variants)
-        if len(verified_variants) != len(generated_variants):
-            logging.warning(
-                "Se excluyeron %d variantes no verificadas antes del rebalanceo",
-                len(generated_variants) - len(verified_variants),
-            )
-        generated_variants = verified_variants
+        generated_variants = FILE_MANIFEST.filter_existing(
+            generated_variants,
+            context=f"generación {base_name}{rot_suffix}",
+        )
 
         generated_count = len(generated_variants)
         logging.info(
@@ -3965,9 +4532,8 @@ def process_single_image(args):
     base_name = os.path.splitext(os.path.basename(image_path))[0]
 
     try:
-        path_obj = Path(image_path)
-        if not path_obj.exists():
-            error_message = f"Archivo de imagen no encontrado: {path_obj}"
+        if not Path(image_path).exists():
+            error_message = f"Archivo de entrada no encontrado: {image_path}"
             logging.error(error_message)
             return {
                 "image": base_name,
@@ -3976,38 +4542,37 @@ def process_single_image(args):
                 "rotation_results": [],
             }
 
-        with open_image_safely(path_obj) as img:
-            if img is None:
-                error_message = f"No se pudo abrir {path_obj}"
-                logging.error(error_message)
-                return {
-                    "image": base_name,
-                    "message": error_message,
-                    "warnings": [error_message],
-                    "rotation_results": [],
-                }
+        with Image.open(image_path) as img:
+            if CONFIG["GENERATE_ROTATIONS"]:
+                rotations = generate_rotations(img)
 
-            working_image = img.convert("RGBA")
+                if CONFIG["PARALLEL_ROTATIONS"] and len(rotations) > 1:
+                    rotation_tasks = []
+                    for rot_suffix, rot_img in rotations.items():
+                        rotation_tasks.append(
+                            (rot_img, base_name, rot_suffix, colors, output_dir)
+                        )
 
-        if CONFIG["GENERATE_ROTATIONS"]:
-            rotations = generate_rotations(working_image)
+                    with ThreadPoolExecutor(
+                        max_workers=min(
+                            CONFIG["MAX_ROTATION_WORKERS"], len(rotations)
+                        )
+                    ) as executor:
+                        futures = [
+                            executor.submit(process_rotation_parallel, task)
+                            for task in rotation_tasks
+                        ]
+                        rotation_results = []
+                        for future in as_completed(futures):
+                            rotation_results.append(future.result())
 
-            if CONFIG["PARALLEL_ROTATIONS"] and len(rotations) > 1:
-                rotation_tasks = []
-                for rot_suffix, rot_img in rotations.items():
-                    rotation_tasks.append(
-                        (rot_img, base_name, rot_suffix, colors, output_dir)
-                    )
-
-                with ThreadPoolExecutor(
-                    max_workers=min(
-                        CONFIG["MAX_ROTATION_WORKERS"], len(rotations)
-                    )
-                ) as executor:
-                    futures = [
-                        executor.submit(process_rotation_parallel, task)
-                        for task in rotation_tasks
-                    ]
+                        return {
+                            "image": base_name,
+                            "message": _summarize_image_results(base_name, rotation_results),
+                            "warnings": _collect_warnings(rotation_results),
+                            "rotation_results": rotation_results,
+                        }
+                else:
                     rotation_results = []
                     for future in as_completed(futures):
                         rotation_results.append(future.result())
@@ -4070,18 +4635,9 @@ def main():
     if not COLOR_MATH_AVAILABLE:
         logging.warning("colormath no disponible. Usando método alternativo")
 
-    file_manager = get_file_manager(CONFIG["OUTPUT_DIR"])
-    file_manager.prepare_run()
-
-    input_dir = Path(CONFIG["INPUT_DIR"])
-    if not input_dir.is_absolute():
-        input_dir = (Path.cwd() / input_dir).resolve()
-
-    if not input_dir.exists() or not input_dir.is_dir():
-        logging.error("Directorio de entrada no válido: %s", input_dir)
-        return
-
-    logging.info("Usando directorio de salida: %s", file_manager.output_dir)
+    output_dir = Path(CONFIG["OUTPUT_DIR"]).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    FILE_MANIFEST.initialize_from_directory(output_dir)
 
     base_colors = load_colors(CONFIG["COLORS_JSON"])
     if len(base_colors) < CONFIG["MIN_COLOR"]:
