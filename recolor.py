@@ -1,23 +1,18 @@
-import errno
-import hashlib
+import gc
+import io
 import json
 import logging
+import multiprocessing as mp
 import os
-import platform
 import random
-import shutil
 import sys
-import tempfile
 import time
-import uuid
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-import gc
-import multiprocessing as mp
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from colorsys import hls_to_rgb, rgb_to_hls
 
 import cv2
@@ -39,14 +34,6 @@ try:
 except ImportError:  # pragma: no cover - dependencia opcional
     KMeans = None
     SKLEARN_AVAILABLE = False
-
-if os.name == "nt":
-    try:
-        import msvcrt
-    except ImportError:  # pragma: no cover - entornos sin msvcrt
-        msvcrt = None
-else:  # pragma: no cover - solo se ejecuta en POSIX
-    import fcntl
 
 CONFIG = {
     "MIN_COLOR": 100,
@@ -200,166 +187,133 @@ class AtomicOperationQueue:
             logging.debug("Liberando lock de cola atómica para %s (pid=%s)", key, os.getpid())
 
 
-class CrossProcessLock:
-    """Cross-platform file-based lock for synchronizing multiple processes."""
-
-    def __init__(self, lock_name, timeout=30.0, check_interval=0.1):
-        safe_name = hashlib.sha1(lock_name.encode("utf-8", "ignore")).hexdigest()
-        self.lock_name = f"global_{safe_name}.lock"
-        self.timeout = timeout
-        self.check_interval = check_interval
-        self._lock_path = Path(tempfile.gettempdir()) / self.lock_name
-        self._file_handle = None
-
-    def _acquire_lock(self):
-        if os.name == "nt" and msvcrt is not None:
-            # Bloquea 1 byte del archivo para garantizar exclusividad
-            msvcrt.locking(self._file_handle.fileno(), msvcrt.LK_NBLCK, 1)
-        elif os.name != "nt":  # pragma: no cover - requiere entorno POSIX
-            fcntl.flock(self._file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def _release_lock(self):
-        if self._file_handle is None:
-            return
-        if os.name == "nt" and msvcrt is not None:
-            self._file_handle.seek(0)
-            msvcrt.locking(self._file_handle.fileno(), msvcrt.LK_UNLCK, 1)
-        elif os.name != "nt":  # pragma: no cover - requiere entorno POSIX
-            fcntl.flock(self._file_handle.fileno(), fcntl.LOCK_UN)
-
-    def __enter__(self):
-        deadline = time.monotonic() + self.timeout
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        logging.debug("Esperando lock global %s (pid=%s)", self.lock_name, os.getpid())
-        while True:
-            try:
-                self._file_handle = self._lock_path.open("a+")
-                self._acquire_lock()
-                self._file_handle.seek(0)
-                self._file_handle.truncate()
-                self._file_handle.write(
-                    f"pid={os.getpid()} time={datetime.utcnow().isoformat()}\n"
-                )
-                self._file_handle.flush()
-                logging.debug("Lock global %s adquirido (pid=%s)", self.lock_name, os.getpid())
-                return self
-            except (BlockingIOError, OSError) as exc:
-                if time.monotonic() >= deadline:
-                    logging.error(
-                        "Timeout al adquirir lock global %s (pid=%s): %s",
-                        self.lock_name,
-                        os.getpid(),
-                        exc,
-                    )
-                    raise TimeoutError(f"Timeout acquiring lock {self.lock_name}") from exc
-                time.sleep(self.check_interval)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            self._release_lock()
-        finally:
-            if self._file_handle is not None:
-                self._file_handle.close()
-                self._file_handle = None
-            logging.debug("Lock global %s liberado (pid=%s)", self.lock_name, os.getpid())
+ATOMIC_OPERATION_QUEUE = AtomicOperationQueue()
 
 
-class WindowsPathHandler:
-    """Utility helpers for dealing with Windows-specific filesystem quirks."""
+class AtomicPNGWriter:
+    """Guarda imágenes PNG usando buffers en memoria y escritura atómica."""
 
-    ONEDRIVE_TOKENS = ("OneDrive", "OneDrive -")
+    def __init__(self, directory):
+        self.directory = Path(directory).resolve()
+        self._thread_lock = Lock()
+        self._process_id = os.getpid()
 
-    def __init__(self):
-        self.is_windows = os.name == "nt"
-        self._platform = platform.system().lower()
-
-    def normalize(self, path):
-        if isinstance(path, Path):
-            path = str(path)
-        if self.is_windows:
-            return Path(os.path.normpath(path))
-        return Path(path)
-
-    def is_onedrive_path(self, path):
-        if not path:
-            return False
-        path_str = str(path)
-        return self.is_windows and any(token in path_str for token in self.ONEDRIVE_TOKENS)
-
-    def resolve_temp_dir(self, base_dir):
-        base_dir = self.normalize(base_dir)
-        if self.is_onedrive_path(base_dir):
-            dir_hash = hashlib.sha1(str(base_dir).encode("utf-8", "ignore")).hexdigest()[:12]
-            alt_root = Path(tempfile.gettempdir()) / "piaf_variants" / dir_hash
-            alt_root.mkdir(parents=True, exist_ok=True)
-            return alt_root
-        return base_dir
-
-    def get_process_temp_dir(self, directory, process_id):
-        directory = self.normalize(directory)
-        temp_root = self.resolve_temp_dir(directory / ".tmp_variants")
-
+    def _ensure_directory(self):
         def _ensure():
-            temp_root.mkdir(parents=True, exist_ok=True)
+            self.directory.mkdir(parents=True, exist_ok=True)
 
         RetryMechanism.execute(_ensure)
 
-        process_dir = temp_root / f"process_{process_id}"
+    @staticmethod
+    def _prepare_image(image, filename):
+        if isinstance(image, Image.Image):
+            return image
+        try:
+            return Image.fromarray(np.array(image, dtype=np.uint8))
+        except Exception as exc:
+            raise ValueError(f"Entrada inválida al guardar {filename}: {exc}") from exc
 
-        def _ensure_process():
-            process_dir.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def _encode_png(image):
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
 
-        RetryMechanism.execute(_ensure_process)
-        return process_dir
+    def _write_bytes(self, final_path, data, allow_replace):
+        flags = os.O_WRONLY | os.O_CREAT
+        if allow_replace:
+            flags |= os.O_TRUNC
+        else:
+            flags |= os.O_EXCL
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
 
-    def safe_operation(
-        self,
-        path,
-        operation,
-        max_retries=5,
-        base_delay=0.1,
-        exceptions=None,
-    ):
-        normalized = self.normalize(path)
+        mode = 0o666
+        fd = os.open(str(final_path), flags, mode)
+        try:
+            total = 0
+            length = len(data)
+            while total < length:
+                written = os.write(fd, data[total:])
+                if written == 0:
+                    raise OSError("Escritura incompleta al guardar la imagen")
+                total += written
+            if hasattr(os, "fsync"):
+                os.fsync(fd)
+        finally:
+            os.close(fd)
 
-        def _wrapped():
-            return operation(normalized)
+    def write_image(self, image, filename, allow_replace=True):
+        final_path = self.directory / filename
+        with self._thread_lock:
+            self._ensure_directory()
 
-        return RetryMechanism.execute(
-            _wrapped,
-            max_retries=max_retries,
-            base_delay=base_delay,
-            exceptions=exceptions,
-        )
+        if final_path.exists() and not allow_replace:
+            logging.warning(
+                "Archivo destino ya existe y no se permite reemplazo: %s (pid=%s)",
+                final_path,
+                self._process_id,
+            )
+            return None
 
+        try:
+            prepared = self._prepare_image(image, final_path.name)
+            data = self._encode_png(prepared)
+        except ValueError as exc:
+            logging.error("%s (pid=%s)", exc, self._process_id)
+            return None
+        except Exception as exc:  # pragma: no cover - errores al codificar
+            logging.error(
+                "Error al codificar imagen %s (pid=%s): %s",
+                final_path,
+                self._process_id,
+                exc,
+            )
+            return None
 
-def robust_file_operation(operation, max_retries=5, base_delay=0.1, exceptions=None):
-    return RetryMechanism.execute(
-        operation,
-        max_retries=max_retries,
-        base_delay=base_delay,
-        exceptions=exceptions,
-    )
+        try:
+            self._write_bytes(final_path, data, allow_replace)
+        except FileExistsError:
+            logging.warning(
+                "Archivo destino ya existe y no se puede sobrescribir: %s (pid=%s)",
+                final_path,
+                self._process_id,
+            )
+            return None
+        except Exception as exc:
+            logging.error(
+                "No se pudo guardar imagen %s (pid=%s): %s",
+                final_path,
+                self._process_id,
+                exc,
+            )
+            return None
 
+        FILE_MANIFEST.register(final_path)
+        logging.info("Imagen guardada %s (pid=%s)", final_path, self._process_id)
+        return str(final_path)
 
-def windows_safe_path_operation(
-    path,
-    operation,
-    max_retries=5,
-    base_delay=0.1,
-    exceptions=None,
-):
-    return WINDOWS_PATH_HANDLER.safe_operation(
-        path,
-        operation,
-        max_retries=max_retries,
-        base_delay=base_delay,
-        exceptions=exceptions,
-    )
+    def remove_file(self, path):
+        resolved = Path(path).resolve()
+        try:
+            resolved.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except TypeError:
+            if resolved.exists():
+                resolved.unlink()
+        except Exception as exc:
+            logging.warning(
+                "No se pudo eliminar archivo %s (pid=%s): %s",
+                resolved,
+                self._process_id,
+                exc,
+            )
+        else:
+            logging.debug(
+                "Archivo eliminado o inexistente %s (pid=%s)",
+                resolved,
+                self._process_id,
+            )
 
-
-WINDOWS_PATH_HANDLER = WindowsPathHandler()
-ATOMIC_OPERATION_QUEUE = AtomicOperationQueue()
 
 
 class VariantFileManifest:
@@ -444,248 +398,39 @@ class VariantFileManifest:
             )
 
 
-class CrossProcessFileManager:
-    """Gestor de archivos con locking entre procesos y rutas seguras."""
-
-    def __init__(self, directory, lock_timeout=45.0):
-        self.directory = WINDOWS_PATH_HANDLER.normalize(directory).resolve()
-        self.lock_timeout = lock_timeout
-        self._thread_lock = Lock()
-        self._process_id = os.getpid()
-        self._process_temp_dir = None
-
-    def _ensure_directories(self):
-        def _ensure_target():
-            self.directory.mkdir(parents=True, exist_ok=True)
-
-        RetryMechanism.execute(_ensure_target)
-        return self._refresh_temp_dir()
-
-    def _refresh_temp_dir(self):
-        self._process_temp_dir = WINDOWS_PATH_HANDLER.get_process_temp_dir(
-            self.directory,
-            self._process_id,
-        )
-        return self._process_temp_dir
-
-    def _prepare_image(self, image, filename):
-        if isinstance(image, Image.Image):
-            return image
-        try:
-            return Image.fromarray(np.array(image, dtype=np.uint8))
-        except Exception as exc:
-            raise ValueError(f"Entrada inválida al guardar {filename}: {exc}") from exc
-
-    def _cleanup_temp(self, temp_path):
-        def _remove(normalized):
-            if normalized.exists():
-                try:
-                    normalized.unlink()
-                except FileNotFoundError:
-                    return
-
-        try:
-            windows_safe_path_operation(
-                temp_path,
-                _remove,
-                max_retries=3,
-                exceptions=(PermissionError, OSError, FileNotFoundError),
-            )
-        except Exception as exc:  # pragma: no cover - solo en casos de error extremos
-            logging.debug(
-                "No se pudo limpiar temporal %s (pid=%s): %s",
-                temp_path,
-                os.getpid(),
-                exc,
-            )
-
-    def write_image(self, image, filename, allow_replace=True):
-        """Guarda una imagen de forma atómica y registra el resultado."""
-
-        final_path = self.directory / filename
-        lock_key = str(final_path)
-
-        with ATOMIC_OPERATION_QUEUE.acquire(lock_key):
-            with CrossProcessLock(lock_key, timeout=self.lock_timeout):
-                return self._write_with_lock(image, final_path, allow_replace)
-
-    def _write_with_lock(self, image, final_path, allow_replace):
-        with self._thread_lock:
-            temp_dir = self._ensure_directories()
-
-        try:
-            image_to_save = self._prepare_image(image, final_path.name)
-        except ValueError as exc:
-            logging.error("%s (pid=%s)", exc, os.getpid())
-            return None
-
-        temp_path = temp_dir / f"{final_path.name}.{uuid.uuid4().hex}.png"
-
-        logging.debug(
-            "Guardando imagen temporal %s -> %s (pid=%s)",
-            temp_path,
-            final_path,
-            os.getpid(),
-        )
-
-        try:
-            windows_safe_path_operation(
-                temp_path,
-                lambda normalized: image_to_save.save(normalized, optimize=True),
-                exceptions=(PermissionError, OSError, ValueError),
-            )
-        except Exception as exc:
-            logging.error(
-                "No se pudo escribir archivo temporal %s (pid=%s): %s",
-                temp_path,
-                os.getpid(),
-                exc,
-            )
-            self._cleanup_temp(temp_path)
-            return None
-
-        if not temp_path.exists():
-            logging.error(
-                "El archivo temporal no existe tras guardado: %s (pid=%s)",
-                temp_path,
-                os.getpid(),
-            )
-            self._cleanup_temp(temp_path)
-            return None
-
-        if final_path.exists() and not allow_replace:
-            logging.warning(
-                "Archivo destino ya existe y no se permite reemplazo: %s (pid=%s)",
-                final_path,
-                os.getpid(),
-            )
-            self._cleanup_temp(temp_path)
-            return None
-
-        if final_path.exists() and allow_replace:
-            try:
-                def _remove_existing(normalized):
-                    if normalized.exists():
-                        try:
-                            normalized.unlink()
-                        except FileNotFoundError:
-                            return
-
-                windows_safe_path_operation(
-                    final_path,
-                    _remove_existing,
-                    exceptions=(PermissionError, OSError, FileNotFoundError),
-                )
-            except Exception as exc:
-                logging.warning(
-                    "No se pudo eliminar archivo existente %s (pid=%s): %s",
-                    final_path,
-                    os.getpid(),
-                    exc,
-                )
-                self._cleanup_temp(temp_path)
-                return None
-
-        def _move():
-            try:
-                temp_path.replace(final_path)
-            except OSError as exc:
-                if getattr(exc, "errno", None) == errno.EXDEV:
-                    shutil.move(str(temp_path), str(final_path))
-                else:
-                    raise
-
-        try:
-            robust_file_operation(
-                _move,
-                exceptions=(PermissionError, OSError),
-            )
-        except Exception as exc:
-            logging.error(
-                "No se pudo mover %s a %s (pid=%s): %s",
-                temp_path,
-                final_path,
-                os.getpid(),
-                exc,
-            )
-            self._cleanup_temp(temp_path)
-            return None
-
-        FILE_MANIFEST.register(final_path)
-        logging.info("Imagen guardada %s (pid=%s)", final_path, os.getpid())
-        return str(final_path)
-
-    def remove_file(self, path):
-        resolved = WINDOWS_PATH_HANDLER.normalize(path).resolve()
-        lock_key = str(resolved)
-
-        with ATOMIC_OPERATION_QUEUE.acquire(lock_key):
-            with CrossProcessLock(lock_key, timeout=self.lock_timeout):
-                def _remove(normalized):
-                    if normalized.exists():
-                        try:
-                            normalized.unlink()
-                        except FileNotFoundError:
-                            return
-
-                try:
-                    windows_safe_path_operation(
-                        resolved,
-                        _remove,
-                        exceptions=(PermissionError, OSError, FileNotFoundError),
-                    )
-                    if not resolved.exists():
-                        logging.debug(
-                            "Archivo eliminado o inexistente %s (pid=%s)",
-                            resolved,
-                            os.getpid(),
-                        )
-                except Exception as exc:
-                    logging.warning(
-                        "No se pudo eliminar archivo %s (pid=%s): %s",
-                        resolved,
-                        os.getpid(),
-                        exc,
-                    )
-        FILE_MANIFEST.discard(resolved)
-
-
-class DirectoryVariantManager(CrossProcessFileManager):
-    """Compatibilidad retroactiva con el gestor anterior."""
-
-    def __init__(self, directory):
-        super().__init__(directory)
-
-
 class VariantFileIORegistry:
-    """Registro de gestores de directorios para operaciones seguras."""
+    """Registro de gestores de directorios para operaciones de guardado."""
 
     def __init__(self):
         self._lock = Lock()
-        self._managers = {}
+        self._writers = {}
 
     def for_directory(self, directory):
         resolved = Path(directory).resolve()
         with self._lock:
-            manager = self._managers.get(resolved)
-            if manager is None:
-                manager = DirectoryVariantManager(resolved)
+            writer = self._writers.get(resolved)
+            if writer is None:
+                writer = AtomicPNGWriter(resolved)
                 logging.debug(
                     "Instanciado gestor de archivos para %s (pid=%s)",
                     resolved,
                     os.getpid(),
                 )
-                self._managers[resolved] = manager
-        return manager
+                self._writers[resolved] = writer
+        return writer
 
     def save_image(self, image, directory, filename, allow_replace=True):
-        manager = self.for_directory(directory)
-        return manager.write_image(image, filename, allow_replace=allow_replace)
+        target_path = Path(directory).resolve() / filename
+        with ATOMIC_OPERATION_QUEUE.acquire(str(target_path)):
+            writer = self.for_directory(directory)
+            result = writer.write_image(image, filename, allow_replace=allow_replace)
+        return result
 
     def remove_file(self, path):
-        directory = Path(path).resolve().parent
-        manager = self.for_directory(directory)
-        manager.remove_file(path)
+        resolved_path = Path(path).resolve()
+        writer = self.for_directory(resolved_path.parent)
+        writer.remove_file(resolved_path)
+        FILE_MANIFEST.discard(resolved_path)
 
 
 FILE_MANIFEST = VariantFileManifest()
@@ -1049,8 +794,6 @@ def setup_cross_platform_logging():
             if hasattr(sys.stderr, "reconfigure"):
                 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
             else:
-                import io
-
                 sys.stderr = io.TextIOWrapper(
                     sys.stderr.buffer,
                     encoding="utf-8",
