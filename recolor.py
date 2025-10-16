@@ -3,6 +3,9 @@ import json
 import logging
 import random
 import sys
+import threading
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageEnhance, ImageFilter
@@ -190,6 +193,243 @@ REQUIRED_GROUPS = [
     "illumination",
     "concise_colors",
 ]
+
+
+class FileManifest:
+    """Mantiene un registro consistente de las variantes generadas."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._variants = set()
+
+    def reset(self):
+        with self._lock:
+            self._variants.clear()
+
+    def register(self, path):
+        resolved = Path(path).resolve()
+        with self._lock:
+            self._variants.add(resolved)
+
+    def unregister(self, path):
+        resolved = Path(path).resolve()
+        with self._lock:
+            self._variants.discard(resolved)
+
+    def contains(self, path):
+        resolved = Path(path).resolve()
+        with self._lock:
+            return resolved in self._variants
+
+    def list_all(self):
+        with self._lock:
+            return [str(path) for path in sorted(self._variants)]
+
+    def filter_existing(self, paths):
+        """Filtra rutas inexistentes y actualiza el manifiesto en consecuencia."""
+
+        filtered = []
+        missing = []
+
+        for original in paths:
+            resolved = Path(original).resolve()
+            if resolved.exists():
+                filtered.append(str(resolved))
+            else:
+                missing.append(str(resolved))
+                with self._lock:
+                    self._variants.discard(resolved)
+
+        if missing:
+            logging.warning(
+                "Variantes ausentes omitidas de las operaciones: %s",
+                missing,
+            )
+
+        return filtered
+
+
+class SafeFileManager:
+    """Gestiona operaciones de archivo con escrituras atómicas y verificación."""
+
+    def __init__(self, output_dir):
+        self.output_dir = Path(output_dir).resolve()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = self.output_dir / ".tmp"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest = FileManifest()
+        self._lock = threading.Lock()
+
+    def prepare_run(self):
+        with self._lock:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            self.manifest.reset()
+            self._cleanup_temp_dir()
+
+    def _cleanup_temp_dir(self):
+        if not self.temp_dir.exists():
+            return
+
+        for temp_file in self.temp_dir.iterdir():
+            if not temp_file.is_file():
+                continue
+            try:
+                temp_file.unlink()
+            except OSError as exc:
+                logging.debug(
+                    "No se pudo limpiar archivo temporal %s: %s",
+                    temp_file,
+                    exc,
+                )
+
+    def _ensure_parent(self, final_path):
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _resolve_final_path(self, final_path):
+        path_obj = Path(final_path)
+        if not path_obj.is_absolute():
+            if path_obj.parts and path_obj.parts[0] == self.output_dir.name:
+                path_obj = self.output_dir.joinpath(*path_obj.parts[1:])
+            else:
+                path_obj = (self.output_dir / path_obj).resolve()
+        return path_obj
+
+    def _create_temp_path(self, final_path):
+        suffix = final_path.suffix or ".tmp"
+        temp_name = f"{final_path.stem}_{uuid.uuid4().hex}{suffix}"
+        return self.temp_dir / temp_name
+
+    def build_variant_path(self, filename):
+        return (self.output_dir / filename).resolve()
+
+    def save_variant_image(self, image, final_path, **save_kwargs):
+        final_path = self._resolve_final_path(final_path)
+        self._ensure_parent(final_path)
+        temp_path = self._create_temp_path(final_path)
+
+        try:
+            image.save(temp_path, **save_kwargs)
+            os.replace(temp_path, final_path)
+            self.manifest.register(final_path)
+            logging.debug("Variante guardada en %s", final_path)
+            return final_path
+        except (FileNotFoundError, PermissionError) as exc:
+            logging.error(
+                "No se pudo guardar la variante %s: %s",
+                final_path,
+                exc,
+            )
+            raise
+        except Exception:
+            logging.exception("Error inesperado guardando %s", final_path)
+            raise
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+
+    def save_auxiliary_image(self, array, final_path, params=None):
+        final_path = self._resolve_final_path(final_path)
+        self._ensure_parent(final_path)
+        temp_path = self._create_temp_path(final_path)
+
+        try:
+            params = params or []
+            success = cv2.imwrite(str(temp_path), array, params)
+            if not success:
+                raise IOError(f"cv2.imwrite devolvió False para {final_path}")
+            os.replace(temp_path, final_path)
+            logging.debug("Archivo auxiliar guardado en %s", final_path)
+            return final_path
+        except (FileNotFoundError, PermissionError) as exc:
+            logging.error(
+                "No se pudo guardar archivo auxiliar %s: %s",
+                final_path,
+                exc,
+            )
+            raise
+        except Exception:
+            logging.exception("Error inesperado guardando archivo auxiliar %s", final_path)
+            raise
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+
+    def remove_variant(self, path):
+        final_path = Path(path).resolve()
+        if not final_path.exists():
+            logging.warning(
+                "Intento de eliminar variante inexistente: %s",
+                final_path,
+            )
+            self.manifest.unregister(final_path)
+            return False
+
+        try:
+            final_path.unlink()
+            logging.debug("Variante eliminada: %s", final_path)
+        except (OSError, PermissionError) as exc:
+            logging.error(
+                "No se pudo eliminar la variante %s: %s",
+                final_path,
+                exc,
+            )
+            return False
+
+        self.manifest.unregister(final_path)
+        return True
+
+    def filter_verified_variants(self, variants):
+        return self.manifest.filter_existing(variants)
+
+
+FILE_MANAGER_LOCK = threading.Lock()
+FILE_MANAGER = None
+
+
+def get_file_manager(output_dir=None):
+    """Obtiene un gestor de archivos global y reconfigurable."""
+
+    global FILE_MANAGER
+    target_output = output_dir or CONFIG.get("OUTPUT_DIR", "variants")
+
+    with FILE_MANAGER_LOCK:
+        if (
+            FILE_MANAGER is None
+            or Path(target_output).resolve() != FILE_MANAGER.output_dir
+        ):
+            FILE_MANAGER = SafeFileManager(target_output)
+        return FILE_MANAGER
+
+
+@contextmanager
+def open_image_safely(path):
+    """Abre una imagen validando su existencia y registrando fallos."""
+
+    path_obj = Path(path)
+    if not path_obj.exists():
+        logging.warning("Archivo inexistente: %s", path_obj)
+        yield None
+        return
+
+    try:
+        with Image.open(path_obj) as img:
+            yield img
+    except FileNotFoundError:
+        logging.warning("Archivo eliminado antes de poder abrirlo: %s", path_obj)
+        yield None
+    except PermissionError as exc:
+        logging.error("Permiso denegado al abrir %s: %s", path_obj, exc)
+        yield None
+    except Exception as exc:
+        logging.error("Error abriendo %s: %s", path_obj, exc)
+        yield None
 
 
 # Se asignará más adelante con la implementación completa de rebalanceo
@@ -540,8 +780,16 @@ def is_color_significantly_different(new_color, existing_colors, threshold=None)
     return np.all(differences >= threshold)
 
 def load_colors(json_path):
+    path = Path(json_path)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+
+    if not path.exists():
+        logging.error("Archivo de colores no encontrado: %s", path)
+        return []
+
     try:
-        with open(json_path, "r") as f:
+        with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
 
         colors = []
@@ -1643,17 +1891,33 @@ def find_group_with_excess(current_counts, target_distribution):
 
 
 def convert_variant_between_groups(variants, source_index, to_group, new_variant_index):
-    source_path = Path(variants[source_index])
-    metadata = parse_variant_filename_metadata(source_path.name)
-    if metadata is None:
+    file_manager = get_file_manager()
+    source_path = Path(variants[source_index]).resolve()
+
+    if not source_path.exists():
+        logging.warning(
+            "Variante faltante durante rebalanceo: %s",
+            source_path,
+        )
+        file_manager.manifest.unregister(source_path)
         return None
 
-    try:
-        with Image.open(source_path) as img:
-            base_image = img.convert("RGBA")
-    except Exception as exc:
-        logging.error("No se pudo cargar %s para rebalancear: %s", source_path, exc)
+    metadata = parse_variant_filename_metadata(source_path.name)
+    if metadata is None:
+        logging.warning(
+            "Metadatos inválidos para rebalanceo en %s",
+            source_path,
+        )
         return None
+
+    with open_image_safely(source_path) as img:
+        if img is None:
+            logging.error(
+                "No se pudo abrir %s para rebalancear",
+                source_path,
+            )
+            return None
+        base_image = img.convert("RGBA")
 
     from_group = metadata.get("group", "base")
 
@@ -1692,12 +1956,22 @@ def convert_variant_between_groups(variants, source_index, to_group, new_variant
             break
         candidate_index += 1
 
-    transformed.save(new_path, optimize=True)
+    try:
+        new_path = file_manager.save_variant_image(
+            transformed,
+            new_path,
+            optimize=True,
+        )
+    except Exception as exc:
+        logging.error(
+            "No se pudo guardar variante rebalanceada %s: %s",
+            new_path,
+            exc,
+        )
+        return None
+
     if new_path != source_path:
-        try:
-            os.remove(source_path)
-        except OSError:
-            pass
+        file_manager.remove_variant(source_path)
 
     logging.info(
         "Rebalanceo: %s → %s (%s → %s)",
@@ -1707,7 +1981,7 @@ def convert_variant_between_groups(variants, source_index, to_group, new_variant
         new_path.name,
     )
 
-    return str(new_path)
+    return str(new_path.resolve())
 
 
 def implement_actual_rebalancing_system():
@@ -1717,7 +1991,17 @@ def implement_actual_rebalancing_system():
         if not variants:
             return False
 
-        current_counts = count_group_distribution(variants)
+        file_manager = get_file_manager()
+        filtered_variants = file_manager.filter_verified_variants(list(variants))
+        if not filtered_variants:
+            logging.warning(
+                "No hay variantes válidas disponibles para rebalancear"
+            )
+            variants[:] = []
+            return False
+
+        variants[:] = filtered_variants
+        current_counts = count_group_distribution(filtered_variants)
         for group in target_distribution:
             current_counts.setdefault(group, 0)
 
@@ -1746,7 +2030,8 @@ def implement_actual_rebalancing_system():
                     source_index = next(
                         idx
                         for idx, path in enumerate(variants)
-                        if extract_group_from_filename(Path(path).name) == excess_group
+                        if extract_group_from_filename(Path(path).name)
+                        == excess_group
                     )
                 except StopIteration:
                     current_counts[excess_group] = target_distribution.get(excess_group, 0)
@@ -1983,13 +2268,19 @@ def create_adaptive_perceptual_metrics():
         return "colorful"
 
     def analyze(image_or_path):
+        stats = {"brightness": 0.5, "color_diversity": 0.2, "texture_complexity": 0.1}
+
         if isinstance(image_or_path, (str, os.PathLike)):
-            with Image.open(image_or_path) as img:
-                stats = calculate_image_statistics(img)
+            with open_image_safely(image_or_path) as img:
+                if img is not None:
+                    stats = calculate_image_statistics(img)
+                else:
+                    logging.warning(
+                        "No se pudieron calcular métricas para %s por ausencia del archivo",
+                        image_or_path,
+                    )
         elif isinstance(image_or_path, Image.Image):
             stats = calculate_image_statistics(image_or_path)
-        else:
-            stats = {"brightness": 0.5, "color_diversity": 0.2, "texture_complexity": 0.1}
 
         profile = classify_profile(stats)
         thresholds = get_realistic_thresholds(profile)
@@ -2037,7 +2328,9 @@ def calculate_color_variance(variants):
     for item in variants:
         try:
             if isinstance(item, str):
-                with Image.open(item) as img:
+                with open_image_safely(item) as img:
+                    if img is None:
+                        continue
                     rgb = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
             elif isinstance(item, Image.Image):
                 rgb = np.array(item.convert("RGB"), dtype=np.float32) / 255.0
@@ -2122,7 +2415,9 @@ def validate_contrast_contextually(variants, thresholds, image_profile):
     for path in variants:
         try:
             if isinstance(path, str):
-                with Image.open(path) as img:
+                with open_image_safely(path) as img:
+                    if img is None:
+                        continue
                     contrast_values.append(extract_contrast(img))
             elif isinstance(path, Image.Image):
                 contrast_values.append(extract_contrast(path))
@@ -2265,7 +2560,9 @@ def check_background_issues(variants, thresholds=None):
     color_means = []
     for path in variants:
         try:
-            with Image.open(path) as img:
+            with open_image_safely(path) as img:
+                if img is None:
+                    continue
                 rgb = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
                 color_means.append(np.mean(rgb, axis=(0, 1)))
         except Exception:
@@ -2306,7 +2603,9 @@ def implement_batch_validation(
         for item in variants_batch:
             try:
                 if isinstance(item, str):
-                    with Image.open(item) as img:
+                    with open_image_safely(item) as img:
+                        if img is None:
+                            continue
                         contrast_values.append(extract_contrast(img))
                 elif isinstance(item, Image.Image):
                     contrast_values.append(extract_contrast(item))
@@ -2634,7 +2933,9 @@ def check_contrast_distribution(generated_variants):
     contrasts = []
     for path in generated_variants:
         try:
-            with Image.open(path) as img:
+            with open_image_safely(path) as img:
+                if img is None:
+                    continue
                 gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
                 contrasts.append(float(gray.std()))
         except Exception:
@@ -2659,7 +2960,9 @@ def measure_color_variance(generated_variants):
     variances = []
     for path in generated_variants:
         try:
-            with Image.open(path) as img:
+            with open_image_safely(path) as img:
+                if img is None:
+                    continue
                 lab = rgb_to_lab(img.convert("RGB"))
                 flat = lab.reshape(-1, 3)
                 variances.append(float(np.mean(np.var(flat, axis=0))))
@@ -2679,7 +2982,9 @@ def evaluate_perceptual_edge_quality(variants, min_strength=0.08):
     for item in variants:
         try:
             if isinstance(item, str):
-                with Image.open(item) as img:
+                with open_image_safely(item) as img:
+                    if img is None:
+                        continue
                     edges = enhanced_edge_detection(img)
             elif isinstance(item, Image.Image):
                 edges = enhanced_edge_detection(item)
@@ -2717,7 +3022,9 @@ def evaluate_human_vision_balance(variants, min_chroma=12.0, min_edge=0.06):
     for item in variants:
         try:
             if isinstance(item, str):
-                with Image.open(item) as img:
+                with open_image_safely(item) as img:
+                    if img is None:
+                        continue
                     rgb = np.array(img.convert("RGB"), dtype=np.uint8)
             elif isinstance(item, Image.Image):
                 rgb = np.array(item.convert("RGB"), dtype=np.uint8)
@@ -2772,7 +3079,9 @@ def analyze_background_diversity(generated_variants):
     color_means = []
     for path in generated_variants:
         try:
-            with Image.open(path) as img:
+            with open_image_safely(path) as img:
+                if img is None:
+                    continue
                 rgb = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
                 color_means.append(np.mean(rgb, axis=(0, 1)))
         except Exception:
@@ -2892,7 +3201,9 @@ def get_random_background(size):
 
     for path in background_files:
         try:
-            with Image.open(path) as bg_image:
+            with open_image_safely(path) as bg_image:
+                if bg_image is None:
+                    continue
                 bg_rgba = bg_image.convert("RGBA")
                 resized = bg_rgba.resize((width, height), Image.LANCZOS)
                 result = resized.copy()
@@ -3307,9 +3618,13 @@ def generate_basic_color_variants(args):
         "fallback",
         variant_index,
     )
-    output_path = os.path.join(output_dir, output_name)
-    basic_image.save(output_path, optimize=True)
-    return output_path
+    file_manager = get_file_manager(output_dir)
+    final_path = file_manager.save_variant_image(
+        basic_image,
+        file_manager.build_variant_path(output_name),
+        optimize=True,
+    )
+    return str(final_path)
 
 
 def fallback_output_generation(args):
@@ -3370,16 +3685,25 @@ def process_single_color(args):
         dynamic_bg = generate_perceptual_background(background, variant_index)
         final_img = composite_with_alpha(perceptual_array, dynamic_bg)
 
+        file_manager = get_file_manager(output_dir)
         output_name = generate_perceptual_filename(
             base_name, rot_suffix, color_idx, group_type, variant_index
         )
-        output_path = os.path.join(output_dir, output_name)
-        final_img.save(output_path, optimize=True)
+        final_path = file_manager.save_variant_image(
+            final_img,
+            file_manager.build_variant_path(output_name),
+            optimize=True,
+        )
+        output_path = str(final_path)
 
         if GENERATE_PBR_MAPS:
             try:
                 result_img = Image.fromarray(perceptual_array.astype("uint8"), "RGBA")
-                save_pbr_maps(result_img, output_name, output_dir)
+                save_pbr_maps(
+                    result_img,
+                    output_name,
+                    str(file_manager.output_dir),
+                )
             except Exception as pbr_error:
                 logging.error(
                     f"Error generando mapas PBR para {output_name}: {pbr_error}"
@@ -3485,6 +3809,7 @@ def process_rotation_parallel(args):
                 )
             )
 
+        file_manager = get_file_manager(output_dir)
         generated_variants = []
         if CONFIG["PARALLEL_COLORS"] and len(color_tasks) > 1:
             with ThreadPoolExecutor(
@@ -3504,6 +3829,14 @@ def process_rotation_parallel(args):
                 if result:
                     generated_variants.append(result)
 
+        verified_variants = file_manager.filter_verified_variants(generated_variants)
+        if len(verified_variants) != len(generated_variants):
+            logging.warning(
+                "Se excluyeron %d variantes no verificadas antes del rebalanceo",
+                len(generated_variants) - len(verified_variants),
+            )
+        generated_variants = verified_variants
+
         generated_count = len(generated_variants)
         logging.info(
             f"Completadas {generated_count} variantes para rotación {rot_suffix}"
@@ -3521,6 +3854,10 @@ def process_rotation_parallel(args):
                     base_name,
                     rot_suffix,
                     rebalance_error,
+                )
+            finally:
+                generated_variants = file_manager.filter_verified_variants(
+                    generated_variants
                 )
 
         warnings = []
@@ -3628,59 +3965,82 @@ def process_single_image(args):
     base_name = os.path.splitext(os.path.basename(image_path))[0]
 
     try:
-        with Image.open(image_path) as img:
-            if CONFIG["GENERATE_ROTATIONS"]:
-                rotations = generate_rotations(img)
+        path_obj = Path(image_path)
+        if not path_obj.exists():
+            error_message = f"Archivo de imagen no encontrado: {path_obj}"
+            logging.error(error_message)
+            return {
+                "image": base_name,
+                "message": error_message,
+                "warnings": [error_message],
+                "rotation_results": [],
+            }
 
-                if CONFIG["PARALLEL_ROTATIONS"] and len(rotations) > 1:
-                    rotation_tasks = []
-                    for rot_suffix, rot_img in rotations.items():
-                        rotation_tasks.append(
-                            (rot_img, base_name, rot_suffix, colors, output_dir)
-                        )
-
-                    with ThreadPoolExecutor(
-                        max_workers=min(
-                            CONFIG["MAX_ROTATION_WORKERS"], len(rotations)
-                        )
-                    ) as executor:
-                        futures = [
-                            executor.submit(process_rotation_parallel, task)
-                            for task in rotation_tasks
-                        ]
-                        rotation_results = []
-                        for future in as_completed(futures):
-                            rotation_results.append(future.result())
-
-                        return {
-                            "image": base_name,
-                            "message": _summarize_image_results(base_name, rotation_results),
-                            "warnings": _collect_warnings(rotation_results),
-                            "rotation_results": rotation_results,
-                        }
-                else:
-                    rotation_results = []
-                    for rot_suffix, rot_img in rotations.items():
-                        result_payload = process_rotation_parallel(
-                            (rot_img, base_name, rot_suffix, colors, output_dir)
-                        )
-                        rotation_results.append(result_payload)
-                    return {
-                        "image": base_name,
-                        "message": _summarize_image_results(base_name, rotation_results),
-                        "warnings": _collect_warnings(rotation_results),
-                        "rotation_results": rotation_results,
-                    }
-            else:
-                result_payload = process_rotation_parallel(
-                    (img, base_name, "", colors, output_dir)
-                )
+        with open_image_safely(path_obj) as img:
+            if img is None:
+                error_message = f"No se pudo abrir {path_obj}"
+                logging.error(error_message)
                 return {
                     "image": base_name,
-                    "message": _summarize_image_results(base_name, [result_payload]),
-                    "warnings": _collect_warnings([result_payload]),
-                    "rotation_results": [result_payload],
+                    "message": error_message,
+                    "warnings": [error_message],
+                    "rotation_results": [],
                 }
+
+            working_image = img.convert("RGBA")
+
+        if CONFIG["GENERATE_ROTATIONS"]:
+            rotations = generate_rotations(working_image)
+
+            if CONFIG["PARALLEL_ROTATIONS"] and len(rotations) > 1:
+                rotation_tasks = []
+                for rot_suffix, rot_img in rotations.items():
+                    rotation_tasks.append(
+                        (rot_img, base_name, rot_suffix, colors, output_dir)
+                    )
+
+                with ThreadPoolExecutor(
+                    max_workers=min(
+                        CONFIG["MAX_ROTATION_WORKERS"], len(rotations)
+                    )
+                ) as executor:
+                    futures = [
+                        executor.submit(process_rotation_parallel, task)
+                        for task in rotation_tasks
+                    ]
+                    rotation_results = []
+                    for future in as_completed(futures):
+                        rotation_results.append(future.result())
+
+                return {
+                    "image": base_name,
+                    "message": _summarize_image_results(base_name, rotation_results),
+                    "warnings": _collect_warnings(rotation_results),
+                    "rotation_results": rotation_results,
+                }
+
+            rotation_results = []
+            for rot_suffix, rot_img in rotations.items():
+                result_payload = process_rotation_parallel(
+                    (rot_img, base_name, rot_suffix, colors, output_dir)
+                )
+                rotation_results.append(result_payload)
+            return {
+                "image": base_name,
+                "message": _summarize_image_results(base_name, rotation_results),
+                "warnings": _collect_warnings(rotation_results),
+                "rotation_results": rotation_results,
+            }
+
+        result_payload = process_rotation_parallel(
+            (working_image, base_name, "", colors, output_dir)
+        )
+        return {
+            "image": base_name,
+            "message": _summarize_image_results(base_name, [result_payload]),
+            "warnings": _collect_warnings([result_payload]),
+            "rotation_results": [result_payload],
+        }
 
     except Exception as e:
         error_message = f"Error en {image_path}: {str(e)}"
@@ -3710,7 +4070,18 @@ def main():
     if not COLOR_MATH_AVAILABLE:
         logging.warning("colormath no disponible. Usando método alternativo")
 
-    os.makedirs(CONFIG["OUTPUT_DIR"], exist_ok=True)
+    file_manager = get_file_manager(CONFIG["OUTPUT_DIR"])
+    file_manager.prepare_run()
+
+    input_dir = Path(CONFIG["INPUT_DIR"])
+    if not input_dir.is_absolute():
+        input_dir = (Path.cwd() / input_dir).resolve()
+
+    if not input_dir.exists() or not input_dir.is_dir():
+        logging.error("Directorio de entrada no válido: %s", input_dir)
+        return
+
+    logging.info("Usando directorio de salida: %s", file_manager.output_dir)
 
     base_colors = load_colors(CONFIG["COLORS_JSON"])
     if len(base_colors) < CONFIG["MIN_COLOR"]:
@@ -3725,11 +4096,11 @@ def main():
     logging.info(f"Paralelismo por colores: {CONFIG['PARALLEL_COLORS']}")
     logging.info(f"Objetivo de memoria (referencia): {CONFIG['TARGET_MEMORY_GB']}GB")
 
+    valid_ext = {ext.lower() for ext in CONFIG["VALID_EXTENSIONS"]}
     image_files = [
-        os.path.join(CONFIG["INPUT_DIR"], f)
-        for f in os.listdir(CONFIG["INPUT_DIR"])
-        if os.path.isfile(os.path.join(CONFIG["INPUT_DIR"], f))
-        and os.path.splitext(f)[1].lower() in CONFIG["VALID_EXTENSIONS"]
+        str(path)
+        for path in sorted(input_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in valid_ext
     ]
 
     if not image_files:
@@ -3749,7 +4120,10 @@ def main():
 
         for batch in image_batches:
             future = executor.submit(
-                process_image_batch, batch, base_colors, CONFIG["OUTPUT_DIR"]
+                process_image_batch,
+                batch,
+                base_colors,
+                str(file_manager.output_dir),
             )
             futures.append(future)
 
@@ -4173,9 +4547,9 @@ def save_pbr_maps(result_img, output_name, variants_dir):
             rotation_suffix=rotation_suffix,
         )
 
-    variants_path = Path(variants_dir)
+    file_manager = get_file_manager(variants_dir)
+    variants_path = file_manager.output_dir
     pbr_dir = variants_path / "pbr_maps"
-    pbr_dir.mkdir(exist_ok=True)
 
     stem = Path(output_name).stem
     suffix = Path(output_name).suffix or ".png"
@@ -4191,10 +4565,10 @@ def save_pbr_maps(result_img, output_name, variants_dir):
         normal_out = cv2.cvtColor(normal_map, cv2.COLOR_RGBA2BGRA)
     normal_out = np.ascontiguousarray(normal_out)
 
-    cv2.imwrite(
-        str(pbr_dir / normal_filename),
+    file_manager.save_auxiliary_image(
         normal_out,
-        PNG_PARAMS,
+        pbr_dir / normal_filename,
+        params=PNG_PARAMS,
     )
 
     if specular_map.shape[2] == 3:
@@ -4213,15 +4587,15 @@ def save_pbr_maps(result_img, output_name, variants_dir):
     specular_bgra = np.ascontiguousarray(specular_bgra)
     emissive_bgra = np.ascontiguousarray(emissive_bgra)
 
-    cv2.imwrite(
-        str(pbr_dir / specular_filename),
+    file_manager.save_auxiliary_image(
         specular_bgra,
-        PNG_PARAMS,
+        pbr_dir / specular_filename,
+        params=PNG_PARAMS,
     )
-    cv2.imwrite(
-        str(pbr_dir / emissive_filename),
+    file_manager.save_auxiliary_image(
         emissive_bgra,
-        PNG_PARAMS,
+        pbr_dir / emissive_filename,
+        params=PNG_PARAMS,
     )
 
     return [normal_filename, specular_filename, emissive_filename]
