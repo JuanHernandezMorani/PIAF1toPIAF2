@@ -10,7 +10,7 @@ def generate(image: Image.Image) -> Image.Image:
 
     rgba = image.convert("RGBA")
     luminance = np.asarray(rgba.convert("L"), dtype=np.float32)
-    normalized = (luminance - luminance.min()) / max(luminance.ptp(), 1.0)
+    normalized = (luminance - luminance.min()) / max(np.ptp(luminance), 1.0)
     height = (normalized * 255.0).astype(np.uint8)
     alpha = np.asarray(rgba.split()[-1], dtype=np.uint8)
     height_rgba = np.dstack([height, height, height, alpha])

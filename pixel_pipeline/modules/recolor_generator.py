@@ -92,14 +92,21 @@ class BackgroundLibrary:
 
 
 def shift_hue(image: Image.Image, degrees: float) -> Image.Image:
-    """Shift the hue of *image* by *degrees* in-place."""
-
+    """Shift hue by given degrees (safe for negative values)."""
+    if degrees == 0:
+        return image
     hsv = image.convert("HSV")
     h, s, v = hsv.split()
-    h_data = (np.asarray(h, dtype=np.uint16) + int(degrees / 360.0 * 255)) % 255
-    shifted_h = Image.fromarray(h_data.astype(np.uint8), mode="L")
-    shifted = Image.merge("HSV", (shifted_h, s, v))
-    return shifted.convert("RGBA")
+    # Convert to int32 para permitir valores negativos sin overflow
+    np_h = np.asarray(h, dtype=np.int32)
+    # Convertir grados a desplazamiento en rango [0,255)
+    shift = int(degrees / 360.0 * 255)
+    np_h = (np_h + shift) % 255
+    np_h = np.clip(np_h, 0, 255).astype(np.uint8)
+    h = Image.fromarray(np_h, "L")
+    merged = Image.merge("HSV", (h, s, v))
+    return merged.convert("RGBA")
+
 
 
 def add_texture_noise(image: Image.Image, amount: float) -> Image.Image:

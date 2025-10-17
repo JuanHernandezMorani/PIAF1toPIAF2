@@ -1,9 +1,7 @@
-"""Generate tangent-space normal maps from pixel art sprites."""
+"""Generate tangent-space normal maps from pixel art sprites (Sobel + normalization)."""
 from __future__ import annotations
-
 import numpy as np
 from PIL import Image, ImageFilter
-
 
 def _sobel_edges(gray: Image.Image) -> tuple[np.ndarray, np.ndarray]:
     gx_kernel = ImageFilter.Kernel(
@@ -21,23 +19,35 @@ def _sobel_edges(gray: Image.Image) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(grad_x, dtype=np.float32), np.asarray(grad_y, dtype=np.float32)
 
 
-def generate(image: Image.Image) -> Image.Image:
-    """Create a normal map from *image* using Sobel gradients."""
-
+def generate(image: Image.Image, strength: float = 2.0) -> Image.Image:
+    """Create a physically plausible normal map (tangent space, bluish) from *image* using Sobel gradients."""
     rgba = image.convert("RGBA")
     gray = rgba.convert("L")
-    grad_x, grad_y = _sobel_edges(gray)
-    depth = np.full_like(grad_x, 255.0)
-    normals = np.stack([grad_x, grad_y, depth], axis=-1)
-    normals -= normals.min(axis=(0, 1), keepdims=True)
-    normals /= np.maximum(normals.max(axis=(0, 1), keepdims=True), 1.0)
-    normals = (normals * 255.0).astype(np.uint8)
+
+    gx, gy = _sobel_edges(gray)
+    gx /= 255.0
+    gy /= 255.0
+
+    # compute tangent-space normal
+    nx = -gx * strength
+    ny = -gy * strength
+    nz = np.ones_like(gray, dtype=np.float32)
+
+    # normalize vectors
+    length = np.sqrt(nx ** 2 + ny ** 2 + nz ** 2)
+    nx /= length
+    ny /= length
+    nz /= length
+
+    # remap from [-1,1] → [0,1]
+    normal = np.stack([(nx + 1) * 0.5, (ny + 1) * 0.5, (nz + 1) * 0.5], axis=-1)
+    normal = np.clip(normal * 255.0, 0, 255).astype(np.uint8)
+
     alpha = np.asarray(rgba.split()[-1], dtype=np.uint8)
-    normal_rgba = np.dstack([normals, alpha])
+    normal_rgba = np.dstack([normal, alpha])
     return Image.fromarray(normal_rgba, mode="RGBA")
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke test
     sample = Image.new("RGBA", (16, 16), (120, 100, 90, 255))
-    normal_map = generate(sample)
-    normal_map.show()
+    generate(sample).show()

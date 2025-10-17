@@ -23,17 +23,7 @@ def ensure_dir(path: Path) -> Path:
 
 
 def _normalize_onedrive_path(path: Path) -> Path:
-    """Resolve OneDrive synced paths to avoid temporary file issues."""
 
-    parts = list(path.parts)
-    if "OneDrive" in parts:
-        # move temporary artifacts into a dedicated hidden directory
-        onedrive_index = parts.index("OneDrive")
-        prefix = Path(*parts[: onedrive_index + 1])
-        suffix = Path(*parts[onedrive_index + 1 :])
-        safe_root = prefix / "_pixel_pipeline"
-        ensure_dir(safe_root)
-        return safe_root / suffix
     return path
 
 
