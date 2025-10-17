@@ -23,6 +23,7 @@ from ..core.utils_color import (
 )
 from ..core.utils_io import SafeFileManager, ensure_dir
 from ..core.utils_parallel import limited_threads, run_parallel
+from . import contextual_randomizer
 
 LOGGER = logging.getLogger("pixel_pipeline.recolor")
 
@@ -315,7 +316,8 @@ class RecolorPipeline:
         arr[..., :3] = np.clip(arr[..., :3], 0, 255)
         arr[..., 3:4] = alpha * 255.0
         tinted = Image.fromarray(arr.astype(np.uint8), mode="RGBA")
-        tinted = self._apply_pixel_variation(tinted)
+        with contextual_randomizer.pixel_variation_callback(self._apply_pixel_variation):
+            tinted = contextual_randomizer.integrate_contextual_variation(tinted, self.rng)
         brightness = self.rng.uniform(0.8, 1.2)
         contrast = self.rng.uniform(0.8, 1.3)
         tinted = ImageEnhance.Brightness(tinted).enhance(brightness)
