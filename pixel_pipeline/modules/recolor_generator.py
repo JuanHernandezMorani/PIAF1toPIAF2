@@ -573,6 +573,7 @@ class RecolorPipeline:
         combined_rgb = np.where(foreground, varied_rgb, rgb)
         combined = np.dstack((combined_rgb, alpha))
         tinted = Image.fromarray(np.clip(combined * 255.0, 0.0, 255.0).astype(np.uint8), mode="RGBA")
+        tinted = contextual_randomizer.apply_global_recolor(tinted, self.rng)
         with contextual_randomizer.pixel_variation_callback(self._apply_pixel_variation):
             tinted = contextual_randomizer.integrate_contextual_variation(tinted, self.rng)
         brightness = self.rng.uniform(0.8, 1.2)

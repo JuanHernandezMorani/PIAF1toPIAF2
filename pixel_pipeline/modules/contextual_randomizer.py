@@ -17,6 +17,136 @@ except Exception:  # pragma: no cover - optional dependency
 _PIXEL_VARIATION_CALLBACK: Optional[Callable[[Image.Image], Image.Image]] = None
 
 
+def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
+    """Convert sRGB values in [0, 1] to linear RGB."""
+
+    threshold = 0.04045
+    low = rgb <= threshold
+    high = ~low
+    result = np.empty_like(rgb, dtype=np.float32)
+    result[low] = rgb[low] / 12.92
+    result[high] = np.power((rgb[high] + 0.055) / 1.055, 2.4)
+    return result
+
+
+def _linear_to_srgb(rgb: np.ndarray) -> np.ndarray:
+    """Convert linear RGB values to sRGB in [0, 1]."""
+
+    threshold = 0.0031308
+    low = rgb <= threshold
+    high = ~low
+    result = np.empty_like(rgb, dtype=np.float32)
+    result[low] = rgb[low] * 12.92
+    result[high] = 1.055 * np.power(rgb[high], 1.0 / 2.4) - 0.055
+    return result
+
+
+def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    """Convert sRGB array in [0, 1] to CIE LAB."""
+
+    linear = _srgb_to_linear(np.clip(rgb, 0.0, 1.0))
+    matrix = np.array(
+        (
+            (0.4124564, 0.3575761, 0.1804375),
+            (0.2126729, 0.7151522, 0.0721750),
+            (0.0193339, 0.1191920, 0.9503041),
+        ),
+        dtype=np.float32,
+    )
+    xyz = linear @ matrix.T
+
+    # Reference white for D65
+    ref_white = np.array((0.95047, 1.0, 1.08883), dtype=np.float32)
+    xyz_scaled = xyz / ref_white
+
+    delta = 6.0 / 29.0
+
+    def _f(t: np.ndarray) -> np.ndarray:
+        cube = np.cbrt(t)
+        linear_mask = t <= delta**3
+        result = cube
+        if np.any(linear_mask):
+            result = result.astype(np.float32)
+            result[linear_mask] = (t[linear_mask] / (3.0 * delta**2)) + (4.0 / 29.0)
+        return result.astype(np.float32)
+
+    fx = _f(xyz_scaled[..., 0])
+    fy = _f(xyz_scaled[..., 1])
+    fz = _f(xyz_scaled[..., 2])
+
+    l = (116.0 * fy) - 16.0
+    a = 500.0 * (fx - fy)
+    b = 200.0 * (fy - fz)
+    lab = np.stack((l, a, b), axis=2)
+    return lab.astype(np.float32)
+
+
+def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
+    """Convert CIE LAB array back to sRGB in [0, 1]."""
+
+    lab = lab.astype(np.float32)
+    fy = (lab[..., 0] + 16.0) / 116.0
+    fx = fy + lab[..., 1] / 500.0
+    fz = fy - lab[..., 2] / 200.0
+
+    delta = 6.0 / 29.0
+
+    def _f_inv(t: np.ndarray) -> np.ndarray:
+        result = np.power(t, 3)
+        linear_mask = t <= delta
+        if np.any(linear_mask):
+            result = result.astype(np.float32)
+            result[linear_mask] = 3.0 * delta**2 * (t[linear_mask] - 4.0 / 29.0)
+        return result.astype(np.float32)
+
+    x = _f_inv(fx)
+    y = _f_inv(fy)
+    z = _f_inv(fz)
+
+    ref_white = np.array((0.95047, 1.0, 1.08883), dtype=np.float32)
+    xyz = np.stack((x, y, z), axis=2) * ref_white
+
+    matrix = np.array(
+        (
+            (3.2404542, -1.5371385, -0.4985314),
+            (-0.9692660, 1.8760108, 0.0415560),
+            (0.0556434, -0.2040259, 1.0572252),
+        ),
+        dtype=np.float32,
+    )
+    linear_rgb = xyz @ matrix.T
+    return np.clip(_linear_to_srgb(linear_rgb), 0.0, 1.0)
+
+
+def _rgb_to_yuv(rgb: np.ndarray) -> np.ndarray:
+    """Convert sRGB array in [0, 1] to YUV."""
+
+    matrix = np.array(
+        (
+            (0.299, 0.587, 0.114),
+            (-0.14713, -0.28886, 0.436),
+            (0.615, -0.51499, -0.10001),
+        ),
+        dtype=np.float32,
+    )
+    return rgb @ matrix.T
+
+
+def _yuv_to_rgb(yuv: np.ndarray) -> np.ndarray:
+    """Convert YUV array back to sRGB in [0, 1]."""
+
+    matrix = np.array(
+        (
+            (1.0, 0.0, 1.13983),
+            (1.0, -0.39465, -0.58060),
+            (1.0, 2.03211, 0.0),
+        ),
+        dtype=np.float32,
+    )
+    rgb = yuv @ matrix.T
+    return np.clip(rgb, 0.0, 1.0)
+
+
 @contextlib.contextmanager
 def pixel_variation_callback(callback: Callable[[Image.Image], Image.Image]) -> Iterator[None]:
     """Temporarily set the pixel-variation callback used by contextual blending."""
@@ -157,3 +287,77 @@ def integrate_contextual_variation(image: Image.Image, rng: random.Random) -> Im
         raise RuntimeError("Pixel variation callback is not configured")
     structured = apply_structural_variation(image, rng)
     return _PIXEL_VARIATION_CALLBACK(structured)
+
+
+def apply_global_recolor(image: Image.Image, rng: random.Random) -> Image.Image:
+    """Apply an adaptive recolor step to break dominant color dependency."""
+
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    if width == 0 or height == 0:
+        return rgba
+
+    alpha_channel = rgba.getchannel("A")
+    rgb_image = rgba.convert("RGB")
+    arr = np.asarray(rgb_image, dtype=np.float32) / 255.0
+    if arr.size == 0:
+        recolored = rgba.copy()
+        recolored.putalpha(alpha_channel)
+        return recolored
+
+    np_rng = np.random.default_rng(rng.randint(0, 2**32 - 1))
+    mode = rng.choice(["HSL", "LAB", "YUV"])
+
+    if mode == "HSL":
+        import colorsys
+
+        hls = np.empty_like(arr)
+        for y in range(height):
+            for x in range(width):
+                r, g, b = arr[y, x]
+                h, l, s = colorsys.rgb_to_hls(float(r), float(g), float(b))
+                hls[y, x] = (h, l, s)
+        hls[..., 0] = (hls[..., 0] + rng.uniform(-0.6, 0.6)) % 1.0
+        hls[..., 1] = np.clip(hls[..., 1] * rng.uniform(0.5, 1.8), 0.0, 1.0)
+        hls[..., 2] = np.clip(hls[..., 2] * rng.uniform(0.4, 1.6), 0.0, 1.0)
+        for y in range(height):
+            for x in range(width):
+                arr[y, x] = colorsys.hls_to_rgb(*hls[y, x])
+    elif mode == "LAB":
+        lab = _rgb_to_lab(arr)
+        lab[..., 1:] += np_rng.normal(0.0, 20.0, lab[..., 1:].shape).astype(np.float32)
+        lab[..., 0] *= rng.uniform(0.7, 1.4)
+        arr = np.clip(_lab_to_rgb(lab), 0.0, 1.0)
+    else:  # YUV
+        yuv = _rgb_to_yuv(arr)
+        yuv[..., 1:] += np_rng.normal(0.0, 0.1, yuv[..., 1:].shape).astype(np.float32)
+        yuv[..., 0] = np.clip(yuv[..., 0] * rng.uniform(0.6, 1.6), 0.0, 1.0)
+        arr = np.clip(_yuv_to_rgb(yuv), 0.0, 1.0)
+
+    tint = np.array([rng.uniform(0.6, 1.4) for _ in range(3)], dtype=np.float32)
+    arr = np.clip(arr * tint, 0.0, 1.0)
+
+    # Apply smooth fractal noise per channel
+    noise_strength = rng.uniform(0.08, 0.22)
+    noise_fields = []
+    for _ in range(3):
+        channel_rng = random.Random(rng.randint(0, 2**32 - 1))
+        noise_map = generate_multiscale_noise(
+            width,
+            height,
+            channel_rng,
+            scales=(4, 8, 16, 32),
+            weights=(0.4, 0.3, 0.2, 0.1),
+        )
+        noise_fields.append(noise_map)
+    fractal_noise = np.stack(noise_fields, axis=2).astype(np.float32)
+    arr = np.clip(arr + (fractal_noise - 0.5) * noise_strength, 0.0, 1.0)
+
+    micro_noise_strength = rng.uniform(0.01, 0.05)
+    micro_noise = np_rng.normal(0.0, micro_noise_strength, arr.shape).astype(np.float32)
+    arr = np.clip(arr + micro_noise, 0.0, 1.0)
+
+    recolored_rgb = Image.fromarray((arr * 255.0).astype(np.uint8), mode="RGB")
+    recolored = recolored_rgb.convert("RGBA")
+    recolored.putalpha(alpha_channel)
+    return recolored
