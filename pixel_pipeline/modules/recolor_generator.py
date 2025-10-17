@@ -123,6 +123,73 @@ def add_texture_noise(image: Image.Image, amount: float) -> Image.Image:
     return blended
 
 
+def _rgb_to_hsv_array(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized RGB→HSV conversion for arrays in range [0, 1]."""
+
+    maxc = rgb.max(axis=2)
+    minc = rgb.min(axis=2)
+    delta = maxc - minc
+
+    h = np.zeros_like(maxc)
+    mask = delta > 1e-6
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+
+    red_mask = (maxc == r) & mask
+    green_mask = (maxc == g) & mask
+    blue_mask = (maxc == b) & mask
+
+    if np.any(red_mask):
+        h_val = (g[red_mask] - b[red_mask]) / delta[red_mask]
+        h[red_mask] = np.mod(h_val, 6.0)
+    if np.any(green_mask):
+        h[green_mask] = (b[green_mask] - r[green_mask]) / delta[green_mask] + 2.0
+    if np.any(blue_mask):
+        h[blue_mask] = (r[blue_mask] - g[blue_mask]) / delta[blue_mask] + 4.0
+
+    h = np.mod(h / 6.0, 1.0)
+    s = np.zeros_like(maxc)
+    nonzero = maxc > 1e-6
+    s[nonzero] = delta[nonzero] / maxc[nonzero]
+    v = maxc
+    return h, s, v
+
+
+def _hsv_to_rgb_array(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Vectorized HSV→RGB conversion for arrays in range [0, 1]."""
+
+    h = np.mod(h, 1.0)
+    s = np.clip(s, 0.0, 1.0)
+    v = np.clip(v, 0.0, 1.0)
+
+    h_prime = h * 6.0
+    sector = np.floor(h_prime).astype(int)
+    fraction = h_prime - sector
+
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * fraction)
+    t = v * (1.0 - s * (1.0 - fraction))
+
+    sector_mod = np.mod(sector, 6)
+    conditions = [sector_mod == idx for idx in range(6)]
+
+    r = np.select(conditions, [v, q, p, p, t, v], default=v)
+    g = np.select(conditions, [t, v, v, q, p, p], default=v)
+    b = np.select(conditions, [p, p, t, v, v, q], default=q)
+    return np.stack((r, g, b), axis=2)
+
+
+def _generate_zone_noise(rng: np.random.Generator, height: int, width: int, scale: float) -> np.ndarray:
+    """Create smooth noise fields to perturb pixels by regions."""
+
+    coarse_h = max(1, height // 4)
+    coarse_w = max(1, width // 4)
+    coarse = rng.normal(0.0, scale, (coarse_h, coarse_w)).astype(np.float32)
+    repeat_y = int(np.ceil(height / coarse_h))
+    repeat_x = int(np.ceil(width / coarse_w))
+    tiled = np.kron(coarse, np.ones((repeat_y, repeat_x), dtype=np.float32))
+    return tiled[:height, :width]
+
+
 class RecolorPipeline:
     """Generate recolored variants and derived maps for input sprites."""
 
@@ -248,11 +315,40 @@ class RecolorPipeline:
         arr[..., :3] = np.clip(arr[..., :3], 0, 255)
         arr[..., 3:4] = alpha * 255.0
         tinted = Image.fromarray(arr.astype(np.uint8), mode="RGBA")
+        tinted = self._apply_pixel_variation(tinted)
         brightness = self.rng.uniform(0.8, 1.2)
         contrast = self.rng.uniform(0.8, 1.3)
         tinted = ImageEnhance.Brightness(tinted).enhance(brightness)
         tinted = ImageEnhance.Contrast(tinted).enhance(contrast)
         return tinted
+
+    def _apply_pixel_variation(self, image: Image.Image) -> Image.Image:
+        """Apply pixel-wise hue, saturation, and luminance perturbations."""
+
+        rgba = image.convert("RGBA")
+        arr = np.asarray(rgba, dtype=np.float32)
+        alpha = np.clip(arr[..., 3:4], 0.0, 255.0)
+        rgb = arr[..., :3] / 255.0
+        height, width = rgb.shape[:2]
+        if height == 0 or width == 0:
+            return image
+
+        rng = np.random.default_rng(self.rng.randint(0, 2**32 - 1))
+        hue_noise = rng.uniform(-0.04, 0.04, (height, width)).astype(np.float32)
+        sat_noise = rng.normal(0.0, 0.06, (height, width)).astype(np.float32)
+        val_noise = rng.normal(0.0, 0.06, (height, width)).astype(np.float32)
+        zone_noise = _generate_zone_noise(rng, height, width, scale=0.08)
+
+        h, s, v = _rgb_to_hsv_array(rgb)
+        h = np.mod(h + hue_noise, 1.0)
+        s = np.clip(s + sat_noise + zone_noise * 0.5, 0.0, 1.0)
+        v = np.clip(v + val_noise + zone_noise * 0.5, 0.0, 1.0)
+
+        varied_rgb = _hsv_to_rgb_array(h, s, v)
+        varied_rgb = np.clip(varied_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        alpha_channel = alpha.astype(np.uint8)
+        combined = np.concatenate((varied_rgb, alpha_channel), axis=2)
+        return Image.fromarray(combined, mode="RGBA")
 
     def _adapt_background(self, variant: Image.Image) -> Image.Image:
         size = variant.size
