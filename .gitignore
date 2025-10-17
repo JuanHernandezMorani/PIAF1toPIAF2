@@ -52,3 +52,5 @@ tool/*
 *.jpg
 *.jpeg
 *.png
+*.tmp
+*.lock

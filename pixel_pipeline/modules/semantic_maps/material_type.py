@@ -19,14 +19,19 @@ _MATERIAL_COLORS = {
 
 def classify_color(rgb: tuple[float, float, float]) -> str:
     h, s, l = utils_color.rgb_to_hsl(tuple(int(c) for c in rgb))
-    if s < 0.2 and l > 0.6:
+
+    if s < 0.25 and l > 0.6:
         return "metal"
-    if 0.05 < h < 0.15:
+
+    if 0.02 < h < 0.13 and 0.3 < s < 0.8:
         return "wood"
-    if 0.45 < h < 0.75 and s > 0.3:
+
+    if (0.25 < h < 0.45 and s > 0.3) or (h < 0.08 and l < 0.4):
         return "organic"
-    if 0.55 < h < 0.75 and l > 0.5:
+
+    if (0.45 < h < 0.75 and s > 0.25 and 0.3 < l < 0.8):
         return "liquid"
+
     return "stone"
 
 
