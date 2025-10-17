@@ -348,6 +348,9 @@ class RecolorPipeline:
         self._images_processed = 0
         self._variants_generated = 0
         self._total_image_time = 0.0
+        contextual_randomizer.pixel_variation_callback(
+            self._apply_pixel_variation, persistent=True
+        )
 
     def _load_map_generators(self, mapping: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, GeneratorFn]]:
         generators: Dict[str, Dict[str, GeneratorFn]] = {}
@@ -597,8 +600,7 @@ class RecolorPipeline:
         combined = np.dstack((combined_rgb, alpha))
         tinted = Image.fromarray(np.clip(combined * 255.0, 0.0, 255.0).astype(np.uint8), mode="RGBA")
         tinted = contextual_randomizer.apply_global_recolor(tinted, self.rng)
-        with contextual_randomizer.pixel_variation_callback(self._apply_pixel_variation):
-            tinted = contextual_randomizer.integrate_contextual_variation(tinted, self.rng)
+        tinted = contextual_randomizer.integrate_contextual_variation(tinted, self.rng)
         brightness = self.rng.uniform(0.8, 1.2)
         contrast = self.rng.uniform(0.8, 1.3)
         tinted = ImageEnhance.Brightness(tinted).enhance(brightness)

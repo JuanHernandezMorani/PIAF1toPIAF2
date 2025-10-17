@@ -1,9 +1,10 @@
 """Contextual randomization utilities for recolor pipeline."""
 from __future__ import annotations
 
-import contextlib
+import logging
 import random
-from typing import Callable, Iterator, Optional, Sequence
+import threading
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -15,6 +16,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 _PIXEL_VARIATION_CALLBACK: Optional[Callable[[Image.Image], Image.Image]] = None
+_PIXEL_CALLBACK_LOCK = threading.Lock()
 
 
 def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
@@ -147,17 +149,32 @@ def _yuv_to_rgb(yuv: np.ndarray) -> np.ndarray:
     return np.clip(rgb, 0.0, 1.0)
 
 
-@contextlib.contextmanager
-def pixel_variation_callback(callback: Callable[[Image.Image], Image.Image]) -> Iterator[None]:
-    """Temporarily set the pixel-variation callback used by contextual blending."""
+def pixel_variation_callback(
+    callback: Callable[[Image.Image], Image.Image], *, persistent: bool = False
+):
+    """Register a pixel-variation callback used by contextual blending."""
 
     global _PIXEL_VARIATION_CALLBACK
-    previous = _PIXEL_VARIATION_CALLBACK
-    _PIXEL_VARIATION_CALLBACK = callback
-    try:
-        yield
-    finally:
-        _PIXEL_VARIATION_CALLBACK = previous
+
+    if persistent:
+        with _PIXEL_CALLBACK_LOCK:
+            _PIXEL_VARIATION_CALLBACK = callback
+        return callback
+
+    previous: Optional[Callable[[Image.Image], Image.Image]] = None
+
+    class _CallbackContext:
+        def __enter__(self):
+            nonlocal previous
+            with _PIXEL_CALLBACK_LOCK:
+                previous = _PIXEL_VARIATION_CALLBACK
+                _PIXEL_VARIATION_CALLBACK = callback
+
+        def __exit__(self, exc_type, exc, tb):
+            with _PIXEL_CALLBACK_LOCK:
+                _PIXEL_VARIATION_CALLBACK = previous
+
+    return _CallbackContext()
 
 
 def _ensure_rng(rng: random.Random | np.random.Generator) -> np.random.Generator:
@@ -283,10 +300,22 @@ def apply_structural_variation(image: Image.Image, rng: random.Random) -> Image.
 def integrate_contextual_variation(image: Image.Image, rng: random.Random) -> Image.Image:
     """Run structural and pixel-level variation steps sequentially."""
 
-    if _PIXEL_VARIATION_CALLBACK is None:
-        raise RuntimeError("Pixel variation callback is not configured")
     structured = apply_structural_variation(image, rng)
-    return _PIXEL_VARIATION_CALLBACK(structured)
+
+    with _PIXEL_CALLBACK_LOCK:
+        callback = _PIXEL_VARIATION_CALLBACK
+
+    if callable(callback):
+        try:
+            return callback(structured)
+        except Exception as exc:  # pragma: no cover - log and fall back gracefully
+            logging.exception("[contextual_randomizer] Pixel variation failed: %s", exc)
+            return structured
+
+    logging.warning(
+        "[contextual_randomizer] No pixel variation callback registered, skipping variation."
+    )
+    return structured
 
 
 def apply_global_recolor(image: Image.Image, rng: random.Random) -> Image.Image:
