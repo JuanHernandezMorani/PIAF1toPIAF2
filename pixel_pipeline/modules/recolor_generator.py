@@ -4,6 +4,8 @@ from __future__ import annotations
 import importlib
 import logging
 import random
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Tuple
@@ -15,7 +17,6 @@ from ..core import config
 from ..core.utils_color import (
     add_color_noise,
     color_distance,
-    generate_high_variation_colors,
     mix_colors,
     random_palette,
     rgb_to_hsl,
@@ -30,6 +31,25 @@ LOGGER = logging.getLogger("pixel_pipeline.recolor")
 GeneratorFn = Callable[[Image.Image], Image.Image]
 
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
+
+DEFAULT_COLOR_CONFIG = {
+    "MIN_COLOR": 100,
+    "MAX_DOMINANT_COLORS": 30,
+    "MIN_VARIATIONS_PER_COLOR": 15,
+    "MAX_VARIATIONS_PER_COLOR": 40,
+    "MIN_COLOR_DIFFERENCE": 8.0,
+    "HUE_VARIATION_RANGE": (-0.3, 0.3),
+    "SATURATION_VARIATION_RANGE": (-0.7, 0.7),
+    "LIGHTNESS_VARIATION_RANGE": (-0.5, 0.5),
+    "INTENSITY_VARIATION_RANGE": (0.5, 1.8),
+    "PRESERVE_BRIGHTNESS": False,
+    "RANDOM_COLOR_PROBABILITY": 0.3,
+    "CROSS_COLOR_MIXING": True,
+    "MAX_COLOR_MIXES": 256,
+    "NOISE_INTENSITY": 0.08,
+    "ENSURE_MIN_VARIATIONS": True,
+    "MAX_GENERATION_ATTEMPTS": 800,
+}
 
 
 @dataclass
@@ -191,6 +211,87 @@ def _generate_zone_noise(rng: np.random.Generator, height: int, width: int, scal
     return tiled[:height, :width]
 
 
+def _rgb_to_hls_array(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized RGB→HLS conversion for arrays in range [0, 1]."""
+
+    maxc = rgb.max(axis=2)
+    minc = rgb.min(axis=2)
+    delta = maxc - minc
+    sumc = maxc + minc
+
+    l = 0.5 * sumc
+
+    s = np.zeros_like(maxc)
+    mask = delta > 1e-6
+    denom1 = sumc
+    mask1 = mask & (denom1 > 1e-6) & (l <= 0.5)
+    s[mask1] = delta[mask1] / denom1[mask1]
+
+    denom2 = 2.0 - sumc
+    mask2 = mask & (denom2 > 1e-6) & (l > 0.5)
+    s[mask2] = delta[mask2] / denom2[mask2]
+
+    h = np.zeros_like(maxc)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    denom = np.where(mask, delta, 1.0)
+    rc = np.zeros_like(maxc)
+    gc = np.zeros_like(maxc)
+    bc = np.zeros_like(maxc)
+    rc[mask] = (maxc[mask] - r[mask]) / denom[mask]
+    gc[mask] = (maxc[mask] - g[mask]) / denom[mask]
+    bc[mask] = (maxc[mask] - b[mask]) / denom[mask]
+
+    red_mask = (maxc == r) & mask
+    green_mask = (maxc == g) & mask
+    blue_mask = (maxc == b) & mask
+
+    if np.any(red_mask):
+        h[red_mask] = bc[red_mask] - gc[red_mask]
+    if np.any(green_mask):
+        h[green_mask] = 2.0 + rc[green_mask] - bc[green_mask]
+    if np.any(blue_mask):
+        h[blue_mask] = 4.0 + gc[blue_mask] - rc[blue_mask]
+
+    h = np.mod(h / 6.0, 1.0)
+    return h, s, l
+
+
+def _hls_to_rgb_array(h: np.ndarray, s: np.ndarray, l: np.ndarray) -> np.ndarray:
+    """Vectorized HLS→RGB conversion for arrays in range [0, 1]."""
+
+    h = np.mod(h, 1.0)
+    s = np.clip(s, 0.0, 1.0)
+    l = np.clip(l, 0.0, 1.0)
+
+    m2 = np.where(l <= 0.5, l * (1.0 + s), l + s - l * s)
+    m2 = np.clip(m2, 0.0, 1.0)
+    m1 = np.clip(2.0 * l - m2, 0.0, 1.0)
+
+    def _hue_to_rgb(m1_arr: np.ndarray, m2_arr: np.ndarray, hue: np.ndarray) -> np.ndarray:
+        hue = np.mod(hue, 1.0)
+        result = np.empty_like(hue)
+
+        cond1 = hue < (1.0 / 6.0)
+        cond2 = (hue >= (1.0 / 6.0)) & (hue < 0.5)
+        cond3 = (hue >= 0.5) & (hue < (2.0 / 3.0))
+
+        if np.any(cond1):
+            result[cond1] = m1_arr[cond1] + (m2_arr[cond1] - m1_arr[cond1]) * hue[cond1] * 6.0
+        if np.any(cond2):
+            result[cond2] = m2_arr[cond2]
+        if np.any(cond3):
+            result[cond3] = m1_arr[cond3] + (m2_arr[cond3] - m1_arr[cond3]) * ((2.0 / 3.0) - hue[cond3]) * 6.0
+        other = ~(cond1 | cond2 | cond3)
+        if np.any(other):
+            result[other] = m1_arr[other]
+        return np.clip(result, 0.0, 1.0)
+
+    r = _hue_to_rgb(m1, m2, h + (1.0 / 3.0))
+    g = _hue_to_rgb(m1, m2, h)
+    b = _hue_to_rgb(m1, m2, h - (1.0 / 3.0))
+    return np.stack((r, g, b), axis=2)
+
+
 class RecolorPipeline:
     """Generate recolored variants and derived maps for input sprites."""
 
@@ -201,7 +302,7 @@ class RecolorPipeline:
         self.background_path = Path(cfg["PATH_BACKGROUNDS"])
         ensure_dir(self.output_path)
         self.file_manager = SafeFileManager(self.output_path)
-        self.rotation_angles: Iterable[int] = cfg.get("ROTATION_ANGLES", (0,))  # type: ignore[assignment]
+        self.rotation_angles: Tuple[int, ...] = tuple(cfg.get("ROTATION_ANGLES", (0,)))  # type: ignore[arg-type]
         self.max_variants: int = int(cfg.get("MAX_VARIANTS", 200))
         seed = cfg.get("RANDOM_SEED")
         self.rng = random.Random(seed)
@@ -215,6 +316,28 @@ class RecolorPipeline:
         if self.enable_gpu and not self.gpu_available:
             self.logger.warning("GPU acceleration requested but no compatible backend was found")
         self.logger.debug("Pipeline configured with %s", cfg)
+        color_cfg = DEFAULT_COLOR_CONFIG.copy()
+        color_cfg.update({k: v for k, v in cfg.items() if k in DEFAULT_COLOR_CONFIG})
+        self.min_color_pixels = int(color_cfg["MIN_COLOR"])
+        self.max_dominant_colors = int(color_cfg["MAX_DOMINANT_COLORS"])
+        self.min_variations_per_color = max(1, int(color_cfg["MIN_VARIATIONS_PER_COLOR"]))
+        self.max_variations_per_color = max(self.min_variations_per_color, int(color_cfg["MAX_VARIATIONS_PER_COLOR"]))
+        self.min_color_difference = float(color_cfg["MIN_COLOR_DIFFERENCE"])
+        self.hue_variation_range = tuple(float(v) for v in color_cfg["HUE_VARIATION_RANGE"])
+        self.saturation_variation_range = tuple(float(v) for v in color_cfg["SATURATION_VARIATION_RANGE"])
+        self.lightness_variation_range = tuple(float(v) for v in color_cfg["LIGHTNESS_VARIATION_RANGE"])
+        self.intensity_variation_range = tuple(float(v) for v in color_cfg["INTENSITY_VARIATION_RANGE"])
+        self.preserve_brightness = bool(color_cfg["PRESERVE_BRIGHTNESS"])
+        self.random_color_probability = float(color_cfg["RANDOM_COLOR_PROBABILITY"])
+        self.cross_color_mixing = bool(color_cfg["CROSS_COLOR_MIXING"])
+        self.max_color_mixes = int(color_cfg["MAX_COLOR_MIXES"])
+        self.noise_intensity = float(color_cfg["NOISE_INTENSITY"])
+        self.ensure_min_variations = bool(color_cfg["ENSURE_MIN_VARIATIONS"])
+        self.max_generation_attempts = int(color_cfg["MAX_GENERATION_ATTEMPTS"])
+        self._stats_lock = threading.Lock()
+        self._images_processed = 0
+        self._variants_generated = 0
+        self._total_image_time = 0.0
 
     def _load_map_generators(self, mapping: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, GeneratorFn]]:
         generators: Dict[str, Dict[str, GeneratorFn]] = {}
@@ -255,12 +378,28 @@ class RecolorPipeline:
             self.logger.warning("No input files found in %s", self.input_path)
             return
         self.logger.info("Processing %d input files", len(files))
+        start_time = time.perf_counter()
         with limited_threads(threads):
             run_parallel(self._process_file, files, max_workers=threads)
+        total_time = time.perf_counter() - start_time
+        with self._stats_lock:
+            images = self._images_processed
+            variants = self._variants_generated
+            total_image_time = self._total_image_time
+        avg_variants = variants / images if images else 0.0
+        avg_time = total_image_time / images if images else 0.0
+        self.logger.info(
+            "Imagenes transformadas: %d, Transformaciones por imagen: %.2f, Tiempo transcurrido por imagen: %.2fs, Tiempo total transcurrido para la tarea: %.2fs",
+            images,
+            avg_variants,
+            avg_time,
+            total_time,
+        )
 
     # Variant generation -------------------------------------------------
     def _process_file(self, path: Path) -> None:
         self.logger.info("Generating variants for %s", path.name)
+        process_start = time.perf_counter()
         try:
             with Image.open(path) as img:
                 rgba = img.convert("RGBA")
@@ -269,15 +408,26 @@ class RecolorPipeline:
             return
 
         variants = list(self._generate_variants(path.stem, rgba))
+        persisted = 0
         for variant in variants[: self.max_variants]:
             self._persist_variant(path.stem, variant)
+            persisted += 1
+        elapsed = time.perf_counter() - process_start
+        with self._stats_lock:
+            self._images_processed += 1
+            self._variants_generated += persisted
+            self._total_image_time += elapsed
 
     def _generate_variants(self, stem: str, image: Image.Image) -> Iterator[Variant]:
         palette = self._extract_palette(image)
         variant_index = 0
         for rotation in self.rotation_angles:
+            if variant_index >= self.max_variants:
+                return
             rotated = image.rotate(rotation, resample=Image.NEAREST, expand=False)
             for tint in palette:
+                if variant_index >= self.max_variants:
+                    return
                 variant_image = self._apply_tint(rotated, tint)
                 adapted = self._adapt_background(variant_image)
                 name = f"{stem}_r{rotation:03d}_{variant_index:04d}"
@@ -291,31 +441,138 @@ class RecolorPipeline:
             return random_palette(self.rng.randint(0, 1000000))
         colors_sorted = sorted(colors, key=lambda item: item[0], reverse=True)
         dominant: List[Tuple[int, int, int]] = []
-        for _, color in colors_sorted:
+        for count, color in colors_sorted:
+            if count < self.min_color_pixels:
+                continue
             rgb = color[:3]
-            if all(color_distance(rgb, existing) > 12 for existing in dominant):
+            if all(color_distance(rgb, existing) >= self.min_color_difference for existing in dominant):
                 dominant.append(rgb)
-            if len(dominant) >= 8:
+            if len(dominant) >= self.max_dominant_colors:
                 break
-        if len(dominant) < 4:
-            dominant.extend(random_palette(self.rng.randint(0, 1000000), size=4 - len(dominant)))
-        variants: List[Tuple[int, int, int]] = []
+        if not dominant:
+            for _, color in colors_sorted:
+                rgb = color[:3]
+                if all(color_distance(rgb, existing) >= self.min_color_difference for existing in dominant):
+                    dominant.append(rgb)
+                if len(dominant) >= self.max_dominant_colors:
+                    break
+        if not dominant:
+            dominant.extend(random_palette(self.rng.randint(0, 1000000), size=4))
+
+        palette: List[Tuple[int, int, int]] = []
         for base in dominant:
-            mixed = mix_colors(base, add_color_noise(base, 0.2), 0.5)
-            variants.append(mixed)
-            variants.extend(generate_high_variation_colors(base, 2, 0.7))
-        return variants
+            variations = self._generate_color_variations(base)
+            for variant in variations:
+                if all(color_distance(variant, existing) >= self.min_color_difference for existing in palette):
+                    palette.append(variant)
+                if len(palette) >= self.max_variants:
+                    break
+            if len(palette) >= self.max_variants:
+                break
+            if self.random_color_probability > 0 and self.rng.random() < self.random_color_probability:
+                random_color = random_palette(self.rng.randint(0, 1000000), size=1)[0]
+                if all(color_distance(random_color, existing) >= self.min_color_difference for existing in palette):
+                    palette.append(random_color)
+            if len(palette) >= self.max_variants:
+                break
+
+        if self.cross_color_mixing and len(dominant) >= 2 and len(palette) < self.max_variants:
+            mixes = 0
+            limit = max(0, self.max_color_mixes)
+            for idx, color_a in enumerate(dominant):
+                for color_b in dominant[idx + 1 :]:
+                    if limit and mixes >= limit:
+                        break
+                    ratio = self.rng.uniform(0.25, 0.75)
+                    mixed = mix_colors(color_a, color_b, ratio)
+                    if self.noise_intensity > 0:
+                        mixed = add_color_noise(mixed, self.noise_intensity)
+                    if all(color_distance(mixed, existing) >= self.min_color_difference for existing in palette):
+                        palette.append(mixed)
+                        mixes += 1
+                    if len(palette) >= self.max_variants:
+                        break
+                if limit and mixes >= limit:
+                    break
+                if len(palette) >= self.max_variants:
+                    break
+
+        if self.ensure_min_variations and len(palette) < self.min_variations_per_color:
+            needed = self.min_variations_per_color - len(palette)
+            fallback_colors = random_palette(self.rng.randint(0, 1000000), size=needed * 2)
+            for color in fallback_colors:
+                if all(color_distance(color, existing) >= self.min_color_difference for existing in palette):
+                    palette.append(color)
+                if len(palette) >= self.min_variations_per_color:
+                    break
+
+        if not palette:
+            palette = random_palette(self.rng.randint(0, 1000000))
+
+        max_per_rotation = max(1, self.max_variants // max(1, len(self.rotation_angles)))
+        return palette[: max_per_rotation]
+
+    def _generate_color_variations(self, base: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
+        base_h, base_s, base_l = rgb_to_hsl(base)
+        variations: List[Tuple[int, int, int]] = []
+        np_rng = np.random.default_rng(self.rng.randint(0, 2**32 - 1))
+        target_count = np_rng.integers(self.min_variations_per_color, self.max_variations_per_color + 1)
+        attempts = 0
+        max_attempts = max(self.max_generation_attempts, target_count * 2)
+        while len(variations) < target_count and attempts < max_attempts:
+            attempts += 1
+            hue_shift = np_rng.uniform(self.hue_variation_range[0], self.hue_variation_range[1])
+            sat_shift = np_rng.uniform(self.saturation_variation_range[0], self.saturation_variation_range[1])
+            light_shift = np_rng.uniform(self.lightness_variation_range[0], self.lightness_variation_range[1])
+            intensity = np_rng.uniform(self.intensity_variation_range[0], self.intensity_variation_range[1])
+            new_h = (base_h + hue_shift) % 1.0
+            new_s = np.clip(base_s + sat_shift, 0.0, 1.0)
+            target_l = np.clip(base_l * intensity + light_shift, 0.0, 1.0)
+            if self.preserve_brightness:
+                new_l = np.clip(0.5 * base_l + 0.5 * target_l, 0.0, 1.0)
+            else:
+                new_l = target_l
+            candidate = hsl_to_rgb((new_h, new_s, new_l))
+            if all(color_distance(candidate, existing) >= self.min_color_difference for existing in variations):
+                variations.append(candidate)
+        if not variations:
+            variations.append(base)
+        return variations
 
     def _apply_tint(self, image: Image.Image, tint: Tuple[int, int, int]) -> Image.Image:
         rgba = image.convert("RGBA")
-        arr = np.asarray(rgba, dtype=np.float32)
-        alpha = arr[..., 3:4] / 255.0
-        tinted_color = add_color_noise(tint, 0.12)
-        tint_arr = np.array(tinted_color, dtype=np.float32)
-        arr[..., :3] = arr[..., :3] * (1 - 0.35) + tint_arr * 0.35
-        arr[..., :3] = np.clip(arr[..., :3], 0, 255)
-        arr[..., 3:4] = alpha * 255.0
-        tinted = Image.fromarray(arr.astype(np.uint8), mode="RGBA")
+        arr = np.asarray(rgba, dtype=np.float32) / 255.0
+        alpha = arr[..., 3:4]
+        rgb = arr[..., :3]
+        if rgb.size == 0:
+            return image
+
+        np_rng = np.random.default_rng(self.rng.randint(0, 2**32 - 1))
+        h, s, l = _rgb_to_hls_array(rgb)
+
+        base_h, base_s, base_l = rgb_to_hsl(tint)
+        hue_noise = np_rng.uniform(self.hue_variation_range[0], self.hue_variation_range[1], h.shape)
+        sat_noise = np_rng.uniform(self.saturation_variation_range[0], self.saturation_variation_range[1], s.shape)
+        light_noise = np_rng.uniform(self.lightness_variation_range[0], self.lightness_variation_range[1], l.shape)
+        intensity = np_rng.uniform(self.intensity_variation_range[0], self.intensity_variation_range[1], l.shape)
+
+        base_h_array = np.full_like(h, base_h)
+        base_s_array = np.full_like(s, base_s)
+        base_l_array = np.full_like(l, base_l)
+
+        new_h = np.mod(base_h_array + hue_noise, 1.0)
+        new_s = np.clip(base_s_array + sat_noise, 0.0, 1.0)
+        target_l = np.clip(base_l_array * intensity + light_noise, 0.0, 1.0)
+        if self.preserve_brightness:
+            new_l = np.clip(0.5 * l + 0.5 * target_l, 0.0, 1.0)
+        else:
+            new_l = target_l
+
+        varied_rgb = _hls_to_rgb_array(new_h, new_s, new_l)
+        foreground = alpha > 1e-6
+        combined_rgb = np.where(foreground, varied_rgb, rgb)
+        combined = np.dstack((combined_rgb, alpha))
+        tinted = Image.fromarray(np.clip(combined * 255.0, 0.0, 255.0).astype(np.uint8), mode="RGBA")
         with contextual_randomizer.pixel_variation_callback(self._apply_pixel_variation):
             tinted = contextual_randomizer.integrate_contextual_variation(tinted, self.rng)
         brightness = self.rng.uniform(0.8, 1.2)
