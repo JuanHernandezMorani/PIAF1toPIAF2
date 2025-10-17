@@ -26,6 +26,16 @@ from ..core.utils_io import SafeFileManager, ensure_dir
 from ..core.utils_parallel import limited_threads, run_parallel
 from . import contextual_randomizer
 
+try:
+    from pixel_pipeline.modules.perceptual_vision import (
+        apply_human_vision_simulation,
+        validate_photopic_parameters,
+    )
+
+    PERCEPTUAL_VISION_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    PERCEPTUAL_VISION_AVAILABLE = False
+
 LOGGER = logging.getLogger("pixel_pipeline.recolor")
 
 GeneratorFn = Callable[[Image.Image], Image.Image]
@@ -429,6 +439,19 @@ class RecolorPipeline:
                 if variant_index >= self.max_variants:
                     return
                 variant_image = self._apply_tint(rotated, tint)
+                if PERCEPTUAL_VISION_AVAILABLE and self.config.get("enable_perceptual_simulation", True):
+                    lighting_condition = str(self.config.get("lighting_condition", "photopic"))
+                    adaptation_level = float(self.config.get("adaptation_level", 1.0))
+                    luminance = self.config.get("luminance_cd_m2")
+                    variant_image = apply_human_vision_simulation(
+                        variant_image,
+                        lighting_condition=lighting_condition,
+                        adaptation_level=adaptation_level,
+                        luminance_cd_m2=float(luminance) if luminance is not None else None,
+                    )
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        metrics = validate_photopic_parameters(variant_image)
+                        self.logger.debug("Perceptual metrics for %s: %s", tint, metrics)
                 adapted = self._adapt_background(variant_image)
                 name = f"{stem}_r{rotation:03d}_{variant_index:04d}"
                 variant_index += 1
