@@ -265,6 +265,14 @@ def _rgb_to_hls_array(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarr
     h = np.mod(h / 6.0, 1.0)
     return h, s, l
 
+def safe_rotate(img: Image.Image, angle: int) -> Image.Image:
+    w, h = img.size
+    if w != h:
+        size = max(w, h)
+        square = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        square.paste(img, ((size - w) // 2, (size - h) // 2))
+        img = square
+    return img.rotate(angle, expand=True)
 
 def _hls_to_rgb_array(h: np.ndarray, s: np.ndarray, l: np.ndarray) -> np.ndarray:
     """Vectorized HLS→RGB conversion for arrays in range [0, 1]."""
@@ -437,7 +445,7 @@ class RecolorPipeline:
         for rotation in self.rotation_angles:
             if variant_index >= self.max_variants:
                 return
-            rotated = image.rotate(rotation, resample=Image.NEAREST, expand=False)
+            rotated = safe_rotate(image, rotation)
             for tint in palette:
                 if variant_index >= self.max_variants:
                     return
