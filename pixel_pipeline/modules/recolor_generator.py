@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Tuple
 
 import numpy as np
-from PIL import Image, ImageChops, ImageEnhance, ImageOps
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
 
 from ..core import config
 from ..core.utils_color import (
@@ -310,6 +310,72 @@ def _hls_to_rgb_array(h: np.ndarray, s: np.ndarray, l: np.ndarray) -> np.ndarray
     return np.stack((r, g, b), axis=2)
 
 
+_SOBEL_X = np.array([[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]], dtype=np.float32)
+_SOBEL_Y = np.array([[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]], dtype=np.float32)
+_UNIFORM_KERNEL_5 = np.full((5, 5), 1.0 / 25.0, dtype=np.float32)
+
+
+def _convolve2d(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Lightweight 2D convolution with reflective padding."""
+
+    pad_y, pad_x = kernel.shape[0] // 2, kernel.shape[1] // 2
+    padded = np.pad(image, ((pad_y, pad_y), (pad_x, pad_x)), mode="reflect")
+    output = np.zeros_like(image, dtype=np.float32)
+    for y in range(kernel.shape[0]):
+        for x in range(kernel.shape[1]):
+            output += kernel[y, x] * padded[y : y + image.shape[0], x : x + image.shape[1]]
+    return output
+
+
+def _compute_perceptual_silhouette(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """Estimate a perceptual silhouette mask from luminance and texture cues."""
+
+    if rgb.size == 0:
+        return alpha
+
+    gray = np.dot(rgb, np.array([0.299, 0.587, 0.114], dtype=np.float32))
+    gray = gray.astype(np.float32)
+    _, saturation, _ = _rgb_to_hls_array(rgb)
+
+    grad_x = _convolve2d(gray, _SOBEL_X)
+    grad_y = _convolve2d(gray, _SOBEL_Y)
+    gradient = np.sqrt(grad_x**2 + grad_y**2)
+    gradient /= gradient.max() + 1e-6
+
+    mean = _convolve2d(gray, _UNIFORM_KERNEL_5)
+    mean_sq = _convolve2d(gray * gray, _UNIFORM_KERNEL_5)
+    variance = np.clip(mean_sq - mean * mean, 0.0, None)
+    if variance.max() > 1e-6:
+        variance /= variance.max()
+
+    response = 0.6 * gradient + 0.25 * variance + 0.15 * saturation
+    response = np.clip(response, 0.0, 1.0)
+    if response.max() > 1e-6:
+        response /= response.max()
+
+    threshold = max(float(np.percentile(response, 60.0)), 0.15)
+    binary = (response >= threshold).astype(np.float32)
+
+    mask_image = Image.fromarray(np.clip(binary * 255.0, 0, 255).astype(np.uint8), mode="L")
+    mask_image = mask_image.filter(ImageFilter.MaxFilter(size=3))
+    mask_image = mask_image.filter(ImageFilter.MinFilter(size=3))
+    mask_image = mask_image.filter(ImageFilter.GaussianBlur(radius=1.5))
+    perceptual_mask = np.asarray(mask_image, dtype=np.float32) / 255.0
+    perceptual_mask = np.clip(perceptual_mask, 0.0, 1.0)
+
+    alpha_base = np.clip(alpha[..., 0], 0.0, 1.0)
+    has_transparency = float(np.mean(alpha_base < 0.98)) > 0.02
+    if has_transparency:
+        combined = np.maximum(alpha_base, perceptual_mask)
+    else:
+        combined = np.maximum(perceptual_mask, alpha_base)
+
+    if combined.max() < 1e-6:
+        combined = np.clip(alpha_base, 0.0, 1.0)
+
+    return combined[..., None]
+
+
 class RecolorPipeline:
     """Generate recolored variants and derived maps for input sprites."""
 
@@ -603,9 +669,10 @@ class RecolorPipeline:
             new_l = target_l
 
         varied_rgb = _hls_to_rgb_array(new_h, new_s, new_l)
-        foreground = alpha > 1e-6
-        combined_rgb = np.where(foreground, varied_rgb, rgb)
-        combined = np.dstack((combined_rgb, alpha))
+        silhouette = _compute_perceptual_silhouette(rgb, alpha)
+        combined_rgb = rgb * (1.0 - silhouette) + varied_rgb * silhouette
+        combined_alpha = np.clip(np.maximum(alpha, silhouette), 0.0, 1.0)
+        combined = np.dstack((combined_rgb, combined_alpha))
         tinted = Image.fromarray(np.clip(combined * 255.0, 0.0, 255.0).astype(np.uint8), mode="RGBA")
         tinted = contextual_randomizer.apply_global_recolor(tinted, self.rng)
         tinted = contextual_randomizer.integrate_contextual_variation(tinted, self.rng)
