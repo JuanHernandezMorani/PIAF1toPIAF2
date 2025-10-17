@@ -337,9 +337,12 @@ class RecolorPipeline:
         hue_noise = rng.uniform(-0.04, 0.04, (height, width)).astype(np.float32)
         sat_noise = rng.normal(0.0, 0.06, (height, width)).astype(np.float32)
         val_noise = rng.normal(0.0, 0.06, (height, width)).astype(np.float32)
+        h, s, v = _rgb_to_hsv_array(rgb)
         zone_noise = _generate_zone_noise(rng, height, width, scale=0.08)
 
-        h, s, v = _rgb_to_hsv_array(rgb)
+        # Simulate human perception (non-linear luminance)
+        gamma = 2.2
+        v = np.power(v, 1.0 / gamma)
         h = np.mod(h + hue_noise, 1.0)
         s = np.clip(s + sat_noise + zone_noise * 0.5, 0.0, 1.0)
         v = np.clip(v + val_noise + zone_noise * 0.5, 0.0, 1.0)
