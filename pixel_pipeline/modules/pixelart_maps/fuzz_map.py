@@ -1,8 +1,18 @@
+"""Fuzz map generation tuned for perceptual continuity under extreme lighting."""
+
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps
+from scipy.ndimage import gaussian_filter
 
 def generate(image: Image.Image, intensity: float = 1.0) -> Image.Image:
-    """Generate an enhanced fuzz map emphasizing micro edges and soft translucency."""
+    """Generate a micro-edge fuzz map with adaptive noise for dark sprites.
+
+    The procedure modulates uniform noise by the average brightness of the
+    detected edge field so that extremely dark sprites (e.g., all-black inputs)
+    do not accumulate bright speckles that break temporal coherence. A light
+    Gaussian filter ensures spatial continuity before simulating secondary
+    scattering.
+    """
     rgba = image.convert("RGBA")
     alpha = np.asarray(rgba.getchannel("A"), dtype=np.float32) / 255.0
 
@@ -13,12 +23,13 @@ def generate(image: Image.Image, intensity: float = 1.0) -> Image.Image:
     edges = np.sqrt(sobel_x**2 + sobel_y**2)
     edges = np.clip(edges, 0.0, 1.0)
 
-    # Ruido multiescala fractal
-    rng = np.random.default_rng()
-    base = rng.normal(0.0, 0.1, edges.shape)
-    detail = rng.normal(0.0, 0.05, edges.shape)
-    noise = base + detail
-    fuzz = np.clip(edges + noise * intensity, 0.0, 1.0)
+    # Ruido adaptativo a la luminancia media
+    brightness = float(np.mean(edges))
+    noise = np.random.default_rng().uniform(-0.1, 0.1, edges.shape)
+    fuzz = np.clip(edges + noise * (0.5 + brightness) * intensity, 0.0, 1.0)
+
+    # Suavizado espacial leve para reforzar coherencia local
+    fuzz = gaussian_filter(fuzz, sigma=0.6)
 
     # Simular scattering (alas, pelaje, etc.)
     blur = Image.fromarray((fuzz * 255).astype(np.uint8), "L").filter(ImageFilter.GaussianBlur(2))
