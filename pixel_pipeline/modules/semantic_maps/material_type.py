@@ -1,4 +1,4 @@
-"""Semantic material classification based on dominant color."""
+"""Semantic material classification based on dominant color and texture cues."""
 from __future__ import annotations
 
 import numpy as np
@@ -35,14 +35,41 @@ def classify_color(rgb: tuple[float, float, float]) -> str:
     return "stone"
 
 
+def detect_texture_context(rgb_array: np.ndarray) -> str:
+    """Infer the most plausible neutral material class via grayscale texture statistics."""
+
+    if rgb_array.size == 0:
+        return "stone"
+
+    gray = np.mean(rgb_array, axis=-1)
+    texture_var = float(np.var(gray))
+    histogram, _ = np.histogram(gray, bins=32, range=(0, 255), density=True)
+    entropy = float(-np.sum(histogram * np.log2(histogram + 1e-9)))
+
+    if entropy > 3.5 and texture_var < 1000:
+        return "organic"  # piel, madera, vegetación
+    if entropy < 2.0:
+        return "metal"  # superficies uniformes reflectantes
+    return "stone"
+
+
 def generate(image: Image.Image) -> Image.Image:
-    """Generate a semantic material map for *image*."""
+    """Generate a semantic material map enriched with neutral-tone texture inference."""
 
     rgba = image.convert("RGBA")
     rgb_array = np.asarray(rgba.convert("RGB"), dtype=np.float32)
     alpha = np.asarray(rgba.split()[-1], dtype=np.uint8)
-    mean_color = rgb_array[alpha > 0].mean(axis=0) if np.any(alpha > 0) else (0, 0, 0)
-    material = classify_color(tuple(mean_color))
+    valid_mask = alpha > 0
+    if np.any(valid_mask):
+        valid_rgb = rgb_array[valid_mask]
+    else:
+        valid_rgb = rgb_array.reshape(-1, 3)
+
+    mean_color = valid_rgb.mean(axis=0) if valid_rgb.size else np.array((0.0, 0.0, 0.0))
+    if np.allclose(mean_color, (128, 128, 128), atol=15):
+        material = detect_texture_context(valid_rgb)
+    else:
+        material = classify_color(tuple(mean_color))
     color = _MATERIAL_COLORS[material]
     semantic = np.zeros((*alpha.shape, 4), dtype=np.uint8)
     semantic[..., 0] = color[0]

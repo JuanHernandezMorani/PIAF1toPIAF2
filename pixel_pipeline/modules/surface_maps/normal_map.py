@@ -1,32 +1,36 @@
-"""Generate tangent-space normal maps from pixel art sprites (Sobel + normalization)."""
+"""Generate tangent-space normal maps with perceptually smooth gradients."""
 from __future__ import annotations
+
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 
-def _sobel_edges(gray: Image.Image) -> tuple[np.ndarray, np.ndarray]:
-    gx_kernel = ImageFilter.Kernel(
-        size=(3, 3),
-        kernel=(-1, 0, 1, -2, 0, 2, -1, 0, 1),
-        scale=1,
-    )
-    gy_kernel = ImageFilter.Kernel(
-        size=(3, 3),
-        kernel=(-1, -2, -1, 0, 0, 0, 1, 2, 1),
-        scale=1,
-    )
-    grad_x = gray.filter(gx_kernel)
-    grad_y = gray.filter(gy_kernel)
-    return np.asarray(grad_x, dtype=np.float32), np.asarray(grad_y, dtype=np.float32)
-
+try:  # OpenCV offers an efficient bilateral filter when available
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None
 
 def generate(image: Image.Image, strength: float = 2.0) -> Image.Image:
-    """Create a physically plausible normal map (tangent space, bluish) from *image* using Sobel gradients."""
+    """Create a tangent-space normal map with bilateral pre-filtering.
+
+    The pipeline smooths the luminance field using a bilateral (or Gaussian)
+    filter before estimating gradients. This step suppresses salt-and-pepper
+    noise and yields normals that behave coherently under shading, especially
+    for sprites with hard alpha edges or low-light palettes.
+    """
     rgba = image.convert("RGBA")
     gray = rgba.convert("L")
 
-    gx, gy = _sobel_edges(gray)
-    gx /= 255.0
-    gy /= 255.0
+    img_gray = np.asarray(gray, dtype=np.float32)
+    if cv2 is not None:
+        smooth = cv2.bilateralFilter(img_gray, d=5, sigmaColor=30, sigmaSpace=15)
+    else:  # pragma: no cover - SciPy fallback for environments without OpenCV
+        from scipy.ndimage import gaussian_filter
+
+        smooth = gaussian_filter(img_gray, sigma=1.0)
+
+    grad_y, grad_x = np.gradient(smooth)
+    gx = grad_x.astype(np.float32) / 255.0
+    gy = grad_y.astype(np.float32) / 255.0
 
     # compute tangent-space normal
     nx = -gx * strength
