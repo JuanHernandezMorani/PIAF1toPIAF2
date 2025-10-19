@@ -25,6 +25,7 @@ from ..core.utils_color import (
 from ..core.utils_io import SafeFileManager, ensure_dir
 from ..core.utils_parallel import limited_threads, run_parallel
 from . import contextual_randomizer
+from .pbr import generate_physically_accurate_pbr_maps, generate_quality_report
 
 try:
     from pixel_pipeline.modules.perceptual_vision import (
@@ -745,17 +746,18 @@ class RecolorPipeline:
             self.file_manager.atomic_save(map_image, map_path)
 
     def _generate_maps(self, base_image: Image.Image, background: Image.Image) -> Dict[str, Image.Image]:
-        results: Dict[str, Image.Image] = {}
+        baseline: Dict[str, Image.Image] = {}
         for category, generators in self.map_generators.items():
             for map_name, generator in generators.items():
                 try:
-                    generated = generator(base_image)
+                    baseline[map_name] = generator(base_image)
                 except Exception as exc:  # pragma: no cover - logging path
                     self.logger.exception("Failed to generate %s map: %s", map_name, exc)
-                    continue
-                composite = Image.alpha_composite(background, generated) if background else generated
-                results[map_name] = composite
-        return results
+        pbr_result = generate_physically_accurate_pbr_maps(base_image, background, baseline)
+        final_maps: Dict[str, Image.Image] = pbr_result["maps"]
+        quality = generate_quality_report(final_maps, pbr_result.get("analysis"))
+        self.logger.debug("PBR quality report: %s", quality)
+        return final_maps
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke test
