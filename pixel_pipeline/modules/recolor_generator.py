@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
@@ -26,6 +26,7 @@ from ..core.utils_io import SafeFileManager, ensure_dir
 from ..core.utils_parallel import limited_threads, run_parallel
 from . import contextual_randomizer
 from .pbr import generate_physically_accurate_pbr_maps, generate_quality_report
+from .pbr.layered import LAYERED_PBR_CONFIG, LayeredPBRCache, PBRLayerManager
 
 try:
     from pixel_pipeline.modules.perceptual_vision import (
@@ -70,6 +71,12 @@ class Variant:
     name: str
     image: Image.Image
     background: Image.Image
+    foreground_base: Optional[Image.Image] = None
+    background_base: Optional[Image.Image] = None
+    foreground_variant: Optional[Image.Image] = None
+    background_variant: Optional[Image.Image] = None
+    color_variant: Optional[Tuple[int, int, int]] = None
+    rotation: float = 0.0
 
 
 class BackgroundLibrary:
@@ -419,6 +426,26 @@ class RecolorPipeline:
         self.noise_intensity = float(color_cfg["NOISE_INTENSITY"])
         self.ensure_min_variations = bool(color_cfg["ENSURE_MIN_VARIATIONS"])
         self.max_generation_attempts = int(color_cfg["MAX_GENERATION_ATTEMPTS"])
+        layered_cfg_input = cfg.get("LAYERED_PBR")
+        base_layered_cfg = dict(LAYERED_PBR_CONFIG)
+        base_layered_cfg["composition_methods"] = dict(LAYERED_PBR_CONFIG.get("composition_methods", {}))
+        if isinstance(layered_cfg_input, Mapping):
+            for key, value in layered_cfg_input.items():
+                if key == "composition_methods" and isinstance(value, Mapping):
+                    base_layered_cfg["composition_methods"].update(value)
+                else:
+                    base_layered_cfg[key] = value
+        self.layered_pbr_config = base_layered_cfg
+        self.layered_pbr_enabled = bool(self.layered_pbr_config.get("generate_separate_pbr", False))
+        self.layered_cache = (
+            LayeredPBRCache()
+            if self.layered_pbr_enabled and self.layered_pbr_config.get("cache_layers_separately", True)
+            else None
+        )
+        self.pbr_layer_manager: PBRLayerManager | None = None
+        if self.layered_pbr_enabled:
+            self.pbr_layer_manager = PBRLayerManager(self.layered_pbr_config, cache=self.layered_cache)
+        self.background_tint_strength = float(self.layered_pbr_config.get("background_tint_strength", 0.0))
         self._stats_lock = threading.Lock()
         self._images_processed = 0
         self._variants_generated = 0
@@ -509,31 +536,66 @@ class RecolorPipeline:
     def _generate_variants(self, stem: str, image: Image.Image) -> Iterator[Variant]:
         palette = self._extract_palette(image)
         variant_index = 0
+        base_foreground_template = image.convert("RGBA") if self.layered_pbr_enabled else None
         for rotation in self.rotation_angles:
             if variant_index >= self.max_variants:
                 return
-            rotated = safe_rotate(image, rotation)
+            rotated: Optional[Image.Image] = None
             for tint in palette:
                 if variant_index >= self.max_variants:
                     return
-                variant_image = self._apply_tint(rotated, tint)
-                if PERCEPTUAL_VISION_AVAILABLE and self.config.get("enable_perceptual_simulation", True):
-                    lighting_condition = str(self.config.get("lighting_condition", "photopic"))
-                    adaptation_level = float(self.config.get("adaptation_level", 1.0))
-                    luminance = self.config.get("luminance_cd_m2")
-                    variant_image = apply_human_vision_simulation(
-                        variant_image,
-                        lighting_condition=lighting_condition,
-                        adaptation_level=adaptation_level,
-                        luminance_cd_m2=float(luminance) if luminance is not None else None,
+                if self.layered_pbr_enabled:
+                    base_foreground = base_foreground_template.copy() if base_foreground_template else image.convert("RGBA")
+                    foreground_variant = self._apply_tint(base_foreground.copy(), tint)
+                    if PERCEPTUAL_VISION_AVAILABLE and self.config.get("enable_perceptual_simulation", True):
+                        lighting_condition = str(self.config.get("lighting_condition", "photopic"))
+                        adaptation_level = float(self.config.get("adaptation_level", 1.0))
+                        luminance = self.config.get("luminance_cd_m2")
+                        foreground_variant = apply_human_vision_simulation(
+                            foreground_variant,
+                            lighting_condition=lighting_condition,
+                            adaptation_level=adaptation_level,
+                            luminance_cd_m2=float(luminance) if luminance is not None else None,
+                        )
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            metrics = validate_photopic_parameters(foreground_variant)
+                            self.logger.debug("Perceptual metrics for %s: %s", tint, metrics)
+                    background_base = self._adapt_background(foreground_variant).convert("RGBA")
+                    background_variant = self._apply_background_color_variant(background_base.copy(), tint)
+                    name = f"{stem}_r{rotation:03d}_{variant_index:04d}"
+                    variant_index += 1
+                    yield Variant(
+                        name=name,
+                        image=foreground_variant,
+                        background=background_variant,
+                        foreground_base=base_foreground,
+                        background_base=background_base,
+                        foreground_variant=foreground_variant,
+                        background_variant=background_variant,
+                        color_variant=tint,
+                        rotation=float(rotation),
                     )
-                    if self.logger.isEnabledFor(logging.DEBUG):
-                        metrics = validate_photopic_parameters(variant_image)
-                        self.logger.debug("Perceptual metrics for %s: %s", tint, metrics)
-                adapted = self._adapt_background(variant_image)
-                name = f"{stem}_r{rotation:03d}_{variant_index:04d}"
-                variant_index += 1
-                yield Variant(name=name, image=variant_image, background=adapted)
+                else:
+                    if rotated is None:
+                        rotated = safe_rotate(image, rotation)
+                    variant_image = self._apply_tint(rotated, tint)
+                    if PERCEPTUAL_VISION_AVAILABLE and self.config.get("enable_perceptual_simulation", True):
+                        lighting_condition = str(self.config.get("lighting_condition", "photopic"))
+                        adaptation_level = float(self.config.get("adaptation_level", 1.0))
+                        luminance = self.config.get("luminance_cd_m2")
+                        variant_image = apply_human_vision_simulation(
+                            variant_image,
+                            lighting_condition=lighting_condition,
+                            adaptation_level=adaptation_level,
+                            luminance_cd_m2=float(luminance) if luminance is not None else None,
+                        )
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            metrics = validate_photopic_parameters(variant_image)
+                            self.logger.debug("Perceptual metrics for %s: %s", tint, metrics)
+                    adapted = self._adapt_background(variant_image)
+                    name = f"{stem}_r{rotation:03d}_{variant_index:04d}"
+                    variant_index += 1
+                    yield Variant(name=name, image=variant_image, background=adapted, rotation=float(rotation))
 
     def _extract_palette(self, image: Image.Image) -> List[Tuple[int, int, int]]:
         resized = image.convert("RGBA").resize((self.pixel_resolution, self.pixel_resolution), resample=Image.NEAREST)
@@ -683,6 +745,23 @@ class RecolorPipeline:
         tinted = ImageEnhance.Contrast(tinted).enhance(contrast)
         return tinted
 
+    def _apply_background_color_variant(
+        self, background: Image.Image, tint: Tuple[int, int, int]
+    ) -> Image.Image:
+        if not self.layered_pbr_enabled:
+            return background
+        strength = float(np.clip(self.background_tint_strength, 0.0, 1.0))
+        if strength <= 0.0:
+            return background
+        rgba = background.convert("RGBA")
+        arr = np.asarray(rgba, dtype=np.float32) / 255.0
+        alpha = arr[..., 3:4]
+        rgb = arr[..., :3]
+        tint_rgb = np.array(tint, dtype=np.float32) / 255.0
+        tinted_rgb = np.clip(rgb * (1.0 - strength) + tint_rgb * strength, 0.0, 1.0)
+        combined = np.concatenate((tinted_rgb, alpha), axis=2)
+        return Image.fromarray(np.clip(combined * 255.0, 0.0, 255.0).astype(np.uint8), mode="RGBA")
+
     def _apply_pixel_variation(self, image: Image.Image) -> Image.Image:
         """Apply pixel-wise hue, saturation, and luminance perturbations."""
 
@@ -736,6 +815,13 @@ class RecolorPipeline:
 
     # Persistence ---------------------------------------------------------
     def _persist_variant(self, stem: str, variant: Variant) -> None:
+        if (
+            self.layered_pbr_enabled
+            and variant.foreground_base is not None
+            and variant.background_base is not None
+        ):
+            self._persist_layered_variant(stem, variant)
+            return
         base_name = variant.name
         composited = Image.alpha_composite(variant.background, variant.image)
         target_path = self.output_path / f"{base_name}.png"
@@ -744,6 +830,36 @@ class RecolorPipeline:
         for map_name, map_image in maps.items():
             map_path = self.output_path / f"{base_name}_{map_name}.png"
             self.file_manager.atomic_save(map_image, map_path)
+
+    def _persist_layered_variant(self, stem: str, variant: Variant) -> None:
+        if self.pbr_layer_manager is None:
+            raise RuntimeError("Layered PBR manager is not configured")
+        base_name = variant.name
+        layered_maps = self._generate_maps_layered(
+            variant.foreground_base,  # type: ignore[arg-type]
+            variant.background_base,  # type: ignore[arg-type]
+            rotation=variant.rotation,
+        )
+        foreground_variant = variant.foreground_variant or variant.image
+        background_variant = variant.background_variant or variant.background
+        composited = Image.alpha_composite(background_variant, foreground_variant)
+        if variant.rotation and self.layered_pbr_config.get("rotation_after_composition", True):
+            composited = self._rotate_layer_image(composited, variant.rotation, Image.BILINEAR)
+            rotated_foreground = self._rotate_layer_image(foreground_variant, variant.rotation, Image.BILINEAR)
+            rotated_background = self._rotate_layer_image(background_variant, variant.rotation, Image.BILINEAR)
+        else:
+            rotated_foreground = foreground_variant
+            rotated_background = background_variant
+        target_path = self.output_path / f"{base_name}.png"
+        self.file_manager.atomic_save(composited, target_path)
+        for map_name, map_image in layered_maps.items():
+            map_path = self.output_path / f"{base_name}_{map_name}.png"
+            self.file_manager.atomic_save(map_image, map_path)
+        if self.layered_pbr_config.get("save_component_images", False):
+            fg_path = self.output_path / f"{base_name}_foreground.png"
+            bg_path = self.output_path / f"{base_name}_background.png"
+            self.file_manager.atomic_save(rotated_foreground, fg_path)
+            self.file_manager.atomic_save(rotated_background, bg_path)
 
     def _generate_maps(self, base_image: Image.Image, background: Image.Image) -> Dict[str, Image.Image]:
         baseline: Dict[str, Image.Image] = {}
@@ -758,6 +874,49 @@ class RecolorPipeline:
         quality = generate_quality_report(final_maps, pbr_result.get("analysis"))
         self.logger.debug("PBR quality report: %s", quality)
         return final_maps
+
+    def _generate_maps_layered(
+        self,
+        base_image: Image.Image,
+        background: Image.Image,
+        rotation: float = 0.0,
+    ) -> Dict[str, Image.Image]:
+        if self.pbr_layer_manager is None:
+            raise RuntimeError("Layered PBR manager is not configured")
+        maps = self.pbr_layer_manager.generate_layered_pbr_maps(base_image, background)
+        if rotation and self.layered_pbr_config.get("rotation_after_composition", True):
+            maps = self._rotate_pbr_maps_layered(maps, rotation)
+        return maps
+
+    def _rotate_pbr_maps_layered(
+        self, pbr_maps: Mapping[str, Image.Image], rotation: float
+    ) -> Dict[str, Image.Image]:
+        rotated: Dict[str, Image.Image] = {}
+        for map_name, map_image in pbr_maps.items():
+            resample = self._select_pbr_rotation_resample(map_name)
+            rotated_map = map_image.rotate(
+                rotation,
+                resample=resample,
+                expand=True,
+                fillcolor=(0, 0, 0, 0),
+            )
+            rotated[map_name] = rotated_map
+        return rotated
+
+    @staticmethod
+    def _select_pbr_rotation_resample(map_name: str) -> int:
+        map_name_lower = map_name.lower()
+        if map_name_lower in {"normal", "height", "curvature"}:
+            return Image.BICUBIC
+        if map_name_lower in {"metallic", "roughness", "specular"}:
+            return Image.NEAREST
+        if map_name_lower in {"albedo", "base_color"}:
+            return Image.BILINEAR
+        return Image.BILINEAR
+
+    @staticmethod
+    def _rotate_layer_image(image: Image.Image, rotation: float, resample: int) -> Image.Image:
+        return image.rotate(rotation, resample=resample, expand=True, fillcolor=(0, 0, 0, 0))
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke test
