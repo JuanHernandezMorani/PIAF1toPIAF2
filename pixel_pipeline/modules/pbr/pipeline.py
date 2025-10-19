@@ -1,8 +1,9 @@
 """Primary orchestration for the physically accurate PBR pipeline."""
 from __future__ import annotations
 
-from typing import Dict, Mapping, Tuple
+from typing import Callable, Dict, Mapping, Tuple
 
+import inspect
 import logging
 import numpy as np
 from PIL import Image
@@ -29,11 +30,149 @@ from .validation import auto_correct_failed_maps, log_corrections_applied, valid
 LOGGER = logging.getLogger("pixel_pipeline.pbr.pipeline")
 
 
+def _resolve_generator(
+    primary_import: Callable[[], Callable[[Image.Image, AnalysisResult], Image.Image] | None],
+    fallback_module_path: str | None = None,
+    fallback_attr: str = "generate",
+) -> Callable[[Image.Image, AnalysisResult], Image.Image] | None:
+    try:
+        generator = primary_import()
+        if generator is not None:
+            return generator
+    except ImportError:
+        generator = None
+
+    if fallback_module_path is None:
+        return generator
+
+    try:
+        module = __import__(fallback_module_path, fromlist=[fallback_attr])
+    except ImportError:
+        return generator
+
+    return getattr(module, fallback_attr, None)
+
+
+try:
+    from pixel_pipeline.modules.pixelart_maps.fuzz_map import generate_fuzz_enhanced as _fuzz_generator
+except ImportError:
+    _fuzz_generator = None
+
+if _fuzz_generator is None:
+    _fuzz_generator = _resolve_generator(
+        lambda: None,
+        "pixel_pipeline.modules.pixelart_maps.fuzz_map",
+        "generate",
+    )
+
+try:
+    from pixel_pipeline.modules.semantic_maps.material_type import (
+        generate_material_semantic as _material_generator,
+    )
+except ImportError:
+    _material_generator = None
+
+if _material_generator is None:
+    _material_generator = _resolve_generator(
+        lambda: None,
+        "pixel_pipeline.modules.semantic_maps.material_type",
+        "generate",
+    )
+
+
+def _import_porosity_generator() -> Callable[[Image.Image, AnalysisResult], Image.Image] | None:
+    try:
+        from pixel_pipeline.modules.surface_maps.porosity_map import (
+            generate_porosity_physically_accurate,
+        )
+
+        return generate_porosity_physically_accurate
+    except ImportError:
+        try:
+            from pixel_pipeline.modules.pixelart_maps.porosity_map import (
+                generate_porosity_physically_accurate,
+            )
+
+            return generate_porosity_physically_accurate
+        except ImportError:
+            return None
+
+
+_porosity_generator = _import_porosity_generator()
+
+if _porosity_generator is None:
+    _porosity_generator = _resolve_generator(
+        lambda: None,
+        "pixel_pipeline.modules.pixelart_maps.porosity_map",
+        "generate",
+    )
+
+
+generate_fuzz_enhanced = _fuzz_generator
+generate_material_semantic = _material_generator
+generate_porosity_physically_accurate = _porosity_generator
+
+
 def _fallback_map(base_img: Image.Image, name: str) -> Image.Image:
     size = base_img.size
     alpha = base_img.split()[-1] if "A" in base_img.getbands() else Image.new("L", size, 255)
     channel = Image.new("L", size, 0 if name in {"opacity", "transmission", "metallic"} else 128)
     return Image.merge("RGBA", (channel, channel, channel, alpha))
+
+
+def _call_generator(
+    generator: Callable[..., Image.Image],
+    base_img: Image.Image,
+    analysis: AnalysisResult,
+) -> Image.Image:
+    try:
+        signature = inspect.signature(generator)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is not None:
+        positional = [
+            parameter
+            for parameter in signature.parameters.values()
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        has_var_positional = any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+            for parameter in signature.parameters.values()
+        )
+        if has_var_positional or len(positional) >= 2:
+            return generator(base_img, analysis)
+        if len(positional) == 1:
+            return generator(base_img)
+
+    try:
+        return generator(base_img, analysis)
+    except TypeError:
+        return generator(base_img)
+
+
+def _generate_optional_map(
+    name: str,
+    generator: Callable[..., Image.Image] | None,
+    base_img: Image.Image,
+    analysis: AnalysisResult,
+) -> Image.Image:
+    if generator is None:
+        LOGGER.warning("Generator for %s map unavailable; using fallback", name)
+        return _fallback_map(base_img, name)
+    try:
+        result = _call_generator(generator, base_img, analysis)
+    except Exception as exc:  # pragma: no cover - defensive log branch
+        LOGGER.warning("Failed to generate %s map (%s); using fallback", name, exc)
+        return _fallback_map(base_img, name)
+    if not isinstance(result, Image.Image):  # pragma: no cover - safety
+        LOGGER.warning("Generator for %s returned non-image result; using fallback", name)
+        return _fallback_map(base_img, name)
+    return result
 
 
 def _ensure_current_maps(base_img: Image.Image, current_maps: Mapping[str, Image.Image]) -> Dict[str, Image.Image]:
@@ -91,6 +230,20 @@ def _update_final_maps(
     final_maps["ao"] = generate_ao_physically_accurate(analysis)
     final_maps["curvature"] = generate_curvature_enhanced(analysis)
     final_maps["emissive"] = generate_emissive_accurate(base_img, analysis)
+
+    final_maps["fuzz"] = _generate_optional_map("fuzz", generate_fuzz_enhanced, base_img, analysis)
+    final_maps["material"] = _generate_optional_map(
+        "material",
+        generate_material_semantic,
+        base_img,
+        analysis,
+    )
+    final_maps["porosity"] = _generate_optional_map(
+        "porosity",
+        generate_porosity_physically_accurate,
+        base_img,
+        analysis,
+    )
 
     return final_maps
 
