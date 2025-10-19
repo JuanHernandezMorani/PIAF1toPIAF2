@@ -7,6 +7,7 @@ import logging
 import numpy as np
 from PIL import Image
 
+from .alpha_utils import apply_alpha_to_maps, derive_alpha_map
 from .analysis import AnalysisResult, analyze_image_comprehensive, calculate_entropy
 from .generation import (
     generate_alpha_accurate,
@@ -94,6 +95,16 @@ def _update_final_maps(
     return final_maps
 
 
+def _enforce_rgba_alpha(
+    base_img: Image.Image,
+    maps: Mapping[str, Image.Image],
+    analysis: AnalysisResult,
+) -> tuple[Dict[str, Image.Image], np.ndarray]:
+    alpha_map = derive_alpha_map(base_img, maps, analysis)
+    updated_maps = apply_alpha_to_maps(maps, alpha_map)
+    return updated_maps, alpha_map
+
+
 def generate_physically_accurate_pbr_maps(
     base_img: Image.Image,
     bg_img: Image.Image | None,
@@ -102,6 +113,7 @@ def generate_physically_accurate_pbr_maps(
     prepared_maps = _ensure_current_maps(base_img, current_maps)
     analysis = analyze_image_comprehensive(base_img, bg_img, prepared_maps)
     final_maps = _update_final_maps(base_img, analysis, prepared_maps)
+    final_maps, alpha_map = _enforce_rgba_alpha(base_img, final_maps, analysis)
 
     validation_report = validate_all_maps(final_maps, analysis)
     corrections: Tuple[str, ...] = ()
@@ -109,6 +121,7 @@ def generate_physically_accurate_pbr_maps(
         final_maps, applied = auto_correct_failed_maps(final_maps, analysis, validation_report)
         corrections = tuple(applied)
         log_corrections_applied(corrections)
+        final_maps, alpha_map = _enforce_rgba_alpha(base_img, final_maps, analysis)
         validation_report = validate_all_maps(final_maps, analysis)
     final_validation = validate_all_maps(final_maps, analysis)
     if not final_validation.passes_all_critical():
@@ -120,6 +133,7 @@ def generate_physically_accurate_pbr_maps(
         "validation": final_validation,
         "corrections_applied": corrections,
         "quality_report": quality_report,
+        "alpha": alpha_map,
     }
 
 
