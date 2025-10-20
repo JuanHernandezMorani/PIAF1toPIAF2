@@ -45,6 +45,16 @@ class AnalysisResult:
     base_image: Image.Image
     background_image: Image.Image | None
 
+    @property
+    def material_class(self) -> str:
+        likelihoods = getattr(self.material_analysis, "likelihoods", {}) or {}
+        if not likelihoods:
+            return "unknown"
+        scores = {name: float(np.mean(field)) for name, field in likelihoods.items() if field is not None}
+        if not scores:
+            return "unknown"
+        return max(scores, key=scores.get)
+
 
 # ---------------------------------------------------------------------------
 # Utility helpers

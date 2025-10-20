@@ -9,6 +9,81 @@ from PIL import Image
 from .analysis import AnalysisResult
 
 
+def _alpha_bleed_rgba(image: Image.Image, iterations: int = 8, radius: int = 1) -> Image.Image:
+    rgba = image.convert("RGBA")
+    array = np.asarray(rgba, dtype=np.uint8).astype(np.float32)
+    rgb = array[..., :3]
+    alpha = array[..., 3]
+
+    if iterations <= 0 or radius <= 0:
+        return rgba
+
+    color_valid = alpha > 1
+    height, width = alpha.shape
+
+    for _ in range(iterations):
+        to_fill = (~color_valid) & (alpha <= 1)
+        if not np.any(to_fill):
+            break
+
+        accum = np.zeros_like(rgb, dtype=np.float32)
+        weight = np.zeros_like(alpha, dtype=np.float32)
+
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if dx == 0 and dy == 0:
+                    continue
+
+                src_y_start = max(0, -dy)
+                src_y_end = min(height, height - dy)
+                src_x_start = max(0, -dx)
+                src_x_end = min(width, width - dx)
+                dst_y_start = max(0, dy)
+                dst_y_end = min(height, height + dy)
+                dst_x_start = max(0, dx)
+                dst_x_end = min(width, width + dx)
+
+                if src_y_start >= src_y_end or src_x_start >= src_x_end:
+                    continue
+
+                src_slice = (slice(src_y_start, src_y_end), slice(src_x_start, src_x_end))
+                dst_slice = (slice(dst_y_start, dst_y_end), slice(dst_x_start, dst_x_end))
+
+                src_valid = color_valid[src_slice]
+                if not np.any(src_valid):
+                    continue
+
+                dst_fillable = to_fill[dst_slice]
+                mask = src_valid & dst_fillable
+                if not np.any(mask):
+                    continue
+
+                src_rgb = rgb[src_slice]
+                accum_dst = accum[dst_slice]
+
+                mask3 = mask[..., None]
+                accum_dst[mask3] += src_rgb[mask3]
+                weight_dst = weight[dst_slice]
+                weight_dst[mask] += 1.0
+
+        if not np.any(weight):
+            break
+
+        average = np.zeros_like(rgb, dtype=np.float32)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            average = np.divide(accum, weight[..., None], out=average, where=weight[..., None] > 0)
+
+        update_mask = (weight > 0) & to_fill
+        if not np.any(update_mask):
+            break
+
+        rgb = np.where(update_mask[..., None], average, rgb)
+        color_valid |= update_mask
+
+    combined = np.dstack((np.clip(rgb, 0.0, 255.0), alpha[..., None]))
+    return Image.fromarray(combined.astype(np.uint8), mode="RGBA")
+
+
 def _as_float_array(image: Image.Image | None) -> np.ndarray | None:
     if image is None:
         return None
@@ -113,7 +188,8 @@ def apply_alpha(image: Image.Image, alpha: np.ndarray) -> Image.Image:
 def apply_alpha_to_maps(maps: Mapping[str, Image.Image], alpha: np.ndarray) -> Dict[str, Image.Image]:
     updated: Dict[str, Image.Image] = {}
     for name, image in maps.items():
-        updated[name] = apply_alpha(image, alpha)
+        bleeded = _alpha_bleed_rgba(image)
+        updated[name] = apply_alpha(bleeded, alpha)
     return updated
 
 
