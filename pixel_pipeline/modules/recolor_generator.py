@@ -871,19 +871,35 @@ class RecolorPipeline:
 
     @staticmethod
     def _restore_background_alpha(alpha_map: np.ndarray, foreground: Image.Image) -> np.ndarray:
-        """Ensure the background retains its default opaque alpha."""
-
+        """
+        Restaura el alpha del background sin romper los bordes suaves del foreground.
+        Mantiene coherencia física entre mapas correlacionados.
+        """
         rgba_foreground = foreground.convert("RGBA")
         fg_alpha = np.asarray(rgba_foreground.split()[-1], dtype=np.float32) / 255.0
+    
+        # Asegurar mismo tamaño
         if alpha_map.shape != fg_alpha.shape:
             resized = Image.fromarray(
-                (np.clip(alpha_map, 0.0, 1.0) * 255).astype(np.uint8),
-                mode="L",
+                (np.clip(alpha_map, 0.0, 1.0) * 255).astype(np.uint8), mode="L"
             ).resize(rgba_foreground.size, Image.BILINEAR)
             alpha_map = np.asarray(resized, dtype=np.float32) / 255.0
-        restored = np.where(fg_alpha <= 1e-3, 1.0, np.clip(alpha_map, 0.0, 1.0))
+    
+        # Restaurar fondo solo donde NO hay foreground real
+        # En lugar de poner 1.0, mezclamos suavemente según el alpha base
+        restored = np.where(
+            fg_alpha < 0.05,
+            np.maximum(alpha_map, 0.95),  # fondo casi opaco
+            np.clip(alpha_map, 0.0, 1.0),  # foreground intacto
+        )
+    
+        # Suavizado para evitar bordes duros
+        from scipy.ndimage import gaussian_filter
+        restored = gaussian_filter(restored, sigma=0.8)
+        restored = np.clip(restored, 0.0, 1.0)
         return restored
-
+    
+    
     def _generate_maps(
         self,
         base_image: Image.Image,
@@ -898,18 +914,23 @@ class RecolorPipeline:
                     baseline[map_name] = generator(base_image)
                 except Exception as exc:  # pragma: no cover - logging path
                     self.logger.exception("Failed to generate %s map: %s", map_name, exc)
+
+        if isinstance(alpha_map, np.ndarray):
+            derived_alpha = alpha_map
+        else:
+            derived_alpha = derive_alpha_map(base_image, final_maps, analysis_obj)
+
+        if foreground_image is not None:
+            derived_alpha = self._restore_background_alpha(derived_alpha, foreground_image)
+            final_maps = apply_alpha_to_maps(final_maps, derived_alpha)
+
         pbr_result = generate_physically_accurate_pbr_maps(base_image, background, baseline)
         final_maps: Dict[str, Image.Image] = pbr_result["maps"]
         analysis = pbr_result.get("analysis")
         analysis_obj = analysis if hasattr(analysis, "mask") else None
         alpha_map = pbr_result.get("alpha")
-        if isinstance(alpha_map, np.ndarray):
-            derived_alpha = alpha_map
-        else:
-            derived_alpha = derive_alpha_map(base_image, final_maps, analysis_obj)
-        if foreground_image is not None:
-            derived_alpha = self._restore_background_alpha(derived_alpha, foreground_image)
-            final_maps = apply_alpha_to_maps(final_maps, derived_alpha)
+        
+        
         quality = pbr_result.get("quality_report")
         if quality is None:
             quality = generate_quality_report(final_maps, analysis_obj)
