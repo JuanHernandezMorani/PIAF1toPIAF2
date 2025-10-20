@@ -826,7 +826,11 @@ class RecolorPipeline:
         base_name = variant.name
         composited = Image.alpha_composite(variant.background, variant.image)
         target_path = self.output_path / f"{base_name}.png"
-        maps, alpha_map = self._generate_maps(composited, variant.background)
+        maps, alpha_map = self._generate_maps(
+            composited,
+            variant.background,
+            foreground_image=variant.image,
+        )
         composited = apply_alpha(composited, alpha_map)
         self.file_manager.atomic_save(composited, target_path)
         for map_name, map_image in maps.items():
@@ -837,13 +841,14 @@ class RecolorPipeline:
         if self.pbr_layer_manager is None:
             raise RuntimeError("Layered PBR manager is not configured")
         base_name = variant.name
+        foreground_variant = variant.foreground_variant or variant.image
+        background_variant = variant.background_variant or variant.background
         layered_maps, alpha_map = self._generate_maps_layered(
             variant.foreground_base,  # type: ignore[arg-type]
             variant.background_base,  # type: ignore[arg-type]
+            foreground_image=foreground_variant,
             rotation=variant.rotation,
         )
-        foreground_variant = variant.foreground_variant or variant.image
-        background_variant = variant.background_variant or variant.background
         composited = Image.alpha_composite(background_variant, foreground_variant)
         composited = apply_alpha(composited, alpha_map)
         if variant.rotation and self.layered_pbr_config.get("rotation_after_composition", True):
@@ -864,8 +869,27 @@ class RecolorPipeline:
             self.file_manager.atomic_save(rotated_foreground, fg_path)
             self.file_manager.atomic_save(rotated_background, bg_path)
 
+    @staticmethod
+    def _restore_background_alpha(alpha_map: np.ndarray, foreground: Image.Image) -> np.ndarray:
+        """Ensure the background retains its default opaque alpha."""
+
+        rgba_foreground = foreground.convert("RGBA")
+        fg_alpha = np.asarray(rgba_foreground.split()[-1], dtype=np.float32) / 255.0
+        if alpha_map.shape != fg_alpha.shape:
+            resized = Image.fromarray(
+                (np.clip(alpha_map, 0.0, 1.0) * 255).astype(np.uint8),
+                mode="L",
+            ).resize(rgba_foreground.size, Image.BILINEAR)
+            alpha_map = np.asarray(resized, dtype=np.float32) / 255.0
+        restored = np.where(fg_alpha <= 1e-3, 1.0, np.clip(alpha_map, 0.0, 1.0))
+        return restored
+
     def _generate_maps(
-        self, base_image: Image.Image, background: Image.Image
+        self,
+        base_image: Image.Image,
+        background: Image.Image,
+        *,
+        foreground_image: Image.Image | None = None,
     ) -> tuple[Dict[str, Image.Image], np.ndarray]:
         baseline: Dict[str, Image.Image] = {}
         for category, generators in self.map_generators.items():
@@ -883,6 +907,9 @@ class RecolorPipeline:
             derived_alpha = alpha_map
         else:
             derived_alpha = derive_alpha_map(base_image, final_maps, analysis_obj)
+        if foreground_image is not None:
+            derived_alpha = self._restore_background_alpha(derived_alpha, foreground_image)
+            final_maps = apply_alpha_to_maps(final_maps, derived_alpha)
         quality = pbr_result.get("quality_report")
         if quality is None:
             quality = generate_quality_report(final_maps, analysis_obj)
@@ -893,12 +920,15 @@ class RecolorPipeline:
         self,
         base_image: Image.Image,
         background: Image.Image,
+        *,
+        foreground_image: Image.Image,
         rotation: float = 0.0,
     ) -> tuple[Dict[str, Image.Image], np.ndarray]:
         if self.pbr_layer_manager is None:
             raise RuntimeError("Layered PBR manager is not configured")
         maps = self.pbr_layer_manager.generate_layered_pbr_maps(base_image, background)
         alpha_map = derive_alpha_map(base_image, maps, analysis=None)
+        alpha_map = self._restore_background_alpha(alpha_map, foreground_image)
         maps = apply_alpha_to_maps(maps, alpha_map)
         if rotation and self.layered_pbr_config.get("rotation_after_composition", True):
             maps = self._rotate_pbr_maps_layered(maps, rotation)
