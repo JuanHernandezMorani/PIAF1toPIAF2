@@ -115,9 +115,22 @@ generate_porosity_physically_accurate = _porosity_generator
 
 def _fallback_map(base_img: Image.Image, name: str) -> Image.Image:
     size = base_img.size
-    alpha = base_img.split()[-1] if "A" in base_img.getbands() else Image.new("L", size, 255)
-    channel = Image.new("L", size, 0 if name in {"opacity", "transmission", "metallic"} else 128)
-    return Image.merge("RGBA", (channel, channel, channel, alpha))
+    rgba = base_img.convert("RGBA")
+    rgba_np = np.asarray(rgba, dtype=np.uint8)
+    alpha = Image.fromarray(rgba_np[..., 3], mode="L")
+    opaque = rgba_np[..., 3] >= 200
+    if np.any(opaque):
+        matte = np.median(rgba_np[..., :3][opaque], axis=0)
+    else:
+        matte = np.median(rgba_np[..., :3].reshape(-1, 3), axis=0)
+    matte = np.clip(matte, 0, 255).astype(np.uint8)
+
+    base_value = 0 if name in {"opacity", "transmission", "metallic"} else 128
+    mix_factor = 0.2 + 0.8 * (base_value / 255.0)
+    fill_color = tuple(int(round(component * mix_factor)) for component in matte)
+
+    rgb_channel = Image.new("RGB", size, fill_color)
+    return Image.merge("RGBA", (*rgb_channel.split(), alpha))
 
 
 def _call_generator(
