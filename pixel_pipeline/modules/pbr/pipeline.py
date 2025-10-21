@@ -6,7 +6,7 @@ from typing import Callable, Dict, List, Mapping, Tuple
 import inspect
 import logging
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:  # pragma: no cover - optional dependency
     from skimage import exposure as _skimage_exposure
@@ -22,6 +22,11 @@ try:  # pragma: no cover - optional dependency
     from scipy import ndimage as _scipy_ndimage
 except ImportError:  # pragma: no cover - graceful fallback
     _scipy_ndimage = None
+
+try:  # pragma: no cover - optional dependency
+    import cv2 as _cv2
+except ImportError:  # pragma: no cover - graceful fallback
+    _cv2 = None
 
 from .alpha_utils import apply_alpha, apply_alpha_to_maps, derive_alpha_map
 from .analysis import AnalysisResult, analyze_image_comprehensive, calculate_entropy
@@ -46,6 +51,8 @@ from .validation import (
     log_corrections_applied,
     validate_all_maps,
     validate_pbr_coherence_corregido,
+    automated_quality_report_v5,
+    validate_pbr_coherence_v5,
 )
 
 LOGGER = logging.getLogger("pixel_pipeline.pbr.pipeline")
@@ -558,6 +565,319 @@ def _generate_metallic_map_corrected(
 
     rgb = Image.merge("RGB", (gray_image, gray_image, gray_image))
     return Image.merge("RGBA", (*rgb.split(), alpha))
+
+
+def _normalize_physical_map_v5(map_array: np.ndarray, preserve_contrast: bool = True) -> np.ndarray:
+    map_array = map_array.astype(np.float32, copy=False)
+    if preserve_contrast and np.std(map_array) > 0:
+        map_min = float(map_array.min())
+        map_range = float(map_array.max() - map_min + 1e-8)
+        normalized = np.log1p(map_array - map_min) / np.log1p(map_range)
+        linear = (map_array - map_min) / map_range
+        blend_factor = 0.3
+        map_final = normalized * (1.0 - blend_factor) + linear * blend_factor
+    else:
+        map_min = float(map_array.min())
+        map_final = (map_array - map_min) / (float(map_array.max() - map_min) + 1e-8)
+    return np.clip(map_final, 0.0, 1.0)
+
+
+def _apply_contrast_enhancement_v5(map_image: Image.Image) -> Image.Image:
+    if not isinstance(map_image, Image.Image):
+        return map_image
+
+    mode = map_image.mode
+    gray = map_image.convert("L")
+    gray_np = np.asarray(gray, dtype=np.uint8)
+
+    if _cv2 is not None:
+        clahe = _cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray_np)
+        enhanced_img = Image.fromarray(enhanced, mode="L")
+    else:  # pragma: no cover - fallback when OpenCV unavailable
+        enhanced_img = ImageOps.equalize(gray)
+
+    if mode == "L":
+        return enhanced_img
+
+    if "A" in map_image.getbands():
+        alpha = map_image.split()[-1]
+    else:
+        alpha = Image.new("L", map_image.size, 255)
+
+    if mode in {"LA", "RGBA"}:
+        rgb = enhanced_img
+        rgb = Image.merge("RGB", (rgb, rgb, rgb))
+        return Image.merge("RGBA", (*rgb.split(), alpha))
+
+    if mode == "RGB":
+        rgb = Image.merge("RGB", (enhanced_img, enhanced_img, enhanced_img))
+        return rgb
+
+    return map_image
+
+
+def _regenerate_roughness_with_variation_v5(map_image: Image.Image) -> Image.Image:
+    gray = np.asarray(map_image.convert("L"), dtype=np.float32) / 255.0
+    blurred = _apply_gaussian_filter(gray, sigma=1.1)
+    detail = np.abs(gray - blurred)
+    enhanced = _normalize_physical_map_v5(np.clip(gray + detail * 0.6, 0.0, 1.0))
+    enhanced_img = Image.fromarray((enhanced * 255.0).astype(np.uint8), mode="L")
+
+    if "A" in map_image.getbands():
+        alpha = map_image.split()[-1]
+    else:
+        alpha = Image.new("L", map_image.size, 255)
+
+    return Image.merge("RGBA", (enhanced_img, enhanced_img, enhanced_img, alpha))
+
+
+def _generate_emissive_map_v5(
+    base_image: Image.Image,
+    analysis: AnalysisResult | None,
+    material_class: str = "default",
+) -> Image.Image:
+    if _cv2 is None:
+        if analysis is not None:
+            return generate_emissive_accurate(base_image, analysis)
+        return base_image.convert("RGBA")
+
+    base = np.asarray(base_image.convert("RGB"), dtype=np.float32) / 255.0
+    hsv = _cv2.cvtColor(base, _cv2.COLOR_RGB2HSV)
+    luminance = base.mean(axis=2)
+
+    high_saturation = hsv[..., 1] > 0.6
+    high_value = hsv[..., 2] > 0.8
+    potential_emissive = np.logical_and(high_saturation, high_value)
+
+    emissive_base = np.power(luminance, 2.2)
+    emissive = emissive_base * potential_emissive.astype(np.float32)
+    emissive = _cv2.bilateralFilter(emissive.astype(np.float32), 5, 25, 25)
+
+    mean_lum = float(luminance.mean())
+    std_lum = float(luminance.std())
+
+    if std_lum > 0:
+        saturation_mask = emissive > (mean_lum + 2.5 * std_lum)
+        very_high_saturation = emissive > (mean_lum + 4.0 * std_lum)
+
+        if np.any(saturation_mask):
+            emissive[saturation_mask] = np.power(emissive[saturation_mask], 0.7)
+        if np.any(very_high_saturation):
+            emissive[very_high_saturation] = np.power(emissive[very_high_saturation], 0.5)
+
+    if any(mat in material_class.lower() for mat in ["stone", "rock", "wood", "organic", "dirt"]):
+        emissive *= 0.1
+
+    if emissive.max() > 0:
+        emissive = emissive / emissive.max()
+
+    emissive = np.clip(emissive, 0.0, 1.0)
+    gray = Image.fromarray((emissive * 255).astype(np.uint8), mode="L")
+
+    if analysis is not None and isinstance(getattr(analysis, "alpha", None), np.ndarray):
+        alpha_arr = np.clip(analysis.alpha.astype(np.float32), 0.0, 1.0)
+        alpha = Image.fromarray((alpha_arr * 255).astype(np.uint8), mode="L")
+    else:
+        alpha = Image.new("L", base_image.size, 255)
+
+    return Image.merge("RGBA", (gray, gray, gray, alpha))
+
+
+def _generate_metallic_map_v5(
+    base_image: Image.Image,
+    roughness_map: Image.Image | None,
+    analysis: AnalysisResult | None,
+    *,
+    material_class: str = "default",
+    candidate: Image.Image | None = None,
+) -> Image.Image:
+    if _cv2 is None:
+        if analysis is not None:
+            return _generate_metallic_map_corrected(
+                base_image, analysis, roughness_map, candidate
+            )
+        return candidate if candidate is not None else base_image.convert("RGBA")
+
+    base = np.asarray(base_image.convert("RGB"), dtype=np.float32) / 255.0
+    rough_array = None
+    if roughness_map is not None:
+        rough_array = np.asarray(roughness_map.convert("L"), dtype=np.float32) / 255.0
+
+    gray = base.mean(axis=2).astype(np.float32)
+    brightness = (
+        _cv2.GaussianBlur(gray, (3, 3), 0.8)
+        if _cv2 is not None
+        else _apply_gaussian_filter(gray, sigma=0.8)
+    )
+
+    if _cv2 is not None:
+        laplacian_var = _cv2.Laplacian(gray, _cv2.CV_32F)
+    else:  # pragma: no cover - fallback when OpenCV unavailable
+        laplacian_var = _apply_laplacian_filter(gray)
+
+    if _scipy_ndimage is not None:
+        local_std = _scipy_ndimage.generic_filter(gray, np.std, size=3)
+    else:
+        mean_local = _apply_gaussian_filter(gray, sigma=1.0)
+        mean_sq = _apply_gaussian_filter(gray ** 2, sigma=1.0)
+        variance = np.clip(mean_sq - mean_local ** 2, 0.0, None)
+        local_std = np.sqrt(variance)
+
+    color_std = np.std(base, axis=2)
+    color_uniformity = 1.0 - np.clip(color_std * 3.0, 0.0, 1.0)
+
+    rough_component = 0.3
+    if rough_array is None:
+        rough_array = np.ones_like(gray)
+        rough_component = 0.15
+
+    metallic_likelihood = (
+        brightness * 0.4
+        + (1.0 - rough_array) * rough_component
+        + color_uniformity * 0.2
+        + (1.0 - np.clip(local_std, 0.0, 1.0)) * 0.1
+    )
+
+    high_frequency_texture = np.clip(np.abs(laplacian_var) * 10.0, 0.0, 1.0)
+    metallic_likelihood *= 1.0 - high_frequency_texture * 0.5
+
+    material_exclusion = 1.0
+    organic_materials = ["organic", "plant", "leaf", "wood", "fabric", "skin", "leather"]
+    stone_materials = ["stone", "rock", "concrete", "brick", "ceramic"]
+
+    lowered = material_class.lower()
+    if any(mat in lowered for mat in organic_materials):
+        material_exclusion = 0.1
+    elif any(mat in lowered for mat in stone_materials):
+        material_exclusion = 0.3
+
+    metallic_likelihood *= material_exclusion
+
+    metallic_clean = metallic_likelihood
+    metallic_clean = np.clip(metallic_clean, 0.0, 1.0)
+    metallic_clean = (metallic_clean * 255).astype(np.uint8)
+    metallic_clean = (
+        _cv2.medianBlur(metallic_clean, 3)
+        if _cv2 is not None
+        else metallic_clean
+    )
+    metallic_clean = metallic_clean.astype(np.float32) / 255.0
+
+    adaptive_threshold = float(np.mean(metallic_clean) + np.std(metallic_clean))
+    metallic_final = np.where(metallic_clean > adaptive_threshold, metallic_clean, 0.0)
+    metallic_final = _normalize_physical_map_v5(metallic_final)
+
+    if candidate is not None:
+        candidate_gray = np.asarray(candidate.convert("L"), dtype=np.float32) / 255.0
+        metallic_final = np.clip(metallic_final * 0.6 + candidate_gray * 0.4, 0.0, 1.0)
+
+    gray_img = Image.fromarray((metallic_final * 255.0).astype(np.uint8), mode="L")
+
+    if candidate is not None and "A" in candidate.getbands():
+        alpha = candidate.split()[-1]
+    elif analysis is not None and isinstance(getattr(analysis, "alpha", None), np.ndarray):
+        alpha_arr = np.clip(analysis.alpha.astype(np.float32), 0.0, 1.0)
+        alpha = Image.fromarray((alpha_arr * 255).astype(np.uint8), mode="L")
+    else:
+        alpha = Image.new("L", base_image.size, 255)
+
+    return Image.merge("RGBA", (gray_img, gray_img, gray_img, alpha))
+
+
+def _regenerate_metallic_with_variation_v5(
+    base_image: Image.Image,
+    roughness_map: Image.Image | None,
+    analysis: AnalysisResult | None,
+    material_class: str,
+    candidate: Image.Image,
+) -> Image.Image:
+    return _generate_metallic_map_v5(
+        base_image,
+        roughness_map,
+        analysis,
+        material_class=material_class,
+        candidate=candidate,
+    )
+
+
+def _detect_and_correct_flat_maps_v5(
+    maps_dict: Mapping[str, Image.Image],
+    base_image: Image.Image | None,
+    analysis: AnalysisResult | None,
+    material_class: str,
+) -> Dict[str, Image.Image]:
+    corrected: Dict[str, Image.Image] = {}
+    for map_name, map_image in maps_dict.items():
+        if not isinstance(map_image, Image.Image):
+            corrected[map_name] = map_image
+            continue
+
+        map_array = np.asarray(map_image.convert("L"), dtype=np.float32)
+        std_dev = float(np.std(map_array))
+        mean_val = float(np.mean(map_array))
+        flatness_ratio = std_dev / (mean_val + 1e-8)
+
+        if flatness_ratio < 0.05:
+            LOGGER.warning(
+                "Mapa %s detectado como uniforme (std: %.4f); aplicando corrección v5",
+                map_name,
+                std_dev,
+            )
+            if map_name == "metallic" and base_image is not None:
+                corrected_map = _regenerate_metallic_with_variation_v5(
+                    base_image,
+                    maps_dict.get("roughness"),
+                    analysis,
+                    material_class,
+                    map_image,
+                )
+            elif map_name == "roughness":
+                corrected_map = _regenerate_roughness_with_variation_v5(map_image)
+            else:
+                corrected_map = _apply_contrast_enhancement_v5(map_image)
+            corrected[map_name] = corrected_map
+        else:
+            corrected[map_name] = map_image
+    return corrected
+
+
+def _generate_roughness_map_v5(
+    base_image: Image.Image,
+    analysis: AnalysisResult | None,
+    metallic_map: Image.Image | None,
+    material_class: str,
+) -> Image.Image:
+    if analysis is not None:
+        metallic = metallic_map if metallic_map is not None else Image.new("L", base_image.size, 0)
+        return generate_roughness_physically_accurate(base_image, analysis, metallic)
+
+    gray = np.asarray(base_image.convert("L"), dtype=np.float32) / 255.0
+    inverted = 1.0 - gray
+    enhanced = _normalize_physical_map_v5(inverted)
+    gray_img = Image.fromarray((enhanced * 255.0).astype(np.uint8), mode="L")
+    alpha = Image.new("L", base_image.size, 255)
+    return Image.merge("RGBA", (gray_img, gray_img, gray_img, alpha))
+
+
+def _generate_normal_map_v5(
+    base_image: Image.Image,
+    analysis: AnalysisResult | None,
+) -> Image.Image:
+    if analysis is not None:
+        return generate_normal_enhanced(base_image, analysis)
+
+    gray = np.asarray(base_image.convert("L"), dtype=np.float32) / 255.0
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+    grad_x = _convolve2d(gray, sobel_x)
+    grad_y = _convolve2d(gray, sobel_y)
+    normal_z = np.ones_like(gray) * 0.5
+    normal = np.dstack((-grad_x, -grad_y, normal_z))
+    norm = np.linalg.norm(normal, axis=2, keepdims=True)
+    normal = normal / (norm + 1e-8)
+    normal_rgb = np.clip((normal + 1.0) / 2.0, 0.0, 1.0)
+    return Image.fromarray((normal_rgb * 255.0).astype(np.uint8), mode="RGB")
 def _preserve_foreground_texture_transmission(
     foreground: Image.Image,
     background: Image.Image | None,
@@ -724,11 +1044,13 @@ def _update_final_maps(
     metallic_candidate = generate_metallic_physically_accurate(
         base_img, analysis, current_maps.get("metallic")
     )
-    final_maps["metallic"] = _generate_metallic_map_corrected(
+    material_class = getattr(analysis, "material_class", "default")
+    final_maps["metallic"] = _generate_metallic_map_v5(
         base_img,
-        analysis,
         current_maps.get("roughness"),
-        metallic_candidate,
+        analysis,
+        material_class=material_class,
+        candidate=metallic_candidate,
     )
     final_maps["ior"] = generate_ior_physically_accurate(
         final_maps["transmission"],
@@ -737,6 +1059,13 @@ def _update_final_maps(
     )
     final_maps["roughness"] = generate_roughness_physically_accurate(
         base_img, analysis, final_maps["metallic"]
+    )
+    final_maps["metallic"] = _generate_metallic_map_v5(
+        base_img,
+        final_maps["roughness"],
+        analysis,
+        material_class=material_class,
+        candidate=final_maps["metallic"],
     )
     final_maps["specular"] = generate_specular_coherent(final_maps["roughness"], analysis)
     final_maps["subsurface"] = generate_subsurface_accurate(analysis, final_maps["transmission"])
@@ -750,7 +1079,11 @@ def _update_final_maps(
     final_maps["height"] = enhanced_height
     final_maps["ao"] = generate_ao_physically_accurate(analysis)
     final_maps["curvature"] = generate_curvature_enhanced(analysis)
-    final_maps["emissive"] = generate_emissive_accurate(base_img, analysis)
+    final_maps["emissive"] = _generate_emissive_map_v5(
+        base_img,
+        analysis,
+        material_class=material_class,
+    )
 
     fuzz_map, fuzz_ok = _robust_fuzz_generation(base_img, analysis)
     final_maps["fuzz"] = fuzz_map
@@ -767,6 +1100,13 @@ def _update_final_maps(
         generate_porosity_physically_accurate,
         base_img,
         analysis,
+    )
+
+    final_maps = _detect_and_correct_flat_maps_v5(
+        final_maps,
+        base_img,
+        analysis,
+        material_class,
     )
 
     coherence_issues = validate_pbr_coherence_corregido(base_img, final_maps)
@@ -821,12 +1161,17 @@ def generate_physically_accurate_pbr_maps(
         transmission_ok=diagnostics.get("transmission_preserved", True),
     )
     quality_report = generate_quality_report(final_maps, analysis)
+    material_class = getattr(analysis, "material_class", "default")
+    coherence_v5 = validate_pbr_coherence_v5(base_img, final_maps, material_class)
+    quality_report_v5 = automated_quality_report_v5(coherence_v5)
     return {
         "maps": final_maps,
         "analysis": analysis,
         "validation": final_validation,
         "corrections_applied": corrections,
         "quality_report": quality_report,
+        "coherence_v5": coherence_v5,
+        "quality_report_v5": quality_report_v5,
         "alpha": alpha_map,
         "quality_checks": quality_checks,
         "coherence_issues": diagnostics.get("coherence_issues", []),
@@ -863,4 +1208,10 @@ def generate_quality_report(maps: Mapping[str, Image.Image], analysis: AnalysisR
 __all__ = [
     "generate_physically_accurate_pbr_maps",
     "generate_quality_report",
+    "_generate_emissive_map_v5",
+    "_generate_metallic_map_v5",
+    "_generate_normal_map_v5",
+    "_generate_roughness_map_v5",
+    "_normalize_physical_map_v5",
+    "_detect_and_correct_flat_maps_v5",
 ]
