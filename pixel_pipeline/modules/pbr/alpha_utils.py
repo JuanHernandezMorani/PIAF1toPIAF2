@@ -1,87 +1,164 @@
 """Helpers for deriving consistent alpha channels across generated assets."""
 from __future__ import annotations
 
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Sequence, Tuple
+
+import logging
 
 import numpy as np
 from PIL import Image
 
 from .analysis import AnalysisResult
 
+LOGGER = logging.getLogger("pixel_pipeline.pbr.alpha_utils")
 
-def _alpha_bleed_rgba(image: Image.Image, iterations: int = 8, radius: int = 1) -> Image.Image:
+
+def _build_simple_distance_kernel(radius: int) -> np.ndarray:
+    """Return a simple inverse-distance kernel normalised to 1."""
+
+    radius = max(int(radius), 1)
+    size = radius * 2 + 1
+    kernel = np.zeros((size, size), dtype=np.float32)
+    for y in range(size):
+        for x in range(size):
+            if x == radius and y == radius:
+                continue
+            distance = np.hypot(float(x - radius), float(y - radius))
+            kernel[y, x] = 1.0 / (1.0 + distance)
+    total = float(kernel.sum())
+    if total > 0.0:
+        kernel /= total
+    return kernel
+
+
+def _enhanced_alpha_bleed_rgba_v3_improved(
+    image: Image.Image,
+    iterations: int = 12,
+    radius: int = 2,
+) -> Tuple[Image.Image, bool]:
+    """Combine V3 robustness with V1 precision for alpha bleeding."""
+
+    if iterations <= 0 or radius <= 0:
+        rgba = image.convert("RGBA")
+        return rgba, False
+
     rgba = image.convert("RGBA")
-    array = np.asarray(rgba, dtype=np.uint8).astype(np.float32)
+    array = np.asarray(rgba, dtype=np.float32) / 255.0
     rgb = array[..., :3]
     alpha = array[..., 3]
 
-    if iterations <= 0 or radius <= 0:
-        return rgba
+    colour_energy = np.linalg.norm(rgb, axis=2)
+    valid_colour = (alpha > 1e-3) & (colour_energy > 1e-4)
+    if not np.any((alpha > 1e-3) & (~valid_colour)):
+        return rgba, False
 
-    color_valid = alpha > 1
+    kernel = _build_simple_distance_kernel(radius)
+    offsets: Sequence[Tuple[int, int, float]] = []
+    size = kernel.shape[0]
+    centre = size // 2
+    for y in range(size):
+        for x in range(size):
+            weight = float(kernel[y, x])
+            if weight <= 0.0:
+                continue
+            dy = y - centre
+            dx = x - centre
+            if dy == 0 and dx == 0:
+                continue
+            offsets.append((dy, dx, weight))
+
     height, width = alpha.shape
+    changed = False
 
     for _ in range(iterations):
-        to_fill = (~color_valid) & (alpha <= 1)
-        if not np.any(to_fill):
+        pending = (alpha > 1e-3) & (~valid_colour)
+        if not np.any(pending):
             break
 
-        accum = np.zeros_like(rgb, dtype=np.float32)
-        weight = np.zeros_like(alpha, dtype=np.float32)
+        accum = np.zeros_like(rgb)
+        weight_accum = np.zeros_like(alpha)
 
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                if dx == 0 and dy == 0:
-                    continue
+        for dy, dx, weight in offsets:
+            src_y_start = max(0, -dy)
+            src_y_end = min(height, height - dy)
+            src_x_start = max(0, -dx)
+            src_x_end = min(width, width - dx)
+            dst_y_start = max(0, dy)
+            dst_y_end = min(height, height + dy)
+            dst_x_start = max(0, dx)
+            dst_x_end = min(width, width + dx)
 
-                src_y_start = max(0, -dy)
-                src_y_end = min(height, height - dy)
-                src_x_start = max(0, -dx)
-                src_x_end = min(width, width - dx)
-                dst_y_start = max(0, dy)
-                dst_y_end = min(height, height + dy)
-                dst_x_start = max(0, dx)
-                dst_x_end = min(width, width + dx)
+            if src_y_start >= src_y_end or src_x_start >= src_x_end:
+                continue
 
-                if src_y_start >= src_y_end or src_x_start >= src_x_end:
-                    continue
+            src_slice = (slice(src_y_start, src_y_end), slice(src_x_start, src_x_end))
+            dst_slice = (slice(dst_y_start, dst_y_end), slice(dst_x_start, dst_x_end))
 
-                src_slice = (slice(src_y_start, src_y_end), slice(src_x_start, src_x_end))
-                dst_slice = (slice(dst_y_start, dst_y_end), slice(dst_x_start, dst_x_end))
+            src_mask = valid_colour[src_slice]
+            if not np.any(src_mask):
+                continue
 
-                src_valid = color_valid[src_slice]
-                if not np.any(src_valid):
-                    continue
+            dst_mask = pending[dst_slice]
+            if not np.any(dst_mask):
+                continue
 
-                dst_fillable = to_fill[dst_slice]
-                mask = src_valid & dst_fillable
-                if not np.any(mask):
-                    continue
+            influence = alpha[src_slice] * weight
+            colour = rgb[src_slice] * influence[..., None]
 
-                src_rgb = rgb[src_slice]
-                accum_dst = accum[dst_slice]
+            accum[dst_slice] += np.where(src_mask[..., None], colour, 0.0)
+            weight_accum[dst_slice] += np.where(src_mask, influence, 0.0)
 
-                mask3 = mask[..., None]
-                accum_dst[mask3] += src_rgb[mask3]
-                weight_dst = weight[dst_slice]
-                weight_dst[mask] += 1.0
-
-        if not np.any(weight):
+        if not np.any(weight_accum):
             break
 
-        average = np.zeros_like(rgb, dtype=np.float32)
         with np.errstate(divide="ignore", invalid="ignore"):
-            average = np.divide(accum, weight[..., None], out=average, where=weight[..., None] > 0)
+            averaged = np.divide(
+                accum,
+                weight_accum[..., None],
+                out=np.zeros_like(rgb),
+                where=weight_accum[..., None] > 0,
+            )
 
-        update_mask = (weight > 0) & to_fill
+        update_mask = (weight_accum > 0) & pending
         if not np.any(update_mask):
             break
 
-        rgb = np.where(update_mask[..., None], average, rgb)
-        color_valid |= update_mask
+        rgb[update_mask] = averaged[update_mask]
+        valid_colour |= update_mask
+        changed = True
 
-    combined = np.dstack((np.clip(rgb, 0.0, 255.0), alpha[..., None]))
-    return Image.fromarray(combined.astype(np.uint8), mode="RGBA")
+    if changed:
+        luminance = np.dot(rgb, np.array([0.299, 0.587, 0.114], dtype=np.float32))
+        dark_edges = (alpha > 0.1) & (alpha < 0.98) & (luminance < 0.03)
+        if np.any(dark_edges):
+            padded = np.pad(rgb, ((1, 1), (1, 1), (0, 0)), mode="edge")
+            local = np.zeros_like(rgb)
+            for dy in range(3):
+                for dx in range(3):
+                    local += padded[dy : dy + height, dx : dx + width]
+            local /= 9.0
+            rgb = np.where(dark_edges[..., None], local, rgb)
+
+    combined = np.dstack((np.clip(rgb, 0.0, 1.0), alpha[..., None]))
+    result = Image.fromarray(np.clip(combined * 255.0, 0.0, 255.0).astype(np.uint8), mode="RGBA")
+    return result, changed
+
+
+def _enhanced_alpha_bleed_rgba(
+    image: Image.Image,
+    iterations: int = 12,
+    radius: int = 2,
+) -> Tuple[Image.Image, bool]:
+    """Backward-compatible wrapper around the improved bleeding routine."""
+
+    return _enhanced_alpha_bleed_rgba_v3_improved(image, iterations=iterations, radius=radius)
+
+
+def _alpha_bleed_rgba(image: Image.Image, iterations: int = 8, radius: int = 1) -> Image.Image:
+    """Backward-compatible wrapper around :func:`_enhanced_alpha_bleed_rgba`."""
+
+    result, _ = _enhanced_alpha_bleed_rgba(image, iterations=max(iterations, 1), radius=max(radius, 1))
+    return result
 
 
 def _as_float_array(image: Image.Image | None) -> np.ndarray | None:
@@ -187,9 +264,13 @@ def apply_alpha(image: Image.Image, alpha: np.ndarray) -> Image.Image:
 
 def apply_alpha_to_maps(maps: Mapping[str, Image.Image], alpha: np.ndarray) -> Dict[str, Image.Image]:
     updated: Dict[str, Image.Image] = {}
+    bleed_applied = False
     for name, image in maps.items():
-        bleeded = _alpha_bleed_rgba(image)
+        bleeded, changed = _enhanced_alpha_bleed_rgba(image)
+        bleed_applied = bleed_applied or changed
         updated[name] = apply_alpha(bleeded, alpha)
+    if bleed_applied:
+        LOGGER.info("Enhanced alpha bleeding applied: eliminated black borders")
     return updated
 
 
