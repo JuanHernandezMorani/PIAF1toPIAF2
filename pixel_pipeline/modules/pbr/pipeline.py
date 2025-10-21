@@ -9,6 +9,16 @@ import numpy as np
 from PIL import Image
 
 try:  # pragma: no cover - optional dependency
+    from skimage import exposure as _skimage_exposure
+except ImportError:  # pragma: no cover - graceful fallback
+    _skimage_exposure = None
+
+try:  # pragma: no cover - optional dependency
+    from skimage.restoration import denoise_bilateral as _skimage_denoise_bilateral
+except ImportError:  # pragma: no cover - graceful fallback
+    _skimage_denoise_bilateral = None
+
+try:  # pragma: no cover - optional dependency
     from scipy import ndimage as _scipy_ndimage
 except ImportError:  # pragma: no cover - graceful fallback
     _scipy_ndimage = None
@@ -35,6 +45,7 @@ from .validation import (
     auto_correct_failed_maps,
     log_corrections_applied,
     validate_all_maps,
+    validate_pbr_coherence_corregido,
 )
 
 LOGGER = logging.getLogger("pixel_pipeline.pbr.pipeline")
@@ -225,6 +236,83 @@ def _apply_gaussian_filter(array: np.ndarray, sigma: float) -> np.ndarray:
     return result.astype(np.float32, copy=False)
 
 
+def _apply_laplacian_filter(array: np.ndarray) -> np.ndarray:
+    if _scipy_ndimage is not None:
+        return _scipy_ndimage.laplace(array)
+
+    kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32)
+    padded = np.pad(array, 1, mode="edge")
+    result = (
+        kernel[1, 1] * padded[1:-1, 1:-1]
+        + kernel[0, 1] * padded[:-2, 1:-1]
+        + kernel[2, 1] * padded[2:, 1:-1]
+        + kernel[1, 0] * padded[1:-1, :-2]
+        + kernel[1, 2] * padded[1:-1, 2:]
+    )
+    return result.astype(np.float32, copy=False)
+
+
+def _convolve2d(array: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    pad_y = kernel.shape[0] // 2
+    pad_x = kernel.shape[1] // 2
+    padded = np.pad(array, ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+    result = np.zeros_like(array, dtype=np.float32)
+    for y in range(kernel.shape[0]):
+        for x in range(kernel.shape[1]):
+            result += kernel[y, x] * padded[y : y + array.shape[0], x : x + array.shape[1]]
+    return result.astype(np.float32, copy=False)
+
+
+def _normalize_01(array: np.ndarray) -> np.ndarray:
+    min_val = float(array.min()) if array.size else 0.0
+    max_val = float(array.max()) if array.size else 0.0
+    if max_val - min_val < 1e-8:
+        return np.zeros_like(array, dtype=np.float32)
+    normalized = (array - min_val) / (max_val - min_val)
+    return normalized.astype(np.float32, copy=False)
+
+
+def _bilateral_filter(array: np.ndarray, sigma_color: float = 0.1, sigma_spatial: float = 3.0) -> np.ndarray:
+    if _skimage_denoise_bilateral is not None:
+        return _skimage_denoise_bilateral(
+            array.astype(np.float32, copy=False),
+            sigma_color=sigma_color,
+            sigma_spatial=sigma_spatial,
+            channel_axis=None,
+        ).astype(np.float32, copy=False)
+    return _apply_gaussian_filter(array, sigma=max(sigma_spatial * 0.5, 0.5))
+
+
+def _equalize_histogram(array: np.ndarray) -> np.ndarray:
+    array = np.clip(array, 0.0, 1.0).astype(np.float32, copy=False)
+    if _skimage_exposure is not None:
+        try:  # pragma: no cover - optional dependency branch
+            return _skimage_exposure.equalize_hist(array).astype(np.float32, copy=False)
+        except Exception:  # pragma: no cover - robust fallback
+            pass
+
+    hist, bin_edges = np.histogram(array, bins=256, range=(0.0, 1.0), density=False)
+    cdf = np.cumsum(hist).astype(np.float32)
+    if cdf[-1] <= 0:
+        return array
+    cdf /= cdf[-1]
+    values = np.interp(array.flatten(), bin_edges[:-1], cdf)
+    return values.reshape(array.shape).astype(np.float32, copy=False)
+
+
+def _adaptive_equalize(array: np.ndarray, clip_limit: float = 0.03) -> np.ndarray:
+    array = np.clip(array, 0.0, 1.0).astype(np.float32, copy=False)
+    if _skimage_exposure is not None and hasattr(_skimage_exposure, "equalize_adapthist"):
+        try:  # pragma: no cover - optional dependency branch
+            return _skimage_exposure.equalize_adapthist(array, clip_limit=clip_limit).astype(
+                np.float32,
+                copy=False,
+            )
+        except Exception:  # pragma: no cover - robust fallback
+            pass
+    return _equalize_histogram(array)
+
+
 def _sobel_gradients(array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if _scipy_ndimage is not None:
         grad_x = _scipy_ndimage.sobel(array, axis=1)
@@ -237,70 +325,61 @@ def _sobel_gradients(array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 def _generate_fuzz_map(analysis_result: AnalysisResult, base_image: Image.Image) -> Tuple[np.ndarray, bool]:
     width, height = base_image.size
     target_shape = (height, width)
-    fallback = np.full(target_shape, 0.1, dtype=np.float32)
 
-    if not isinstance(analysis_result, AnalysisResult):
-        LOGGER.warning(
-            "Fuzz map generation received invalid analysis type: %s", type(analysis_result)
-        )
-        return fallback, False
+    try:
+        if not isinstance(analysis_result, AnalysisResult):
+            raise ValueError("analysis_result inválido")
 
-    data_valid = True
+        microsurface = getattr(analysis_result, "microsurface_data", None)
+        fuzz_potential = getattr(analysis_result, "fuzz_potential", None)
 
-    def _prepare(attribute: str, default_value: float) -> np.ndarray:
-        nonlocal data_valid
-        value = getattr(analysis_result, attribute, None)
-        if value is None:
-            LOGGER.debug("Fuzz map: attribute %s missing; using default", attribute)
-            data_valid = False
-            return np.full(target_shape, default_value, dtype=np.float32)
-        try:
-            array = np.asarray(value, dtype=np.float32)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.debug("Fuzz map: failed to convert %s (%s)", attribute, exc)
-            data_valid = False
-            return np.full(target_shape, default_value, dtype=np.float32)
+        if microsurface is None or fuzz_potential is None:
+            raise ValueError("Datos de microsuperficie ausentes en AnalysisResult")
 
-        if array.ndim >= 3:
-            array = array[..., 0]
+        microsurface = np.asarray(microsurface, dtype=np.float32)
+        fuzz_potential = np.asarray(fuzz_potential, dtype=np.float32)
 
-        if array.shape != target_shape:
-            LOGGER.debug(
-                "Fuzz map: attribute %s shape %s mismatched target %s", attribute, array.shape, target_shape
-            )
-            data_valid = False
-            return np.full(target_shape, default_value, dtype=np.float32)
+        if microsurface.ndim >= 3:
+            microsurface = microsurface[..., 0]
+        if fuzz_potential.ndim >= 3:
+            fuzz_potential = fuzz_potential[..., 0]
 
-        if not np.isfinite(array).all():
-            LOGGER.debug("Fuzz map: attribute %s contains non-finite values", attribute)
-            data_valid = False
-            array = np.nan_to_num(array, nan=default_value, posinf=default_value, neginf=default_value)
+        if microsurface.shape != target_shape or fuzz_potential.shape != target_shape:
+            raise ValueError("Dimensiones de microsuperficie o fuzz_potential no coinciden")
 
-        max_val = float(array.max()) if array.size else default_value
-        min_val = float(array.min()) if array.size else default_value
-        if max_val > 1.0 + 1e-6 or min_val < -1e-6:
-            array = np.clip(array, 0.0, 255.0)
-            if float(array.max()) > 1.0 + 1e-6:
-                array = array / 255.0
+        if (not np.isfinite(microsurface).all()) or (not np.isfinite(fuzz_potential).all()):
+            raise ValueError("microsurface_data o fuzz_potential contienen valores no finitos")
 
-        return np.clip(array, 0.0, 1.0).astype(np.float32, copy=False)
+        microsurface = np.clip(microsurface, 0.0, 1.0)
+        fuzz_potential = np.clip(fuzz_potential, 0.0, 1.0)
 
-    microsurface = _prepare("microsurface_data", 0.5)
-    fuzz_potential = _prepare("fuzz_potential", 0.3)
+        if np.std(microsurface) < 1e-4 or np.std(fuzz_potential) < 1e-4:
+            raise ValueError("microsurface_data o fuzz_potential carecen de variación")
 
-    fuzz_map = np.clip(microsurface * fuzz_potential, 0.0, 1.0)
-    fuzz_map = _apply_gaussian_filter(fuzz_map, sigma=1.0)
-
-    min_val = float(fuzz_map.min()) if fuzz_map.size else 0.0
-    max_val = float(fuzz_map.max()) if fuzz_map.size else 0.0
-    if max_val - min_val > 1e-8:
-        fuzz_map = (fuzz_map - min_val) / (max_val - min_val + 1e-8)
+    except Exception as exc:
+        LOGGER.error("ERROR CRÍTICO en fuzz map: %s", exc)
+        base_array = np.asarray(base_image.convert("L"), dtype=np.float32) / 255.0
+        microsurface = _normalize_01(_bilateral_filter(base_array, sigma_color=0.2, sigma_spatial=2.0))
+        fuzz_potential = np.clip(1.0 - microsurface, 0.0, 1.0)
+        success = False
     else:
-        data_valid = False
-        fuzz_map = fallback
+        success = True
 
-    fuzz_map = np.clip(fuzz_map, 0.0, 1.0).astype(np.float32, copy=False)
-    return fuzz_map, data_valid and np.isfinite(fuzz_map).all()
+    fuzz_map = np.clip(microsurface * fuzz_potential, 0.0, 1.0).astype(np.float32, copy=False)
+
+    fuzz_low = _apply_gaussian_filter(fuzz_map, sigma=1.0)
+    fuzz_high = _apply_gaussian_filter(fuzz_map, sigma=0.3)
+    combined = np.clip(fuzz_low * 0.7 + fuzz_high * 0.3, 0.0, 1.0)
+    fuzz_map = _equalize_histogram(combined)
+    fuzz_map = np.clip(fuzz_map, 0.0, 1.0)
+
+    if not success and np.std(fuzz_map) < 5e-3:
+        height, width = target_shape
+        x, y = np.meshgrid(np.linspace(0, 1, width), np.linspace(0, 1, height))
+        noise = np.sin(x * 20.0) * np.sin(y * 20.0) * 0.3 + 0.5
+        fuzz_map = np.clip(_apply_gaussian_filter(noise.astype(np.float32), sigma=1.0), 0.0, 1.0)
+
+    return fuzz_map.astype(np.float32, copy=False), success
 
 
 def _enhance_transmission_correlation(
@@ -325,32 +404,33 @@ def _enhance_transmission_correlation(
             if mask_array.ndim == 3:
                 mask_array = mask_array[..., 0]
             if mask_array.shape != (height, width):
-                mask_image = Image.fromarray((np.clip(mask_array, 0.0, 1.0) * 255).astype(np.uint8), mode="L")
-                mask_image = mask_image.resize((width, height), Image.Resampling.BILINEAR)
-                mask_array = np.asarray(mask_image, dtype=np.float32) / 255.0
-            else:
-                if mask_array.max() > 1.0 + 1e-6 or mask_array.min() < -1e-6:
-                    mask_array = np.clip(mask_array, 0.0, 255.0)
-                    if mask_array.max() > 1.0 + 1e-6:
-                        mask_array = mask_array / 255.0
+                mask_img = Image.fromarray((np.clip(mask_array, 0.0, 1.0) * 255).astype(np.uint8), mode="L")
+                mask_img = mask_img.resize((width, height), Image.Resampling.BILINEAR)
+                mask_array = np.asarray(mask_img, dtype=np.float32) / 255.0
+            elif mask_array.max() > 1.0 + 1e-6 or mask_array.min() < -1e-6:
+                mask_array = np.clip(mask_array, 0.0, 255.0)
+                if mask_array.max() > 1.0 + 1e-6:
+                    mask_array = mask_array / 255.0
 
         mask_array = np.clip(mask_array, 0.0, 1.0).astype(np.float32, copy=False)
 
         gray_base = base_array.mean(axis=2)
-        grad_x, grad_y = _sobel_gradients(gray_base)
-        texture_strength = np.sqrt(grad_x ** 2 + grad_y ** 2)
-        texture_max = float(texture_strength.max()) if texture_strength.size else 0.0
-        if texture_max > 1e-8:
-            texture_strength = texture_strength / texture_max
+        texture_strength = _bilateral_filter(gray_base, sigma_color=0.15, sigma_spatial=3.0)
+        texture_strength = _normalize_01(texture_strength)
 
-        texture_influence = 0.3
-        enhanced_transmission = transmission_array * (1.0 - texture_influence) + texture_strength * texture_influence
-        enhanced_transmission = (
-            enhanced_transmission * mask_array + transmission_array * (1.0 - mask_array) * 0.1
-        )
+        laplacian = _apply_laplacian_filter(texture_strength)
+        edge_potential = _normalize_01(np.abs(laplacian))
 
-        enhanced_transmission = np.clip(enhanced_transmission, 0.0, 1.0)
-        return Image.fromarray((enhanced_transmission * 255.0).astype(np.uint8), mode="L")
+        transmission = np.clip(texture_strength * 0.3 + edge_potential * 0.7, 0.0, 1.0)
+        transmission = np.clip(transmission * mask_array, 0.0, 1.0)
+
+        if np.any(mask_array > 0.05):
+            original = np.clip(transmission_array, 0.0, 1.0)
+            transmission = np.clip(transmission * 0.6 + original * 0.4, 0.0, 1.0)
+
+        transmission = _normalize_01(transmission)
+        transmission = np.power(np.clip(transmission, 0.0, 1.0), 0.8)
+        return Image.fromarray((transmission * 255.0).astype(np.uint8), mode="L")
     except Exception as exc:  # pragma: no cover - defensive
         LOGGER.warning("Transmission enhancement failed: %s", exc)
         return transmission_map
@@ -359,19 +439,18 @@ def _enhance_transmission_correlation(
 def _robust_fuzz_generation(base_image: Image.Image, analysis: AnalysisResult) -> Tuple[Image.Image, bool]:
     candidate = _generate_optional_map("fuzz", generate_fuzz_enhanced, base_image, analysis)
     fuzz_array, fuzz_operational = _generate_fuzz_map(analysis, base_image)
-    valid = np.isfinite(fuzz_array).all() and fuzz_array.size > 0
+
     detail_source = analysis.geometric_features.get("edge_map") if analysis.geometric_features else None
     detail_map = _safe_map_generation(detail_source, analysis, neutral=0.5)
 
-    if not valid or float(np.std(fuzz_array)) < 5e-3:
-        rng = np.random.default_rng(int(np.sum(detail_map) * 1000) if detail_map.size else None)
-        noise = rng.normal(0.0, 0.04, fuzz_array.shape).astype(np.float32)
-        fuzz_array = np.clip(0.5 + noise + (detail_map - 0.5) * 0.2, 0.0, 1.0)
-        LOGGER.warning("Fuzz map generation: using fallback due to invalid analysis data")
+    candidate_array = np.asarray(candidate.convert("L"), dtype=np.float32) / 255.0
+    if candidate_array.shape == fuzz_array.shape:
+        fuzz_array = np.clip(fuzz_array * 0.7 + candidate_array * 0.3, 0.0, 1.0)
+
+    if np.std(fuzz_array) < 5e-3:
+        LOGGER.warning("Fuzz map generation: variación insuficiente, reforzando con detalle geométrico")
+        fuzz_array = np.clip(fuzz_array + (detail_map - 0.5) * 0.3, 0.0, 1.0)
         fuzz_operational = False
-    else:
-        fuzz_array = np.clip(fuzz_array, 0.0, 1.0)
-        fuzz_operational = fuzz_operational and True
 
     candidate_rgba = candidate.convert("RGBA")
     if candidate_rgba.size != base_image.size:
@@ -383,6 +462,102 @@ def _robust_fuzz_generation(base_image: Image.Image, analysis: AnalysisResult) -
     return result, fuzz_operational
 
 
+def _enhance_height_map(height_map: Image.Image) -> Image.Image:
+    height_array = np.asarray(height_map.convert("L"), dtype=np.float32) / 255.0
+    enhanced = _adaptive_equalize(height_array, clip_limit=0.025)
+    enhanced = np.clip(enhanced, 0.0, 1.0)
+    return Image.fromarray((enhanced * 255.0).astype(np.uint8), mode="L")
+
+
+def _generate_normal_map_corrected(height_map: Image.Image, base_image: Image.Image) -> Image.Image:
+    height_array = np.asarray(height_map.convert("L"), dtype=np.float32) / 255.0
+    if height_array.size == 0:
+        return Image.new("RGB", base_image.size, (128, 128, 255))
+
+    height_enhanced = _adaptive_equalize(height_array, clip_limit=0.03)
+
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+
+    if _scipy_ndimage is not None:
+        grad_x = _scipy_ndimage.convolve(height_enhanced, sobel_x, mode="nearest") * 2.0
+        grad_y = _scipy_ndimage.convolve(height_enhanced, sobel_y, mode="nearest") * 2.0
+    else:
+        grad_x = _convolve2d(height_enhanced, sobel_x) * 2.0
+        grad_y = _convolve2d(height_enhanced, sobel_y) * 2.0
+
+    z_component = 0.5
+    normal = np.dstack((-grad_x, -grad_y, np.ones_like(height_array) * z_component))
+    norm = np.linalg.norm(normal, axis=2, keepdims=True)
+    normal = normal / (norm + 1e-8)
+    normal_rgb = np.clip((normal + 1.0) / 2.0, 0.0, 1.0)
+
+    return Image.fromarray((normal_rgb * 255.0).astype(np.uint8), mode="RGB")
+
+
+def _generate_metallic_map_corrected(
+    base_image: Image.Image,
+    analysis: AnalysisResult,
+    roughness_map: Image.Image | None,
+    candidate: Image.Image | None,
+) -> Image.Image:
+    base_rgb = np.asarray(base_image.convert("RGB"), dtype=np.float32) / 255.0
+    brightness = base_rgb.mean(axis=2)
+    saturation = np.std(base_rgb, axis=2)
+    metallic_likelihood = np.clip(brightness * 0.6 + (1.0 - saturation) * 0.4, 0.0, 1.0)
+
+    if roughness_map is not None:
+        rough_img = roughness_map.convert("L") if isinstance(roughness_map, Image.Image) else roughness_map
+        if isinstance(rough_img, Image.Image) and rough_img.size != base_image.size:
+            rough_img = rough_img.resize(base_image.size, Image.BILINEAR)
+        rough_array = np.asarray(rough_img, dtype=np.float32) / 255.0
+        if rough_array.ndim == 3:
+            rough_array = rough_array[..., 0]
+        metallic_likelihood *= np.clip(1.0 - rough_array, 0.0, 1.0)
+
+    mask = getattr(analysis, "mask", None)
+    if isinstance(mask, np.ndarray) and mask.shape == metallic_likelihood.shape:
+        metallic_likelihood *= np.clip(mask.astype(np.float32), 0.0, 1.0)
+
+    material = getattr(analysis, "material_analysis", None)
+    if material is not None:
+        metal_like = material.likelihoods.get("metal") if material.likelihoods else None
+        if metal_like is not None and metal_like.shape == metallic_likelihood.shape:
+            metallic_likelihood *= np.clip(metal_like.astype(np.float32) + 0.35, 0.0, 1.0)
+        organic_like = material.likelihoods.get("organic") if material.likelihoods else None
+        if organic_like is not None and organic_like.shape == metallic_likelihood.shape:
+            metallic_likelihood *= np.clip(1.0 - organic_like.astype(np.float32) * 0.8, 0.0, 1.0)
+        false_risk = getattr(material, "false_metal_risks", None)
+        if false_risk is not None and false_risk.shape == metallic_likelihood.shape:
+            metallic_likelihood *= np.clip(1.0 - false_risk.astype(np.float32) * 0.7, 0.0, 1.0)
+
+    metallic_likelihood = _normalize_01(metallic_likelihood)
+    active_pixels = metallic_likelihood[metallic_likelihood > 0.01]
+    if active_pixels.size:
+        threshold = float(np.percentile(active_pixels, 70))
+    else:
+        threshold = 0.0
+    refined = np.where(metallic_likelihood > threshold, metallic_likelihood, 0.0)
+    refined = np.clip(_apply_gaussian_filter(refined, sigma=1.0), 0.0, 1.0)
+    refined = _normalize_01(refined)
+
+    if candidate is not None:
+        candidate_gray = np.asarray(candidate.convert("L"), dtype=np.float32) / 255.0
+        if candidate_gray.shape != refined.shape:
+            candidate_gray_image = candidate.convert("L").resize(base_image.size, Image.BILINEAR)
+            candidate_gray = np.asarray(candidate_gray_image, dtype=np.float32) / 255.0
+        refined = np.clip(refined * 0.7 + candidate_gray * 0.3, 0.0, 1.0)
+
+    refined = np.clip(refined, 0.0, 1.0)
+    gray_image = Image.fromarray((refined * 255.0).astype(np.uint8), mode="L")
+
+    if candidate is not None and "A" in candidate.getbands():
+        alpha = candidate.convert("RGBA").split()[-1]
+    else:
+        alpha = Image.new("L", base_image.size, 255)
+
+    rgb = Image.merge("RGB", (gray_image, gray_image, gray_image))
+    return Image.merge("RGBA", (*rgb.split(), alpha))
 def _preserve_foreground_texture_transmission(
     foreground: Image.Image,
     background: Image.Image | None,
@@ -546,19 +721,33 @@ def _update_final_maps(
     final_maps["transmission"] = preserved_transmission
     diagnostics["transmission_preserved"] = not transmission_issues
 
-    final_maps["metallic"] = generate_metallic_physically_accurate(base_img, analysis, current_maps.get("metallic"))
+    metallic_candidate = generate_metallic_physically_accurate(
+        base_img, analysis, current_maps.get("metallic")
+    )
+    final_maps["metallic"] = _generate_metallic_map_corrected(
+        base_img,
+        analysis,
+        current_maps.get("roughness"),
+        metallic_candidate,
+    )
     final_maps["ior"] = generate_ior_physically_accurate(
         final_maps["transmission"],
         analysis.material_analysis,
         analysis,
     )
-    final_maps["roughness"] = generate_roughness_physically_accurate(base_img, analysis, final_maps["metallic"])
+    final_maps["roughness"] = generate_roughness_physically_accurate(
+        base_img, analysis, final_maps["metallic"]
+    )
     final_maps["specular"] = generate_specular_coherent(final_maps["roughness"], analysis)
     final_maps["subsurface"] = generate_subsurface_accurate(analysis, final_maps["transmission"])
     final_maps["structural"] = generate_structural_distinct(analysis, current_maps.get("structural"))
 
-    final_maps["normal"] = generate_normal_enhanced(base_img, analysis)
-    final_maps["height"] = generate_height_from_normal(final_maps["normal"], analysis)
+    normal_candidate = generate_normal_enhanced(base_img, analysis)
+    height_candidate = generate_height_from_normal(normal_candidate, analysis)
+    enhanced_height = _enhance_height_map(height_candidate)
+    refined_normal = _generate_normal_map_corrected(enhanced_height, base_img)
+    final_maps["normal"] = refined_normal
+    final_maps["height"] = enhanced_height
     final_maps["ao"] = generate_ao_physically_accurate(analysis)
     final_maps["curvature"] = generate_curvature_enhanced(analysis)
     final_maps["emissive"] = generate_emissive_accurate(base_img, analysis)
@@ -579,6 +768,11 @@ def _update_final_maps(
         base_img,
         analysis,
     )
+
+    coherence_issues = validate_pbr_coherence_corregido(base_img, final_maps)
+    if coherence_issues:
+        LOGGER.warning("Validación de coherencia PBR detectó inconsistencias: %s", ", ".join(coherence_issues))
+    diagnostics["coherence_issues"] = coherence_issues
 
     return final_maps, diagnostics
 
@@ -635,6 +829,7 @@ def generate_physically_accurate_pbr_maps(
         "quality_report": quality_report,
         "alpha": alpha_map,
         "quality_checks": quality_checks,
+        "coherence_issues": diagnostics.get("coherence_issues", []),
     }
 
 

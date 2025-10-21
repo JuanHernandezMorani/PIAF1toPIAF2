@@ -39,11 +39,8 @@ LAYERED_PBR_CONFIG: Mapping[str, object] = {
 def _smart_alpha_composition_improved(foreground: Image.Image, background: Image.Image) -> Image.Image:
     """Composite two images while robustly handling dimensional mismatches."""
 
-    def _to_unit_array(image: Image.Image | np.ndarray) -> np.ndarray:
-        if isinstance(image, Image.Image):
-            array = np.asarray(image, dtype=np.float32)
-        else:
-            array = np.asarray(image, dtype=np.float32)
+    def _normalize(image: Image.Image | np.ndarray) -> np.ndarray:
+        array = np.asarray(image, dtype=np.float32)
         if array.ndim == 2:
             array = array[..., None]
         if array.size == 0:
@@ -52,70 +49,59 @@ def _smart_alpha_composition_improved(foreground: Image.Image, background: Image
             array = np.clip(array, 0.0, 255.0)
             if array.max() > 1.0 + 1e-6:
                 array = array / 255.0
-        else:
-            array = np.clip(array, 0.0, 1.0)
-        return array.astype(np.float32, copy=False)
+        return np.clip(array, 0.0, 1.0).astype(np.float32, copy=False)
 
-    def _ensure_rgba(array: np.ndarray) -> np.ndarray:
+    def _split_rgba(array: np.ndarray, default_alpha: float) -> tuple[np.ndarray, np.ndarray]:
         if array.ndim != 3:
             raise ValueError("Input array must have three dimensions after preprocessing")
         channels = array.shape[2]
-        if channels == 4:
-            return array
-        if channels == 3:
-            alpha = np.ones(array.shape[:2], dtype=array.dtype)
-            return np.dstack((array, alpha))
-        if channels == 1:
+        if channels >= 4:
+            rgb = array[..., :3]
+            alpha = array[..., 3]
+        elif channels == 3:
+            rgb = array
+            alpha = np.full(array.shape[:2], default_alpha, dtype=array.dtype)
+        elif channels == 1:
             rgb = np.repeat(array, 3, axis=2)
-            alpha = np.ones(array.shape[:2], dtype=array.dtype)
-            return np.dstack((rgb, alpha))
-        if channels > 4:
-            return np.dstack((array[..., :3], np.ones(array.shape[:2], dtype=array.dtype)))
-        raise ValueError(f"Unsupported channel count: {channels}")
+            alpha = np.full(array.shape[:2], default_alpha, dtype=array.dtype)
+        else:
+            raise ValueError(f"Unsupported channel count: {channels}")
+        return rgb, np.clip(alpha, 0.0, 1.0)
 
-    fg = _ensure_rgba(_to_unit_array(foreground))
-    bg = _ensure_rgba(_to_unit_array(background))
+    fg_array = _normalize(foreground)
+    bg_array = _normalize(background)
 
-    if fg.shape[:2] != bg.shape[:2]:
-        bg_image = Image.fromarray((np.clip(bg, 0.0, 1.0) * 255.0).astype(np.uint8), mode="RGBA")
-        resized = bg_image.resize((fg.shape[1], fg.shape[0]), Image.Resampling.LANCZOS)
-        bg = np.asarray(resized, dtype=np.float32) / 255.0
+    fg_rgb, fg_alpha = _split_rgba(fg_array, 1.0)
+    bg_rgb, bg_alpha = _split_rgba(bg_array, 0.0)
 
-    fg_rgb = fg[..., :3]
-    fg_alpha = fg[..., 3:4]
-    bg_rgb = bg[..., :3]
-    bg_alpha = bg[..., 3:4]
+    if fg_rgb.shape[:2] != bg_rgb.shape[:2]:
+        bg_image = Image.fromarray((bg_rgb * 255.0).astype(np.uint8), mode="RGB")
+        bg_alpha_img = Image.fromarray((bg_alpha * 255.0).astype(np.uint8), mode="L")
+        resized_rgb = bg_image.resize((fg_rgb.shape[1], fg_rgb.shape[0]), Image.Resampling.LANCZOS)
+        resized_alpha = bg_alpha_img.resize((fg_rgb.shape[1], fg_rgb.shape[0]), Image.Resampling.LANCZOS)
+        bg_rgb = np.asarray(resized_rgb, dtype=np.float32) / 255.0
+        bg_alpha = np.asarray(resized_alpha, dtype=np.float32) / 255.0
 
-    premult_fg = fg_rgb * fg_alpha
-    premult_bg = bg_rgb * bg_alpha
-    combined_premult = premult_fg + premult_bg * (1.0 - fg_alpha)
-    combined_alpha = fg_alpha + bg_alpha * (1.0 - fg_alpha)
+    fg_rgb = np.clip(fg_rgb, 0.0, 1.0)
+    bg_rgb = np.clip(bg_rgb, 0.0, 1.0)
+    fg_alpha = np.clip(fg_alpha, 0.0, 1.0)
+    bg_alpha = np.clip(bg_alpha, 0.0, 1.0)
 
-    epsilon = 1e-8
-    safe_alpha = np.maximum(combined_alpha, epsilon)
-    result_rgb = combined_premult / safe_alpha
+    alpha_out = fg_alpha + bg_alpha * (1.0 - fg_alpha)
+    alpha_out = np.clip(alpha_out, 0.0, 1.0)
 
-    low_alpha = fg_alpha < 0.05
-    result_rgb = np.where(low_alpha, bg_rgb, result_rgb)
-    result_alpha = np.where(low_alpha, bg_alpha, combined_alpha)
+    safe_alpha = np.where(alpha_out < 1e-8, 1.0, alpha_out)
+    rgb_out = (
+        fg_rgb * fg_alpha[..., None]
+        + bg_rgb * bg_alpha[..., None] * (1.0 - fg_alpha[..., None])
+    ) / safe_alpha[..., None]
 
-    halo_mask = (result_alpha > 0.05) & (np.linalg.norm(result_rgb, axis=2) < 1e-3)
-    if np.any(halo_mask):
-        result_rgb = np.where(halo_mask[..., None], bg_rgb, result_rgb)
+    rgb_out = np.clip(rgb_out, 0.0, 1.0)
 
-    residual_mask = (result_alpha > 0.4) & (np.linalg.norm(result_rgb, axis=2) < 0.02)
-    if np.any(residual_mask):
-        padded = np.pad(result_rgb, ((1, 1), (1, 1), (0, 0)), mode="edge")
-        local_avg = np.zeros_like(result_rgb)
-        height, width = result_alpha.shape[:2]
-        for dy in range(3):
-            for dx in range(3):
-                local_avg += padded[dy : dy + height, dx : dx + width]
-        local_avg /= 9.0
-        result_rgb = np.where(residual_mask[..., None], local_avg, result_rgb)
-
-    composed = np.dstack((np.clip(result_rgb, 0.0, 1.0), np.clip(result_alpha, 0.0, 1.0)))
-    return Image.fromarray((composed * 255.0).astype(np.uint8), mode="RGBA")
+    return Image.fromarray(
+        (np.dstack((rgb_out, alpha_out)) * 255.0).astype(np.uint8),
+        mode="RGBA",
+    )
 
 
 def _smart_alpha_composition(foreground: Image.Image, background: Image.Image) -> Image.Image:

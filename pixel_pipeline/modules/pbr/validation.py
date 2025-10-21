@@ -444,6 +444,55 @@ def _evaluate_quality_checks_improved(
     return results
 
 
+def validate_pbr_coherence_corregido(
+    base_image: Image.Image,
+    pbr_maps: Mapping[str, Image.Image],
+) -> List[str]:
+    """Evaluate cross-map coherence and flag major inconsistencies."""
+
+    if base_image is None:
+        return ["BASE_IMAGE_MISSING"]
+
+    issues: List[str] = []
+    base_gray = np.asarray(base_image.convert("L"), dtype=np.float32) / 255.0
+
+    for name, image in pbr_maps.items():
+        if image is None:
+            issues.append(f"MISSING_MAP: {name}")
+            continue
+
+        try:
+            raw_array = np.asarray(image, dtype=np.float32)
+        except Exception:
+            issues.append(f"INVALID_IMAGE: {name}")
+            continue
+
+        if raw_array.size == 0:
+            issues.append(f"EMPTY_MAP: {name}")
+            continue
+
+        raw_min = float(np.nanmin(raw_array))
+        raw_max = float(np.nanmax(raw_array))
+        if raw_min < 0.0 or raw_max > 255.0:
+            issues.append(f"VALUE_OVERFLOW: {name}")
+
+        map_gray = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        if map_gray.shape != base_gray.shape:
+            issues.append(f"DIMENSION_MISMATCH: {name}")
+            continue
+
+        if float(np.std(map_gray)) < 5e-3:
+            issues.append(f"LOW_VARIATION: {name}")
+
+        if name not in {"emissive", "transmission"}:
+            with np.errstate(invalid="ignore"):
+                correlation = np.corrcoef(base_gray.flatten(), map_gray.flatten())[0, 1]
+            if not np.isfinite(correlation) or abs(float(correlation)) < 0.3:
+                issues.append(f"LOW_CORRELATION: {name} ({float(correlation):.2f})")
+
+    return issues
+
+
 __all__ = [
     "VALIDATION_RULES",
     "ValidationReport",
@@ -460,4 +509,5 @@ __all__ = [
     "_validate_halo_elimination",
     "_validate_transmission_integrity",
     "validate_all_maps",
+    "validate_pbr_coherence_corregido",
 ]

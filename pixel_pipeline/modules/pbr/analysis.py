@@ -39,6 +39,8 @@ class AnalysisResult:
     specular_achromaticity: np.ndarray
     diffuse_albedo: np.ndarray
     transmission_seed: np.ndarray
+    microsurface_data: np.ndarray
+    fuzz_potential: np.ndarray
     material_analysis: MaterialAnalysis
     geometric_features: Dict[str, np.ndarray]
     current_issues: Dict[str, Iterable[str]]
@@ -273,6 +275,26 @@ def extract_geometric_features_enhanced(
     }
 
 
+def compute_microsurface_descriptors(
+    luminance: np.ndarray,
+    saturation: np.ndarray,
+    mask: np.ndarray,
+    thin_regions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Derive microsurface energy and fuzz potential fields."""
+
+    smoothed = gaussian_blur(luminance, radius=1.2)
+    high_freq = np.abs(luminance - smoothed)
+    microsurface = gaussian_blur(high_freq, radius=0.6)
+    microsurface = normalize01(microsurface) * mask
+
+    fuzz_base = np.clip((1.0 - saturation) * (0.4 + high_freq), 0.0, 1.0)
+    fuzz_base = gaussian_blur(fuzz_base * mask, radius=0.8)
+    fuzz_potential = normalize01(fuzz_base + thin_regions * 0.2)
+
+    return microsurface.astype(np.float32), fuzz_potential.astype(np.float32)
+
+
 def _map_issues(image: Image.Image) -> Iterable[str]:
     array = _pil_to_np(image, mode="L")
     flat = array.max() - array.min() < 0.02
@@ -353,6 +375,12 @@ def analyze_image_comprehensive(
 
     geometric_features = extract_geometric_features_enhanced(luminance, mask, alpha)
     geometric_features.setdefault("thin_regions", thin_regions.astype(np.float32))
+    microsurface_data, fuzz_potential = compute_microsurface_descriptors(
+        luminance,
+        saturation,
+        mask,
+        geometric_features["thin_regions"],
+    )
     current_issues = diagnose_current_map_issues(current_maps, mask)
 
     return AnalysisResult(
@@ -365,6 +393,8 @@ def analyze_image_comprehensive(
         specular_achromaticity=specular,
         diffuse_albedo=diffuse,
         transmission_seed=translucency,
+        microsurface_data=microsurface_data,
+        fuzz_potential=fuzz_potential,
         material_analysis=material_analysis,
         geometric_features=geometric_features,
         current_issues=current_issues,
