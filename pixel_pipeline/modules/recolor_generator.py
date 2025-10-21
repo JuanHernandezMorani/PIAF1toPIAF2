@@ -929,8 +929,18 @@ class RecolorPipeline:
         analysis = pbr_result.get("analysis")
         analysis_obj = analysis if hasattr(analysis, "mask") else None
         alpha_map = pbr_result.get("alpha")
-        
-        
+
+        quality_checks = pbr_result.get("quality_checks", {})
+        if quality_checks:
+            self.logger.debug("PBR validation checks: %s", quality_checks)
+            if quality_checks.get("halos_eliminated", False):
+                self.logger.info("No visible halos detected in composition")
+            else:
+                self.logger.warning("Halos detected in generated composition output")
+            if not quality_checks.get("transmission_preserved", True):
+                self.logger.warning("Transmission map flagged for manual inspection")
+
+
         quality = pbr_result.get("quality_report")
         if quality is None:
             quality = generate_quality_report(final_maps, analysis_obj)
