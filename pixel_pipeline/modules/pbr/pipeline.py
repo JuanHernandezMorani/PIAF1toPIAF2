@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - graceful fallback
     _cv2 = None
 
 from .alpha_utils import apply_alpha, apply_alpha_to_maps, derive_alpha_map
+from .background_edge_correction import correct_edges_with_background
 from .analysis import AnalysisResult, analyze_image_comprehensive, calculate_entropy
 from .generation import (
     generate_alpha_accurate,
@@ -1149,12 +1150,19 @@ def generate_physically_accurate_pbr_maps(
         log_corrections_applied(corrections)
         final_maps, alpha_map = _enforce_rgba_alpha(sanitized_base, final_maps, analysis)
         validation_report = validate_all_maps(final_maps, analysis)
+
     final_validation = validate_all_maps(final_maps, analysis)
     if not final_validation.passes_all_critical():
         LOGGER.warning("Final maps still report issues: %s", final_validation.issues)
     else:
         LOGGER.info("All PBR maps validated successfully")
-    composite = apply_alpha(sanitized_base, alpha_map)
+
+    if sanitized_bg is not None:
+        corrected_foreground = correct_edges_with_background(sanitized_base, sanitized_bg)
+    else:
+        corrected_foreground = sanitized_base
+
+    composite = apply_alpha(corrected_foreground, alpha_map)
     foreground_texture = np.asarray(sanitized_base.convert("L"), dtype=np.float32) / 255.0
     quality_checks = _evaluate_quality_checks_improved(
         final_maps,
@@ -1168,6 +1176,12 @@ def generate_physically_accurate_pbr_maps(
     material_class = getattr(analysis, "material_class", "default")
     coherence_v5 = validate_pbr_coherence_v5(sanitized_base, final_maps, material_class)
     quality_report_v5 = automated_quality_report_v5(coherence_v5)
+    diagnostics_payload = {
+        **diagnostics,
+        "edge_correction_applied": sanitized_bg is not None,
+        "correction_method": "background_extrapolation" if sanitized_bg is not None else "none",
+    }
+
     return {
         "maps": final_maps,
         "analysis": analysis,
@@ -1179,6 +1193,8 @@ def generate_physically_accurate_pbr_maps(
         "alpha": alpha_map,
         "quality_checks": quality_checks,
         "coherence_issues": diagnostics.get("coherence_issues", []),
+        "composite": composite,
+        "diagnostics": diagnostics_payload,
     }
 
 
@@ -1209,6 +1225,23 @@ def generate_quality_report(maps: Mapping[str, Image.Image], analysis: AnalysisR
     return report
 
 
+def safe_composition_with_background_correction(
+    foreground: Image.Image,
+    background: Image.Image,
+) -> Image.Image:
+    """Compose ``foreground`` over ``background`` after correcting edge bleed."""
+
+    corrected = correct_edges_with_background(foreground, background)
+    fg_arr = np.asarray(corrected.convert("RGBA"), dtype=np.float32) / 255.0
+    bg_arr = np.asarray(background.convert("RGB"), dtype=np.float32) / 255.0
+
+    fg_rgb = fg_arr[..., :3]
+    fg_alpha = fg_arr[..., 3][..., None]
+    composite_rgb = fg_rgb * fg_alpha + bg_arr * (1.0 - fg_alpha)
+    composite_rgb = np.clip(composite_rgb, 0.0, 1.0)
+    return Image.fromarray((composite_rgb * 255.0).astype(np.uint8), mode="RGB")
+
+
 __all__ = [
     "generate_physically_accurate_pbr_maps",
     "generate_quality_report",
@@ -1218,4 +1251,5 @@ __all__ = [
     "_generate_roughness_map_v5",
     "_normalize_physical_map_v5",
     "_detect_and_correct_flat_maps_v5",
+    "safe_composition_with_background_correction",
 ]
