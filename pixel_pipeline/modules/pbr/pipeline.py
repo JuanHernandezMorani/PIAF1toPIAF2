@@ -45,6 +45,7 @@ from .generation import (
     generate_subsurface_accurate,
     generate_transmission_physically_accurate,
 )
+from .physical_rgb import sanitize_rgba_image
 from .validation import (
     _evaluate_quality_checks_improved,
     auto_correct_failed_maps,
@@ -1132,10 +1133,13 @@ def generate_physically_accurate_pbr_maps(
     bg_img: Image.Image | None,
     current_maps: Mapping[str, Image.Image],
 ) -> Dict[str, object]:
-    prepared_maps = _ensure_current_maps(base_img, current_maps)
-    analysis = analyze_image_comprehensive(base_img, bg_img, prepared_maps)
-    final_maps, diagnostics = _update_final_maps(base_img, analysis, prepared_maps)
-    final_maps, alpha_map = _enforce_rgba_alpha(base_img, final_maps, analysis)
+    sanitized_base = sanitize_rgba_image(base_img)
+    sanitized_bg = sanitize_rgba_image(bg_img) if bg_img is not None else None
+
+    prepared_maps = _ensure_current_maps(sanitized_base, current_maps)
+    analysis = analyze_image_comprehensive(sanitized_base, sanitized_bg, prepared_maps)
+    final_maps, diagnostics = _update_final_maps(sanitized_base, analysis, prepared_maps)
+    final_maps, alpha_map = _enforce_rgba_alpha(sanitized_base, final_maps, analysis)
 
     validation_report = validate_all_maps(final_maps, analysis)
     corrections: Tuple[str, ...] = ()
@@ -1143,18 +1147,18 @@ def generate_physically_accurate_pbr_maps(
         final_maps, applied = auto_correct_failed_maps(final_maps, analysis, validation_report)
         corrections = tuple(applied)
         log_corrections_applied(corrections)
-        final_maps, alpha_map = _enforce_rgba_alpha(base_img, final_maps, analysis)
+        final_maps, alpha_map = _enforce_rgba_alpha(sanitized_base, final_maps, analysis)
         validation_report = validate_all_maps(final_maps, analysis)
     final_validation = validate_all_maps(final_maps, analysis)
     if not final_validation.passes_all_critical():
         LOGGER.warning("Final maps still report issues: %s", final_validation.issues)
     else:
         LOGGER.info("All PBR maps validated successfully")
-    composite = apply_alpha(base_img, alpha_map)
-    foreground_texture = np.asarray(base_img.convert("L"), dtype=np.float32) / 255.0
+    composite = apply_alpha(sanitized_base, alpha_map)
+    foreground_texture = np.asarray(sanitized_base.convert("L"), dtype=np.float32) / 255.0
     quality_checks = _evaluate_quality_checks_improved(
         final_maps,
-        base_image=base_img,
+        base_image=sanitized_base,
         composite=composite,
         foreground_texture=foreground_texture,
         fuzz_ok=diagnostics.get("fuzz_map_operational", True),
@@ -1162,7 +1166,7 @@ def generate_physically_accurate_pbr_maps(
     )
     quality_report = generate_quality_report(final_maps, analysis)
     material_class = getattr(analysis, "material_class", "default")
-    coherence_v5 = validate_pbr_coherence_v5(base_img, final_maps, material_class)
+    coherence_v5 = validate_pbr_coherence_v5(sanitized_base, final_maps, material_class)
     quality_report_v5 = automated_quality_report_v5(coherence_v5)
     return {
         "maps": final_maps,

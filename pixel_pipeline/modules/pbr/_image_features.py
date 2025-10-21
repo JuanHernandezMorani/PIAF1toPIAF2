@@ -6,14 +6,13 @@ from typing import Tuple
 import numpy as np
 from PIL import Image, ImageFilter
 
+from .physical_rgb import sanitize_rgba_image
+
 
 def to_rgb_alpha(image: Image.Image) -> Tuple[np.ndarray, np.ndarray]:
     """Return normalized RGB array and alpha mask from any PIL image."""
 
-    rgba = image.convert("RGBA")
-    array = np.asarray(rgba, dtype=np.float32)
-    rgb = array[..., :3] / 255.0
-    alpha = array[..., 3] / 255.0
+    _, rgb, alpha = sanitize_rgba_image(image, return_arrays=True)
     return rgb, alpha
 
 
