@@ -8,6 +8,10 @@ from matplotlib import colors
 import seaborn as sns
 from scipy import ndimage
 from scipy.stats import pearsonr
+from skimage.metrics import structural_similarity as ssim
+import cv2
+
+INPUT = "images"
 
 def load_pbr_maps(base_path, base_name, rotation, variant):
     """
@@ -27,14 +31,16 @@ def load_pbr_maps(base_path, base_name, rotation, variant):
         if os.path.exists(map_path):
             try:
                 img = Image.open(map_path)
-                # Preservar canal alpha si existe
-                if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-                    img = img.convert('RGBA')
-                else:
-                    # Convertir a RGB o L según el tipo de mapa
-                    if map_type in ['normal', 'emissive', 'material', 'specular', 'structural']:
+                # Conversión mejorada basada en el tipo de mapa
+                if map_type in ['normal', 'emissive', 'material', 'specular', 'structural', 'transmission']:
+                    # Mapas que deben preservar color
+                    if img.mode != 'RGB':
                         img = img.convert('RGB')
-                    else:
+                elif map_type in ['albedo', 'basecolor']:  # Si existe mapa de color base
+                    img = img.convert('RGB')
+                else:
+                    # Mapas monocromáticos
+                    if img.mode != 'L':
                         img = img.convert('L')
                 print(f"  Cargado: {map_type} ({img.mode})")
                 maps[map_type] = img
@@ -42,7 +48,6 @@ def load_pbr_maps(base_path, base_name, rotation, variant):
                 print(f"  Error cargando {map_type}: {e}")
     
     return maps
-
 
 def extract_alpha_channel(image):
     """
@@ -55,7 +60,6 @@ def extract_alpha_channel(image):
     else:
         # Crear alpha completo si no existe
         return Image.new('L', image.size, 255)
-
 
 def apply_alpha_compositing(base_img, alpha_map=None):
     """
@@ -91,7 +95,6 @@ def apply_alpha_compositing(base_img, alpha_map=None):
 
     return Image.merge('RGBA', (r, g, b, a))
 
-
 def normalize_array(arr):
     """
     Normaliza un array numpy a rango [0, 1]
@@ -99,7 +102,6 @@ def normalize_array(arr):
     if arr.max() == arr.min():
         return np.zeros_like(arr)
     return (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-
 
 def biological_light_response(intensity, adaptation_level=0.5):
     """
@@ -109,7 +111,6 @@ def biological_light_response(intensity, adaptation_level=0.5):
     # Aproximación de la respuesta visual humana (no lineal)
     return np.power(intensity, 0.45) * adaptation_level + np.power(intensity, 0.6) * (1 - adaptation_level)
 
-
 def chromatic_adaptation(rgb_array, reference_white=(0.95, 1.0, 1.05)):
     """
     Adaptación cromática (equilibrio de blancos biológico)
@@ -118,7 +119,6 @@ def chromatic_adaptation(rgb_array, reference_white=(0.95, 1.0, 1.05)):
     for i in range(3):
         result[..., i] = np.clip(result[..., i] * reference_white[i], 0, 1)
     return result
-
 
 def extract_rgb_channels(image_array):
     """
@@ -132,7 +132,6 @@ def extract_rgb_channels(image_array):
         return np.stack([image_array] * 3, axis=2)
     else:
         raise ValueError(f"Formato de imagen no soportado: {image_array.shape}")
-
 
 def microsurface_occlusion(height_map, normal_map, occlusion_strength=0.3):
     """
@@ -155,7 +154,6 @@ def microsurface_occlusion(height_map, normal_map, occlusion_strength=0.3):
     micro_occlusion = np.clip(micro_occlusion * occlusion_strength, 0, 1)
     
     return micro_occlusion
-
 
 def subsurface_scattering_effect(base_color, thickness_map, scattering_strength=0.1):
     """
@@ -197,7 +195,6 @@ def subsurface_scattering_effect(base_color, thickness_map, scattering_strength=
     
     return np.clip(result, 0, 1)
 
-
 def fresnel_effect(normal_map, view_direction=(0, 0, 1), base_reflectivity=0.04):
     """
     Calcula efecto Fresnel para reflexiones más realistas
@@ -226,12 +223,74 @@ def fresnel_effect(normal_map, view_direction=(0, 0, 1), base_reflectivity=0.04)
     
     return fresnel
 
+def preserve_base_color(base_img, processed_img, color_preservation=0.7):
+    """
+    Preserva los colores originales de la imagen base en el resultado procesado
+    """
+    base_rgb = base_img.convert('RGB')
+    processed_rgb = processed_img.convert('RGB')
+    
+    base_array = np.array(base_rgb, dtype=np.float32) / 255.0
+    processed_array = np.array(processed_rgb, dtype=np.float32) / 255.0
+    
+    # Convertir a HSV para preservar tono y saturación
+    base_hsv = cv2.cvtColor(base_array, cv2.COLOR_RGB2HSV)
+    processed_hsv = cv2.cvtColor(processed_array, cv2.COLOR_RGB2HSV)
+    
+    # Mezclar: preservar H y S de la base, usar V del procesado
+    blended_hsv = np.stack([
+        base_hsv[..., 0],  # Hue de la base
+        base_hsv[..., 1],  # Saturation de la base  
+        processed_hsv[..., 2]  # Value del procesado
+    ], axis=2)
+    
+    # Convertir de vuelta a RGB
+    blended_rgb = cv2.cvtColor(blended_hsv, cv2.COLOR_HSV2RGB)
+    blended_rgb = np.clip(blended_rgb, 0, 1)
+    
+    result = Image.fromarray((blended_rgb * 255).astype(np.uint8))
+    
+    # Preservar canal alpha si existe
+    if base_img.mode == 'RGBA':
+        alpha = base_img.split()[-1]
+        result = result.convert('RGBA')
+        result.putalpha(alpha)
+    
+    return result
 
-def fake_shading_2_5d(base_img, height_map, normal_map, ao_map, roughness_map, metallic_map):
+def apply_material_colors(base_img, material_map, color_intensity=0.3):
     """
-    Fake shading 2.5D mejorado con efectos biológicos y físicos
+    Aplica colores del material map a la imagen base
     """
-    print("  Aplicando fake shading 2.5D mejorado...")
+    if material_map is None:
+        return base_img
+        
+    alpha_channel = extract_alpha_channel(base_img)
+    base_rgb = base_img.convert('RGB')
+    
+    if material_map.size != base_rgb.size:
+        material_map = material_map.resize(base_rgb.size, Image.Resampling.LANCZOS)
+    
+    base_array = np.array(base_rgb, dtype=np.float32) / 255.0
+    material_array = np.array(material_map.convert('RGB'), dtype=np.float32) / 255.0
+    
+    # Mezclar colores del material con la base
+    blended = base_array * (1 - color_intensity) + material_array * color_intensity
+    blended = np.clip(blended, 0, 1)
+    
+    result = Image.fromarray((blended * 255).astype(np.uint8), mode='RGB')
+    
+    if alpha_channel is not None:
+        result = result.convert('RGBA')
+        result.putalpha(alpha_channel)
+    
+    return result
+
+def enhanced_fake_shading_2_5d(base_img, height_map, normal_map, ao_map, roughness_map, metallic_map, material_map):
+    """
+    Fake shading 2.5D mejorado que preserva colores y usa todos los mapas PBR
+    """
+    print("  Aplicando fake shading 2.5D mejorado con preservación de color...")
     
     # Convertir a arrays y normalizar
     base_array = np.array(base_img, dtype=np.float32) / 255.0
@@ -242,27 +301,31 @@ def fake_shading_2_5d(base_img, height_map, normal_map, ao_map, roughness_map, m
         rgb_array = base_array
         alpha_array = np.ones(base_array.shape[:2])
     
+    # PRESERVAR COLOR ORIGINAL
+    original_color = rgb_array.copy()
     result = rgb_array.copy()
     
-    # ===== CONFIGURACIÓN DE ILUMINACIÓN BIOLÓGICAMENTE REALISTA =====
+    # ===== APLICAR MATERIAL COLORS PRIMERO =====
+    if material_map is not None:
+        material_img = material_map.resize(base_img.size, Image.Resampling.LANCZOS)
+        material_array = np.array(material_img.convert('RGB'), dtype=np.float32) / 255.0
+        # Mezcla sutil de colores de material
+        material_blend = 0.2
+        result = result * (1 - material_blend) + material_array * material_blend
+    
+    # ===== CONFIGURACIÓN DE ILUMINACIÓN MEJORADA =====
     light_sources = [
         {
             'direction': np.array([0.5, 0.5, 1.0]),
             'color': np.array([1.0, 0.95, 0.9]),  # Luz solar cálida
-            'intensity': 1.2,
+            'intensity': 0.8,  # Reducida para preservar color
             'biological_response': 0.6
         },
         {
             'direction': np.array([-0.3, -0.5, 0.7]),
             'color': np.array([0.8, 0.9, 1.0]),  # Luz ambiental fría
-            'intensity': 0.4,
+            'intensity': 0.3,  # Reducida
             'biological_response': 0.4
-        },
-        {
-            'direction': np.array([0.7, -0.3, 0.5]),
-            'color': np.array([1.0, 0.98, 0.95]),  # Luz de acento cálida
-            'intensity': 0.3,
-            'biological_response': 0.3
         }
     ]
     
@@ -278,45 +341,26 @@ def fake_shading_2_5d(base_img, height_map, normal_map, ao_map, roughness_map, m
     if normal_map is not None:
         normal_array = np.array(normal_map, dtype=np.float32) / 255.0
         normal_array = normal_array * 2.0 - 1.0
-        
-        # Extraer solo canales RGB para cálculos de normales
         normal_array = extract_rgb_channels(normal_array)
-        
         norm = np.linalg.norm(normal_array, axis=2, keepdims=True)
         normal_array = normal_array / (norm + 1e-8)
     
-    # Generar normales desde height map si no hay normal map
-    if normal_array is None and height_array is not None:
-        kernel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
-        kernel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
-        
-        grad_x = ndimage.convolve(height_array, kernel_x) * 3.0
-        grad_y = ndimage.convolve(height_array, kernel_y) * 3.0
-        
-        normal_from_height = np.stack([-grad_x, -grad_y, np.ones_like(grad_x)], axis=2)
-        norm = np.linalg.norm(normal_from_height, axis=2, keepdims=True)
-        normal_array = normal_from_height / (norm + 1e-8)
-    
-    # ===== APLICAR ILUMINACIÓN POR CADA FUENTE =====
+    # ===== APLICAR ILUMINACIÓN MEJORADA =====
     for i, light in enumerate(light_sources):
         light_dir = light['direction'] / np.linalg.norm(light['direction'])
         
         if normal_array is not None:
-            # Cálculo de intensidad de luz
             light_intensity = np.sum(normal_array * light_dir, axis=2)
             light_intensity = np.clip(light_intensity, 0, 1)
-            
-            # Aplicar respuesta biológica no lineal
             light_intensity = biological_light_response(light_intensity, light['biological_response'])
             
-            # Modificar por roughness si está disponible
+            # Aplicar roughness si está disponible
             if roughness_map is not None:
                 roughness_array = np.array(roughness_map, dtype=np.float32)
                 if len(roughness_array.shape) == 3:
                     roughness_array = np.mean(roughness_array, axis=2)
                 roughness_array = roughness_array / 255.0
-                # Roughness difumina y suaviza los reflejos
-                light_intensity = light_intensity * (1.0 - roughness_array * 0.6)
+                light_intensity = light_intensity * (1.0 - roughness_array * 0.4)  # Menor efecto
             
             # Aplicar oclusión ambiental
             if ao_map is not None:
@@ -324,54 +368,26 @@ def fake_shading_2_5d(base_img, height_map, normal_map, ao_map, roughness_map, m
                 if len(ao_array.shape) == 3:
                     ao_array = np.mean(ao_array, axis=2)
                 ao_array = ao_array / 255.0
-                light_intensity = light_intensity * ao_array
+                light_intensity = light_intensity * (0.3 + 0.7 * ao_array)  # Menor oscurecimiento
             
-            # Aplicar efecto Fresnel para metálicos
-            if metallic_map is not None:
-                metallic_array = np.array(metallic_map, dtype=np.float32)
-                if len(metallic_array.shape) == 3:
-                    metallic_array = np.mean(metallic_array, axis=2)
-                metallic_array = metallic_array / 255.0
-                
-                fresnel = fresnel_effect(normal_map)
-                if fresnel is not None:
-                    metallic_fresnel = fresnel * metallic_array
-                    light_intensity = light_intensity * (1.0 + metallic_fresnel * 2.0)
-            
-            # Aplicar micro-oclusión
-            micro_occlusion = microsurface_occlusion(height_map, normal_map)
-            if micro_occlusion is not None:
-                light_intensity = light_intensity * (1.0 - micro_occlusion * 0.3)
-            
-            # Aplicar luz con color e intensidad
+            # MEZCLA MEJORADA: Preservar color original
             light_effect = light_intensity[..., np.newaxis] * light['color'] * light['intensity']
-            result = result + light_effect
+            result = result * (1.0 + light_effect * 0.5)  # Efecto más sutil
     
-    # ===== EFECTOS DE PROFUNDIDAD Y ATMÓSFERA =====
-    if height_array is not None:
-        # Desenfoque atmosférico (más desenfoque en áreas bajas)
-        height_blur = (1.0 - height_array) * 0.4
+    # ===== APLICAR METALLIC MAP =====
+    if metallic_map is not None:
+        metallic_array = np.array(metallic_map, dtype=np.float32)
+        if len(metallic_array.shape) == 3:
+            metallic_array = np.mean(metallic_array, axis=2)
+        metallic_array = metallic_array / 255.0
         
-        for channel in range(3):
-            channel_data = result[..., channel]
-            # Aplicar blur proporcional a la altura
-            blurred_channel = ndimage.gaussian_filter(channel_data, sigma=2.0)
-            result[..., channel] = channel_data * (1.0 - height_blur) + blurred_channel * height_blur
-        
-        # Acentuación de bordes en áreas de alta frecuencia
-        edge_enhance = height_array * 0.2
-        for channel in range(3):
-            laplacian = ndimage.laplace(result[..., channel])
-            result[..., channel] = np.clip(result[..., channel] + laplacian * edge_enhance, 0, 1)
+        # Efecto metálico más sutil que preserve color
+        metallic_boost = metallic_array[..., np.newaxis] * 0.3
+        result = result * (1.0 + metallic_boost)
     
-    # ===== SCATTERING SUB-SUPERFICIE =====
-    # Usar thickness map o invertir height map para scattering
-    thickness_map = height_map
-    if thickness_map is not None:
-        result = subsurface_scattering_effect(result, thickness_map, scattering_strength=0.15)
-    
-    # ===== ADAPTACIÓN CROMÁTICA BIOLÓGICA =====
-    result = chromatic_adaptation(result)
+    # ===== PRESERVAR COLOR ORIGINAL EN LA MEZCLA FINAL =====
+    color_preservation = 0.6  # 60% color original, 40% iluminación
+    result = original_color * color_preservation + result * (1 - color_preservation)
     
     # ===== AJUSTES FINALES =====
     result = np.clip(result, 0, 1)
@@ -381,41 +397,6 @@ def fake_shading_2_5d(base_img, height_map, normal_map, ao_map, roughness_map, m
         result = np.dstack([result, alpha_array])
     
     return Image.fromarray((result * 255).astype(np.uint8))
-
-
-def biologically_aware_tone_mapping(image, exposure=1.0, contrast=1.1):
-    """
-    Mapeo de tono biológicamente consciente
-    """
-    img_array = np.array(image, dtype=np.float32) / 255.0
-    
-    if img_array.shape[2] == 4:  # RGBA
-        rgb = img_array[..., :3]
-        alpha = img_array[..., 3]
-    else:
-        rgb = img_array
-        alpha = None
-    
-    # Curva de respuesta visual humana (aproximación)
-    # Combinación de logarítmico y sigmoide
-    exposed = rgb * exposure
-    
-    # Compresión de rango dinámico
-    tone_mapped = exposed / (exposed + 1.0)
-    
-    # Restaurar contraste
-    tone_mapped = np.power(tone_mapped, 1.0/contrast)
-    
-    # Ajuste final de gamma para pantallas
-    tone_mapped = np.power(tone_mapped, 1.0/2.2)
-    
-    tone_mapped = np.clip(tone_mapped, 0, 1)
-    
-    if alpha is not None:
-        tone_mapped = np.dstack([tone_mapped, alpha])
-    
-    return Image.fromarray((tone_mapped * 255).astype(np.uint8))
-
 
 def blend_normal_lighting(base_img, normal_map, height_map=None):
     """
@@ -471,7 +452,6 @@ def blend_normal_lighting(base_img, normal_map, height_map=None):
     
     return result
 
-
 def apply_height_displacement(base_img, height_map, intensity=0.02):
     """
     Aplica efecto de desplazamiento basado en mapa de altura (mejorado)
@@ -523,7 +503,6 @@ def apply_height_displacement(base_img, height_map, intensity=0.02):
     
     return result
 
-
 def blend_emissive(base_img, emissive_map):
     """
     Mezcla mapa emisivo con respuesta biológica
@@ -564,7 +543,6 @@ def blend_emissive(base_img, emissive_map):
         result.putalpha(alpha_channel)
     
     return result
-
 
 def apply_roughness_metallic(base_img, roughness_map, metallic_map):
     """
@@ -628,7 +606,6 @@ def apply_roughness_metallic(base_img, roughness_map, metallic_map):
     
     return result
 
-
 def apply_ambient_occlusion(base_img, ao_map):
     """
     Aplica oclusión ambiental mejorada
@@ -666,7 +643,6 @@ def apply_ambient_occlusion(base_img, ao_map):
         result.putalpha(alpha_channel)
     
     return result
-
 
 def apply_specular_effects(base_img, specular_map):
     """
@@ -708,6 +684,36 @@ def apply_specular_effects(base_img, specular_map):
     
     return result
 
+def blend_transmission_effect(base_img, transmission_map, strength=0.3):
+    """
+    Aplica efecto de transmisión de luz (para materiales translúcidos)
+    """
+    if transmission_map is None:
+        return base_img
+        
+    alpha_channel = extract_alpha_channel(base_img)
+    base_rgb = base_img.convert('RGB')
+    
+    if transmission_map.size != base_rgb.size:
+        transmission_map = transmission_map.resize(base_rgb.size, Image.Resampling.LANCZOS)
+    
+    base_array = np.array(base_rgb, dtype=np.float32)
+    transmission_array = np.array(transmission_map, dtype=np.float32)
+    
+    if len(transmission_array.shape) == 2:
+        transmission_array = np.stack([transmission_array] * 3, axis=2)
+    
+    # Efecto de transmisión: aclarar áreas translúcidas
+    transmission_strength = np.mean(transmission_array, axis=2) / 255.0 * strength
+    brightened = base_array * (1.0 + transmission_strength[..., np.newaxis] * 0.5)
+    
+    result = Image.fromarray(np.clip(brightened, 0, 255).astype(np.uint8), mode='RGB')
+    
+    if alpha_channel is not None:
+        result = result.convert('RGBA')
+        result.putalpha(alpha_channel)
+    
+    return result
 
 def calculate_pbr_coherence(pbr_maps, target_size):
     """
@@ -865,14 +871,128 @@ def fill_border_coherence(coherence, border_size):
     
     return coherence
 
-def create_comparison_plot(base_img, fused_img, coherence_map, output_path):
+def apply_ssim_analysis(base_img, fused_img):
     """
-    Crea visualización mejorada con análisis biológico
+    Aplica análisis SSIM para comparar similitud estructural
+    """
+    base_array = np.array(base_img.convert('RGB'))
+    fused_array = np.array(fused_img.convert('RGB'))
+    
+    # Calcular SSIM para cada canal
+    ssim_r = ssim(base_array[:,:,0], fused_array[:,:,0], data_range=255)
+    ssim_g = ssim(base_array[:,:,1], fused_array[:,:,1], data_range=255)  
+    ssim_b = ssim(base_array[:,:,2], fused_array[:,:,2], data_range=255)
+    ssim_mean = (ssim_r + ssim_g + ssim_b) / 3.0
+    
+    return {
+        'ssim_r': ssim_r,
+        'ssim_g': ssim_g, 
+        'ssim_b': ssim_b,
+        'ssim_mean': ssim_mean
+    }
+
+def apply_delta_e_analysis(base_img, fused_img):
+    """
+    Calcula diferencia de color ΔE en espacio Lab
+    """
+    base_lab = cv2.cvtColor(np.array(base_img.convert('RGB')), cv2.COLOR_RGB2Lab)
+    fused_lab = cv2.cvtColor(np.array(fused_img.convert('RGB')), cv2.COLOR_RGB2Lab)
+    
+    # Calcular ΔE
+    delta_e = np.sqrt(
+        np.sum((base_lab - fused_lab) ** 2, axis=2)
+    )
+    
+    return {
+        'delta_e_mean': np.mean(delta_e),
+        'delta_e_std': np.std(delta_e),
+        'delta_e_max': np.max(delta_e),
+        'delta_e_map': delta_e
+    }
+
+def biologically_aware_tone_mapping(image, exposure=1.0, contrast=1.1):
+    """
+    Mapeo de tono biológicamente consciente
+    """
+    img_array = np.array(image, dtype=np.float32) / 255.0
+    
+    if img_array.shape[2] == 4:  # RGBA
+        rgb = img_array[..., :3]
+        alpha = img_array[..., 3]
+    else:
+        rgb = img_array
+        alpha = None
+    
+    # Curva de respuesta visual humana (aproximación)
+    # Combinación de logarítmico y sigmoide
+    exposed = rgb * exposure
+    
+    # Compresión de rango dinámico
+    tone_mapped = exposed / (exposed + 1.0)
+    
+    # Restaurar contraste
+    tone_mapped = np.power(tone_mapped, 1.0/contrast)
+    
+    # Ajuste final de gamma para pantallas
+    tone_mapped = np.power(tone_mapped, 1.0/2.2)
+    
+    tone_mapped = np.clip(tone_mapped, 0, 1)
+    
+    if alpha is not None:
+        tone_mapped = np.dstack([tone_mapped, alpha])
+    
+    return Image.fromarray((tone_mapped * 255).astype(np.uint8))
+
+def enhanced_fuse_pbr_layers(base_img, pbr_maps):
+    """
+    Fusión mejorada de capas PBR con preservación de color y uso completo de mapas
+    """
+    print("  Iniciando fusión MEJORADA de capas PBR...")
+    result = base_img
+    
+    # 1. APLICAR COLOR DE MATERIAL PRIMERO
+    print("  Aplicando colores de material...")
+    result = apply_material_colors(result, pbr_maps.get('material'))
+    
+    # 2. APLICAR FAKE SHADING 2.5D MEJORADO
+    result = enhanced_fake_shading_2_5d(
+        result,
+        pbr_maps.get('height'),
+        pbr_maps.get('normal'), 
+        pbr_maps.get('ao'),
+        pbr_maps.get('roughness'),
+        pbr_maps.get('metallic'),
+        pbr_maps.get('material')
+    )
+    
+    # 3. APLICAR EFECTOS DE TRANSMISIÓN Y SUBSURFACE
+    if 'transmission' in pbr_maps or 'subsurface' in pbr_maps:
+        print("  Aplicando efectos de transmisión/subsurface...")
+        # Estos mapas pueden añadir efectos de color
+        if 'transmission' in pbr_maps:
+            transmission_map = pbr_maps['transmission']
+            # Aplicar efecto de transmisión de luz
+            result = blend_transmission_effect(result, transmission_map)
+    
+    # 4. APLICAR EMISSIVE (SIEMPRE ÚLTIMO - EFECTO ADITIVO)
+    print("  Aplicando efectos emisivos...")
+    result = blend_emissive(result, pbr_maps.get('emissive'))
+    
+    # 5. PRESERVAR COLOR BASE EN MEZCLA FINAL
+    result = preserve_base_color(base_img, result, color_preservation=0.7)
+    
+    print("  Fusión MEJORADA completada!")
+    return result
+
+def create_enhanced_comparison_plot(base_img, fused_img, coherence_map, ssim_results, delta_e_results, output_path):
+    """
+    Crea visualización mejorada con análisis biológico y métricas de calidad
     """
     print("  Creando visualización comparativa mejorada...")
     
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('Análisis PBR - Visualización Biológicamente Mejorada', fontsize=16, fontweight='bold')
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    fig.suptitle('Análisis PBR - Visualización Biológicamente Mejorada con Métricas de Calidad', 
+                 fontsize=16, fontweight='bold')
     
     # Imagen base
     axes[0, 0].imshow(np.array(base_img))
@@ -886,23 +1006,69 @@ def create_comparison_plot(base_img, fused_img, coherence_map, output_path):
     
     # Mapa de calor de coherencia
     if coherence_map is not None:
-        im = axes[1, 0].imshow(coherence_map, cmap='RdYlGn', vmin=0, vmax=1)
-        axes[1, 0].set_title('Mapa de Coherencia PBR Mejorado', fontsize=14, fontweight='bold')
-        axes[1, 0].axis('off')
-        plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+        im = axes[0, 2].imshow(coherence_map, cmap='RdYlGn', vmin=0, vmax=1)
+        axes[0, 2].set_title('Mapa de Coherencia PBR Mejorado', fontsize=14, fontweight='bold')
+        axes[0, 2].axis('off')
+        plt.colorbar(im, ax=axes[0, 2], fraction=0.046, pad=0.04)
         
         # Análisis estadístico avanzado
         mean_coherence = np.mean(coherence_map)
         std_coherence = np.std(coherence_map)
         high_coherence_ratio = np.sum(coherence_map > 0.7) / coherence_map.size
         
-        axes[1, 0].text(0.02, 0.98, 
+        axes[0, 2].text(0.02, 0.98, 
                        f'Coherencia Media: {mean_coherence:.3f}\n'
                        f'Desviación: {std_coherence:.3f}\n'
                        f'Alta Coherencia: {high_coherence_ratio:.1%}',
+                       transform=axes[0, 2].transAxes, 
+                       verticalalignment='top',
+                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+    
+    # Mapa ΔE
+    if delta_e_results and 'delta_e_map' in delta_e_results:
+        delta_e_map = delta_e_results['delta_e_map']
+        im_de = axes[1, 0].imshow(delta_e_map, cmap='hot', vmin=0, vmax=50)
+        axes[1, 0].set_title('Mapa de Diferencia de Color ΔE', fontsize=14, fontweight='bold')
+        axes[1, 0].axis('off')
+        plt.colorbar(im_de, ax=axes[1, 0], fraction=0.046, pad=0.04)
+        
+        axes[1, 0].text(0.02, 0.98, 
+                       f'ΔE Medio: {delta_e_results["delta_e_mean"]:.1f}\n'
+                       f'ΔE Máx: {delta_e_results["delta_e_max"]:.1f}\n'
+                       f'Desv: {delta_e_results["delta_e_std"]:.1f}',
                        transform=axes[1, 0].transAxes, 
                        verticalalignment='top',
                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+    
+    # Métricas de calidad
+    axes[1, 1].axis('off')
+    metrics_text = f"""
+    📊 MÉTRICAS DE CALIDAD
+    
+    SSIM (Similitud Estructural):
+      • Canal R: {ssim_results['ssim_r']:.3f}
+      • Canal G: {ssim_results['ssim_g']:.3f}
+      • Canal B: {ssim_results['ssim_b']:.3f}
+      • Promedio: {ssim_results['ssim_mean']:.3f}
+    
+    ΔE (Diferencia de Color):
+      • Media: {delta_e_results['delta_e_mean']:.2f}
+      • Máxima: {delta_e_results['delta_e_max']:.2f}
+      • Desviación: {delta_e_results['delta_e_std']:.2f}
+    
+    Interpretación:
+      • SSIM > 0.95: Excelente
+      • SSIM 0.90-0.95: Bueno
+      • SSIM < 0.90: Mejorable
+      
+      • ΔE < 5: Imperceptible
+      • ΔE 5-10: Ligeramente perceptible
+      • ΔE > 10: Claramente perceptible
+    """
+    
+    axes[1, 1].text(0.05, 0.95, metrics_text, transform=axes[1, 1].transAxes,
+                   verticalalignment='top', fontsize=11, linespacing=1.4,
+                   bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
     
     # Leyenda de interpretación biológica
     interpretation_text = """
@@ -926,103 +1092,37 @@ def create_comparison_plot(base_img, fused_img, coherence_map, output_path):
     • Adaptación cromática
     • Micro-oclusión
     • Efecto Fresnel
+    • Preservación de color base
     """
     
-    axes[1, 1].text(0.05, 0.95, interpretation_text, transform=axes[1, 1].transAxes,
+    axes[1, 2].text(0.05, 0.95, interpretation_text, transform=axes[1, 2].transAxes,
                    verticalalignment='top', fontsize=11, linespacing=1.4,
                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-    axes[1, 1].axis('off')
+    axes[1, 2].axis('off')
     
     plt.tight_layout()
     
     # Guardar la visualización
-    plot_filename = output_path.replace('_fusion.png', '_analysis.png')
+    plot_filename = output_path.replace('_fusion_enhanced.png', '_analysis_enhanced.png')
     plt.savefig(plot_filename, dpi=150, bbox_inches='tight', facecolor='white')
-    print(f"  Análisis guardado: {plot_filename}")
+    print(f"  Análisis mejorado guardado: {plot_filename}")
     
     # Mostrar en ventana
     plt.show()
 
-
-def fuse_pbr_layers(base_img, pbr_maps):
+def main_enhanced():
     """
-    Fusiona todas las capas PBR en una imagen final con fake shading 2.5D
+    Función principal mejorada
     """
-    print("  Iniciando fusión de capas PBR...")
-    result = base_img
-    
-    # Aplicar fake shading 2.5D
-    result = fake_shading_2_5d(
-        result,
-        pbr_maps.get('height'),
-        pbr_maps.get('normal'),
-        pbr_maps.get('ao'),
-        pbr_maps.get('roughness'),
-        pbr_maps.get('metallic')
-    )
-    
-    # 1. Aplicar oclusión ambiental primero
-    print("  Aplicando oclusión ambiental...")
-    result = apply_ambient_occlusion(result, pbr_maps.get('ao'))
-    
-    # 2. Aplicar efectos de material
-    print("  Aplicando propiedades de material...")
-    result = apply_roughness_metallic(
-        result, 
-        pbr_maps.get('roughness'), 
-        pbr_maps.get('metallic')
-    )
-    
-    # 3. Aplicar efectos especulares
-    print("  Aplicando efectos especulares...")
-    result = apply_specular_effects(result, pbr_maps.get('specular'))
-    
-    # 4. Aplicar desplazamiento de altura
-    print("  Aplicando mapa de altura...")
-    result = apply_height_displacement(result, pbr_maps.get('height'))
-    
-    # 5. Aplicar iluminación desde mapa normal
-    print("  Aplicando iluminación normal...")
-    result = blend_normal_lighting(result, pbr_maps.get('normal'), pbr_maps.get('height'))
-    
-    # 6. Añadir efectos emisivos (último - aditivo)
-    print("  Aplicando efectos emisivos...")
-    result = blend_emissive(result, pbr_maps.get('emissive'))
-    
-    # 7. Aplicar opacidad si existe
-    if 'opacity' in pbr_maps:
-        print("  Aplicando opacidad...")
-        opacity_map = pbr_maps['opacity']
-        if opacity_map.size != result.size:
-            opacity_map = opacity_map.resize(result.size, Image.Resampling.LANCZOS)
-            
-        opacity_array = np.array(opacity_map, dtype=np.float32)
-        if len(opacity_array.shape) == 3:
-            opacity_array = np.mean(opacity_array, axis=2)
-        opacity_array = opacity_array / 255.0
-        
-        result_array = np.array(result, dtype=np.float32)
-        
-        # Combinar con fondo negro basado en opacidad
-        background = np.zeros_like(result_array)
-        final_array = result_array * opacity_array[..., np.newaxis] + background * (1 - opacity_array[..., np.newaxis])
-        result = Image.fromarray(final_array.astype(np.uint8))
-    
-    print("  Fusión completada!")
-    return result
-
-
-def main():
-    test_dir = Path("b")
+    test_dir = Path(INPUT)
     
     if not test_dir.exists():
         print(f"Error: Directorio {test_dir} no encontrado")
         return
     
-    # Patrón para imágenes base
     base_pattern = re.compile(r'(.+)_r(\d{3})_(\d{4})\.png')
-    
     base_images = []
+    
     for file in test_dir.glob("*.png"):
         match = base_pattern.match(file.name)
         if match and not any(map_type in file.name for map_type in [
@@ -1045,7 +1145,7 @@ def main():
         
         print(f"\nProcesando: {base_image_path.name}")
         
-        # Cargar imagen base preservando alpha
+        # Cargar imagen base
         try:
             base_img = Image.open(base_image_path)
             if base_img.mode != 'RGBA':
@@ -1063,33 +1163,44 @@ def main():
             print("  No se encontraron mapas PBR para esta imagen base")
             continue
         
-        # Fusionar capas con enfoque biológico
+        # Fusionar capas con método mejorado
         try:
-            fused_image = fuse_pbr_layers(base_img, pbr_maps)
+            fused_image = enhanced_fuse_pbr_layers(base_img, pbr_maps)
             
             # Guardar resultado
-            output_filename = f"{base_name}_r{rotation}_{variant}_fusion.png"
+            output_filename = f"{base_name}_r{rotation}_{variant}_fusion_enhanced.png"
             output_path = test_dir / output_filename
             fused_image.save(output_path, optimize=True)
-            print(f"  Imagen fusionada guardada: {output_path}")
+            print(f"  Imagen fusionada MEJORADA guardada: {output_path}")
             
-            # Calcular mapa de coherencia mejorado
+            # Análisis de calidad
+            print("  Realizando análisis de calidad...")
+            ssim_results = apply_ssim_analysis(base_img, fused_image)
+            delta_e_results = apply_delta_e_analysis(base_img, fused_image)
+            
+            print(f"  SSIM: {ssim_results['ssim_mean']:.3f}")
+            print(f"  ΔE medio: {delta_e_results['delta_e_mean']:.1f}")
+            
+            # Calcular mapa de coherencia
             coherence_map = calculate_pbr_coherence(pbr_maps, base_img.size)
             
-            # Crear visualización comparativa
-            create_comparison_plot(base_img, fused_image, coherence_map, str(output_path))
+            # Crear visualización comparativa MEJORADA
+            create_enhanced_comparison_plot(
+                base_img, fused_image, coherence_map, 
+                ssim_results, delta_e_results, str(output_path)
+            )
             
         except Exception as e:
-            print(f"  Error durante la fusión biológica: {e}")
+            print(f"  Error durante la fusión mejorada: {e}")
             import traceback
             traceback.print_exc()
 
 if __name__ == "__main__":
-    # Configurar matplotlib para mejor visualización
+    # Configurar matplotlib
     plt.rcParams['figure.figsize'] = [12, 8]
     plt.rcParams['figure.dpi'] = 100
     plt.rcParams['savefig.dpi'] = 150
     plt.rcParams['font.family'] = 'DejaVu Sans'
     
-    main()
-    
+    # Ejecutar versión mejorada
+    main_enhanced()
