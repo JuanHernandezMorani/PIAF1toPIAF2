@@ -9,7 +9,16 @@ import logging
 import numpy as np
 from PIL import Image
 
-from .pipeline import generate_physically_accurate_pbr_maps
+from .pipeline import (
+    generate_physically_accurate_pbr_maps,
+    _detect_and_correct_flat_maps_v5,
+    _generate_emissive_map_v5,
+    _generate_metallic_map_v5,
+    _generate_normal_map_v5,
+    _generate_roughness_map_v5,
+    automated_quality_report_v5,
+    validate_pbr_coherence_v5,
+)
 from .validation import _validate_halo_elimination
 
 LOGGER = logging.getLogger("pixel_pipeline.pbr.layered")
@@ -107,7 +116,115 @@ def _smart_alpha_composition_improved(foreground: Image.Image, background: Image
 def _smart_alpha_composition(foreground: Image.Image, background: Image.Image) -> Image.Image:
     """Backward compatible wrapper that uses the improved composition."""
 
-    return _smart_alpha_composition_improved(foreground, background)
+    try:
+        composed = _smart_alpha_composition_v5(foreground, background)
+        cleaned = remove_alpha_halo_v5(composed)
+        return Image.fromarray((cleaned * 255.0).astype(np.uint8), mode="RGBA")
+    except Exception:  # pragma: no cover - fallback for environments without cv2/scipy
+        return _smart_alpha_composition_improved(foreground, background)
+
+
+def _smart_alpha_composition_v5(
+    foreground: Image.Image | np.ndarray, background: Image.Image | np.ndarray
+) -> np.ndarray:
+    """Advanced anti-halo alpha composition returning a normalised RGBA array."""
+
+    import numpy as _np
+
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - optional dependency safeguard
+        raise RuntimeError("OpenCV is required for v5 alpha composition") from exc
+
+    fg = _np.asarray(foreground, dtype=_np.float32)
+    bg = _np.asarray(background, dtype=_np.float32)
+
+    if fg.ndim == 2:
+        fg = _np.repeat(fg[..., None], 4, axis=2)
+    if bg.ndim == 2:
+        bg = _np.repeat(bg[..., None], 4, axis=2)
+
+    if fg.max() > 1.0:
+        fg /= 255.0
+    if bg.max() > 1.0:
+        bg /= 255.0
+
+    if fg.shape[-1] < 4:
+        alpha_channel = _np.ones(fg.shape[:2], dtype=_np.float32)
+        fg = _np.dstack((fg[..., :3], alpha_channel))
+    if bg.shape[-1] < 4:
+        alpha_channel = _np.zeros(bg.shape[:2], dtype=_np.float32)
+        bg = _np.dstack((bg[..., :3], alpha_channel))
+
+    fg_rgb = _np.clip(fg[..., :3], 0.0, 1.0)
+    fg_alpha = _np.clip(fg[..., 3], 0.0, 1.0)
+    bg_rgb = _np.clip(bg[..., :3], 0.0, 1.0)
+    bg_alpha = _np.clip(bg[..., 3], 0.0, 1.0)
+
+    alpha_out = fg_alpha + bg_alpha * (1.0 - fg_alpha)
+    alpha_safe = _np.where(alpha_out < 1e-8, 1.0, alpha_out)
+
+    rgb_out = (
+        fg_rgb * fg_alpha[..., None]
+        + bg_rgb * bg_alpha[..., None] * (1.0 - fg_alpha[..., None])
+    ) / alpha_safe[..., None]
+
+    alpha_8bit = (_np.clip(alpha_out, 0.0, 1.0) * 255).astype(_np.uint8)
+    edges_fine = cv2.Canny(alpha_8bit, 20, 60).astype(_np.float32) / 255.0
+    edges_wide = cv2.Canny(alpha_8bit, 10, 30).astype(_np.float32) / 255.0
+    edge_mask = _np.clip(edges_fine + edges_wide * 0.5, 0.0, 1.0)
+
+    kernel = _np.ones((2, 2), _np.uint8)
+    edge_mask_dilated = cv2.dilate(edge_mask, kernel, iterations=1)
+
+    alpha_guided = cv2.GaussianBlur(alpha_out.astype(_np.float32), (3, 3), 0.8)
+    blend_weights = edge_mask_dilated[..., None] * alpha_guided[..., None]
+
+    rgb_blurred = cv2.bilateralFilter(rgb_out.astype(_np.float32), 5, 15, 15)
+    rgb_corrected = rgb_out * (1.0 - blend_weights) + rgb_blurred * blend_weights
+
+    near_zero_alpha = alpha_out < 0.01
+    rgb_corrected[near_zero_alpha] = bg_rgb[near_zero_alpha]
+
+    return _np.clip(_np.dstack((rgb_corrected, alpha_out)), 0.0, 1.0)
+
+
+def remove_alpha_halo_v5(
+    rgba_image: np.ndarray | Image.Image, dilation_iterations: int = 2
+) -> np.ndarray:
+    """Post-processing routine that removes residual halo artefacts."""
+
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - optional dependency safeguard
+        raise RuntimeError("OpenCV is required for halo removal") from exc
+
+    if isinstance(rgba_image, Image.Image):
+        img = np.asarray(rgba_image.convert("RGBA"), dtype=np.float32)
+    else:
+        img = np.asarray(rgba_image, dtype=np.float32)
+
+    if img.max() > 1.0:
+        img /= 255.0
+
+    rgb, alpha = img[..., :3].copy(), np.clip(img[..., 3], 0.0, 1.0)
+    alpha_8bit = (alpha * 255).astype(np.uint8)
+    edges = cv2.Canny(alpha_8bit, 15, 45)
+
+    kernel = np.ones((3, 3), np.uint8)
+    halo_region = cv2.dilate(edges, kernel, iterations=dilation_iterations)
+    halo_mask = halo_region.astype(np.float32) / 255.0
+
+    if halo_mask.max() > 0.0:
+        for channel in range(3):
+            channel_blur = cv2.medianBlur((rgb[..., channel] * 255).astype(np.uint8), 3)
+            rgb[..., channel] = np.where(
+                halo_mask > 0,
+                channel_blur.astype(np.float32) / 255.0,
+                rgb[..., channel],
+            )
+
+    return np.clip(np.dstack((rgb, alpha)), 0.0, 1.0)
 
 
 def _chromatic_pbr_integration(
@@ -355,9 +472,83 @@ class PBRLayerManager:
         return composed
 
 
+def execute_physically_correct_pbr_v5(
+    input_foreground: Image.Image | np.ndarray,
+    input_background: Image.Image | np.ndarray,
+    material_class: str = "default",
+) -> Dict[str, object]:
+    """Pipeline orchestration that applies the v5 physical corrections."""
+
+    if isinstance(input_foreground, Image.Image):
+        foreground = input_foreground.convert("RGBA")
+    else:
+        foreground = Image.fromarray(np.asarray(input_foreground, dtype=np.uint8)).convert("RGBA")
+
+    if isinstance(input_background, Image.Image):
+        background = input_background.convert("RGBA")
+    else:
+        background = Image.fromarray(np.asarray(input_background, dtype=np.uint8)).convert("RGBA")
+
+    try:
+        composed_array = _smart_alpha_composition_v5(foreground, background)
+        cleaned_array = remove_alpha_halo_v5(composed_array)
+        composed_image = Image.fromarray((cleaned_array * 255.0).astype(np.uint8), mode="RGBA")
+    except Exception:
+        composed_image = _smart_alpha_composition_improved(foreground, background)
+
+    base_image = composed_image.convert("RGB")
+    pipeline_result = generate_physically_accurate_pbr_maps(base_image, None, {})
+    analysis = pipeline_result.get("analysis")
+
+    maps = dict(pipeline_result.get("maps", {}))
+    metallic_candidate = maps.get("metallic")
+    roughness_candidate = maps.get("roughness")
+
+    maps["metallic"] = _generate_metallic_map_v5(
+        base_image,
+        roughness_candidate,
+        analysis,
+        material_class=material_class,
+        candidate=metallic_candidate,
+    )
+    maps["roughness"] = _generate_roughness_map_v5(
+        base_image,
+        analysis,
+        maps.get("metallic"),
+        material_class,
+    )
+    maps["metallic"] = _generate_metallic_map_v5(
+        base_image,
+        maps.get("roughness"),
+        analysis,
+        material_class=material_class,
+        candidate=maps.get("metallic"),
+    )
+    maps["emissive"] = _generate_emissive_map_v5(
+        base_image,
+        analysis,
+        material_class=material_class,
+    )
+    maps["normal"] = _generate_normal_map_v5(base_image, analysis)
+
+    maps = _detect_and_correct_flat_maps_v5(maps, base_image, analysis, material_class)
+
+    validation = validate_pbr_coherence_v5(base_image, maps, material_class)
+    quality_report = automated_quality_report_v5(validation)
+
+    return {
+        "final_image": base_image,
+        "pbr_maps": maps,
+        "validation": validation,
+        "quality_report": quality_report,
+        "pipeline_result": pipeline_result,
+    }
+
+
 __all__ = [
     "LAYERED_PBR_CONFIG",
     "LayeredPBRCache",
     "PBRBaseManager",
     "PBRLayerManager",
+    "execute_physically_correct_pbr_v5",
 ]

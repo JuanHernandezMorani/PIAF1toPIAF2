@@ -493,6 +493,121 @@ def validate_pbr_coherence_corregido(
     return issues
 
 
+def validate_pbr_coherence_v5(
+    base_image: Image.Image,
+    maps: Mapping[str, Image.Image],
+    material_class: str = "default",
+) -> Dict[str, object]:
+    """Enhanced coherence validation with adaptive thresholds for v5 pipeline."""
+
+    issues: List[str] = []
+    warnings: List[str] = []
+    corrections: Dict[str, str] = {}
+
+    base_array = np.asarray(base_image.convert("L"), dtype=np.float32)
+    base_std = float(np.std(base_array))
+
+    results = {
+        "passed": True,
+        "issues": issues,
+        "warnings": warnings,
+        "corrections_applied": corrections,
+    }
+
+    for map_name, map_img in maps.items():
+        if not isinstance(map_img, Image.Image):
+            continue
+
+        map_array = np.asarray(map_img.convert("L"), dtype=np.float32)
+        map_std = float(np.std(map_array))
+
+        if map_std < 1.5:
+            issues.append(f"{map_name.upper()} → CRITICAL_FLATNESS (std: {map_std:.2f})")
+            corrections[map_name] = "REPROCESS_WITH_CONTRAST_ENHANCEMENT"
+            results["passed"] = False
+
+        map_range = float(map_array.max() - map_array.min())
+        if map_range < 50:
+            warnings.append(f"{map_name.upper()} → LOW_DYNAMIC_RANGE ({map_range:.1f})")
+
+        if map_name not in {"emissive", "transmission"} and map_std > 0 and base_std > 0:
+            with np.errstate(all="ignore"):
+                correlation = np.corrcoef(base_array.flatten(), map_array.flatten())[0, 1]
+            if not np.isfinite(correlation) or abs(float(correlation)) < 0.2:
+                issues.append(
+                    f"{map_name.upper()} → SUSPICIOUS_CORRELATION ({float(correlation):.3f})"
+                )
+
+        if map_name == "metallic":
+            metallic_mean = float(np.mean(map_array))
+            if metallic_mean > 200:
+                issues.append("METALLIC → EXCESSIVE_METALLIC_CONTENT")
+            if metallic_mean < 10 and "metal" in material_class.lower():
+                warnings.append("METALLIC → POTENTIAL_UNDERESTIMATION")
+
+        if map_name == "emissive":
+            emissive_std = float(np.std(map_array))
+            if emissive_std > 80:
+                issues.append("EMISSIVE → NOISY_EMISSIVE_MAP")
+            high_emissive = float(np.sum(map_array > 200) / map_array.size)
+            if high_emissive > 0.3:
+                issues.append("EMISSIVE → EXCESSIVE_EMISSIVE_AREA")
+
+    if "metallic" in maps and "roughness" in maps:
+        metallic_arr = np.asarray(maps["metallic"].convert("L"), dtype=np.float32)
+        rough_arr = np.asarray(maps["roughness"].convert("L"), dtype=np.float32)
+        if np.std(metallic_arr) > 0 and np.std(rough_arr) > 0:
+            with np.errstate(all="ignore"):
+                metal_rough_corr = np.corrcoef(
+                    metallic_arr.flatten(), rough_arr.flatten()
+                )[0, 1]
+            if metal_rough_corr > -0.3:
+                warnings.append(
+                    f"CROSS-MAP → WEAK_METAL_ROUGH_CORRELATION ({float(metal_rough_corr):.3f})"
+                )
+
+    return results
+
+
+def automated_quality_report_v5(validation_results: Mapping[str, object]) -> Dict[str, object]:
+    """Generate an automatic quality report based on v5 validation results."""
+
+    report = {
+        "overall_score": 100,
+        "critical_issues": 0,
+        "warnings": 0,
+        "recommendations": [],
+    }
+
+    for issue in validation_results.get("issues", []):
+        report["critical_issues"] += 1
+        report["overall_score"] -= 15
+        if "FLATNESS" in issue:
+            report["recommendations"].append("Reprocess map with logarithmic normalization")
+        elif "CORRELATION" in issue:
+            report["recommendations"].append("Check material classification and reprocess")
+        elif "METALLIC" in issue:
+            report["recommendations"].append("Review metallic detection parameters")
+        elif "EMISSIVE" in issue:
+            report["recommendations"].append("Apply emissive saturation correction")
+
+    for warning in validation_results.get("warnings", []):
+        report["warnings"] += 1
+        report["overall_score"] -= 5
+
+    score = report["overall_score"]
+    if score >= 85:
+        report["quality"] = "EXCELLENT"
+    elif score >= 70:
+        report["quality"] = "GOOD"
+    elif score >= 50:
+        report["quality"] = "ACCEPTABLE"
+    else:
+        report["quality"] = "POOR - REQUIRES REPROCESSING"
+
+    return report
+
+
 __all__ = [
     "VALIDATION_RULES",
     "ValidationReport",
@@ -510,4 +625,6 @@ __all__ = [
     "_validate_transmission_integrity",
     "validate_all_maps",
     "validate_pbr_coherence_corregido",
+    "validate_pbr_coherence_v5",
+    "automated_quality_report_v5",
 ]
