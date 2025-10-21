@@ -8,6 +8,11 @@ import logging
 import numpy as np
 from PIL import Image
 
+try:  # pragma: no cover - optional dependency
+    from scipy import ndimage as _scipy_ndimage
+except ImportError:  # pragma: no cover - graceful fallback
+    _scipy_ndimage = None
+
 from .alpha_utils import apply_alpha, apply_alpha_to_maps, derive_alpha_map
 from .analysis import AnalysisResult, analyze_image_comprehensive, calculate_entropy
 from .generation import (
@@ -200,9 +205,160 @@ def _safe_map_generation(
     return np.clip(array, 0.0, 1.0)
 
 
+def _apply_gaussian_filter(array: np.ndarray, sigma: float) -> np.ndarray:
+    if _scipy_ndimage is not None:
+        return _scipy_ndimage.gaussian_filter(array, sigma=sigma)
+
+    kernel = np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=np.float32) / 16.0
+    padded = np.pad(array, 1, mode="edge")
+    result = (
+        kernel[0, 0] * padded[:-2, :-2]
+        + kernel[0, 1] * padded[:-2, 1:-1]
+        + kernel[0, 2] * padded[:-2, 2:]
+        + kernel[1, 0] * padded[1:-1, :-2]
+        + kernel[1, 1] * padded[1:-1, 1:-1]
+        + kernel[1, 2] * padded[1:-1, 2:]
+        + kernel[2, 0] * padded[2:, :-2]
+        + kernel[2, 1] * padded[2:, 1:-1]
+        + kernel[2, 2] * padded[2:, 2:]
+    )
+    return result.astype(np.float32, copy=False)
+
+
+def _sobel_gradients(array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if _scipy_ndimage is not None:
+        grad_x = _scipy_ndimage.sobel(array, axis=1)
+        grad_y = _scipy_ndimage.sobel(array, axis=0)
+    else:
+        grad_y, grad_x = np.gradient(array.astype(np.float32, copy=False))
+    return grad_x.astype(np.float32, copy=False), grad_y.astype(np.float32, copy=False)
+
+
+def _generate_fuzz_map(analysis_result: AnalysisResult, base_image: Image.Image) -> Tuple[np.ndarray, bool]:
+    width, height = base_image.size
+    target_shape = (height, width)
+    fallback = np.full(target_shape, 0.1, dtype=np.float32)
+
+    if not isinstance(analysis_result, AnalysisResult):
+        LOGGER.warning(
+            "Fuzz map generation received invalid analysis type: %s", type(analysis_result)
+        )
+        return fallback, False
+
+    data_valid = True
+
+    def _prepare(attribute: str, default_value: float) -> np.ndarray:
+        nonlocal data_valid
+        value = getattr(analysis_result, attribute, None)
+        if value is None:
+            LOGGER.debug("Fuzz map: attribute %s missing; using default", attribute)
+            data_valid = False
+            return np.full(target_shape, default_value, dtype=np.float32)
+        try:
+            array = np.asarray(value, dtype=np.float32)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.debug("Fuzz map: failed to convert %s (%s)", attribute, exc)
+            data_valid = False
+            return np.full(target_shape, default_value, dtype=np.float32)
+
+        if array.ndim >= 3:
+            array = array[..., 0]
+
+        if array.shape != target_shape:
+            LOGGER.debug(
+                "Fuzz map: attribute %s shape %s mismatched target %s", attribute, array.shape, target_shape
+            )
+            data_valid = False
+            return np.full(target_shape, default_value, dtype=np.float32)
+
+        if not np.isfinite(array).all():
+            LOGGER.debug("Fuzz map: attribute %s contains non-finite values", attribute)
+            data_valid = False
+            array = np.nan_to_num(array, nan=default_value, posinf=default_value, neginf=default_value)
+
+        max_val = float(array.max()) if array.size else default_value
+        min_val = float(array.min()) if array.size else default_value
+        if max_val > 1.0 + 1e-6 or min_val < -1e-6:
+            array = np.clip(array, 0.0, 255.0)
+            if float(array.max()) > 1.0 + 1e-6:
+                array = array / 255.0
+
+        return np.clip(array, 0.0, 1.0).astype(np.float32, copy=False)
+
+    microsurface = _prepare("microsurface_data", 0.5)
+    fuzz_potential = _prepare("fuzz_potential", 0.3)
+
+    fuzz_map = np.clip(microsurface * fuzz_potential, 0.0, 1.0)
+    fuzz_map = _apply_gaussian_filter(fuzz_map, sigma=1.0)
+
+    min_val = float(fuzz_map.min()) if fuzz_map.size else 0.0
+    max_val = float(fuzz_map.max()) if fuzz_map.size else 0.0
+    if max_val - min_val > 1e-8:
+        fuzz_map = (fuzz_map - min_val) / (max_val - min_val + 1e-8)
+    else:
+        data_valid = False
+        fuzz_map = fallback
+
+    fuzz_map = np.clip(fuzz_map, 0.0, 1.0).astype(np.float32, copy=False)
+    return fuzz_map, data_valid and np.isfinite(fuzz_map).all()
+
+
+def _enhance_transmission_correlation(
+    transmission_map: Image.Image,
+    base_image: Image.Image,
+    foreground_mask: Image.Image | np.ndarray | None,
+) -> Image.Image:
+    try:
+        width, height = transmission_map.size
+        transmission_array = np.asarray(transmission_map.convert("L"), dtype=np.float32) / 255.0
+
+        resized_base = base_image.convert("RGB").resize((width, height), Image.Resampling.BILINEAR)
+        base_array = np.asarray(resized_base, dtype=np.float32) / 255.0
+
+        if foreground_mask is None:
+            mask_array = np.ones((height, width), dtype=np.float32)
+        elif isinstance(foreground_mask, Image.Image):
+            mask_resized = foreground_mask.resize((width, height), Image.Resampling.BILINEAR)
+            mask_array = np.asarray(mask_resized, dtype=np.float32) / 255.0
+        else:
+            mask_array = np.asarray(foreground_mask, dtype=np.float32)
+            if mask_array.ndim == 3:
+                mask_array = mask_array[..., 0]
+            if mask_array.shape != (height, width):
+                mask_image = Image.fromarray((np.clip(mask_array, 0.0, 1.0) * 255).astype(np.uint8), mode="L")
+                mask_image = mask_image.resize((width, height), Image.Resampling.BILINEAR)
+                mask_array = np.asarray(mask_image, dtype=np.float32) / 255.0
+            else:
+                if mask_array.max() > 1.0 + 1e-6 or mask_array.min() < -1e-6:
+                    mask_array = np.clip(mask_array, 0.0, 255.0)
+                    if mask_array.max() > 1.0 + 1e-6:
+                        mask_array = mask_array / 255.0
+
+        mask_array = np.clip(mask_array, 0.0, 1.0).astype(np.float32, copy=False)
+
+        gray_base = base_array.mean(axis=2)
+        grad_x, grad_y = _sobel_gradients(gray_base)
+        texture_strength = np.sqrt(grad_x ** 2 + grad_y ** 2)
+        texture_max = float(texture_strength.max()) if texture_strength.size else 0.0
+        if texture_max > 1e-8:
+            texture_strength = texture_strength / texture_max
+
+        texture_influence = 0.3
+        enhanced_transmission = transmission_array * (1.0 - texture_influence) + texture_strength * texture_influence
+        enhanced_transmission = (
+            enhanced_transmission * mask_array + transmission_array * (1.0 - mask_array) * 0.1
+        )
+
+        enhanced_transmission = np.clip(enhanced_transmission, 0.0, 1.0)
+        return Image.fromarray((enhanced_transmission * 255.0).astype(np.uint8), mode="L")
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.warning("Transmission enhancement failed: %s", exc)
+        return transmission_map
+
+
 def _robust_fuzz_generation(base_image: Image.Image, analysis: AnalysisResult) -> Tuple[Image.Image, bool]:
     candidate = _generate_optional_map("fuzz", generate_fuzz_enhanced, base_image, analysis)
-    fuzz_array = _safe_map_generation(candidate, analysis, neutral=0.5)
+    fuzz_array, fuzz_operational = _generate_fuzz_map(analysis, base_image)
     valid = np.isfinite(fuzz_array).all() and fuzz_array.size > 0
     detail_source = analysis.geometric_features.get("edge_map") if analysis.geometric_features else None
     detail_map = _safe_map_generation(detail_source, analysis, neutral=0.5)
@@ -215,9 +371,12 @@ def _robust_fuzz_generation(base_image: Image.Image, analysis: AnalysisResult) -
         fuzz_operational = False
     else:
         fuzz_array = np.clip(fuzz_array, 0.0, 1.0)
-        fuzz_operational = True
+        fuzz_operational = fuzz_operational and True
 
-    alpha_channel = np.asarray(candidate.convert("RGBA").split()[-1], dtype=np.float32) / 255.0
+    candidate_rgba = candidate.convert("RGBA")
+    if candidate_rgba.size != base_image.size:
+        candidate_rgba = candidate_rgba.resize(base_image.size, Image.BILINEAR)
+    alpha_channel = np.asarray(candidate_rgba.split()[-1], dtype=np.float32) / 255.0
     fuzz_rgb = np.repeat(fuzz_array[..., None], 3, axis=2)
     combined = np.dstack((fuzz_rgb, alpha_channel[..., None]))
     result = Image.fromarray((combined * 255.0).astype(np.uint8), mode="RGBA")
@@ -232,7 +391,6 @@ def _preserve_foreground_texture_transmission(
 ) -> Tuple[Image.Image, List[str]]:
     issues: List[str] = []
 
-    transmission = _safe_map_generation(candidate, analysis, neutral=0.0)
     fg_texture = _safe_map_generation(foreground.convert("L"), analysis, neutral=0.0)
     bg_texture = (
         _safe_map_generation(background.convert("L"), analysis, neutral=0.0)
@@ -245,6 +403,10 @@ def _preserve_foreground_texture_transmission(
         alpha_map = np.clip(alpha.astype(np.float32), 0.0, 1.0)
     else:
         alpha_map = _safe_map_generation(candidate.split()[-1] if "A" in candidate.getbands() else None, analysis, neutral=0.0)
+
+    mask_image = Image.fromarray((np.clip(alpha_map, 0.0, 1.0) * 255).astype(np.uint8), mode="L")
+    enhanced_candidate = _enhance_transmission_correlation(candidate, foreground, mask_image)
+    transmission = _safe_map_generation(enhanced_candidate, analysis, neutral=0.0)
 
     padded = np.pad(fg_texture, ((1, 1), (1, 1)), mode="edge")
     blurred = np.zeros_like(fg_texture)
@@ -268,7 +430,7 @@ def _preserve_foreground_texture_transmission(
             if not np.isfinite(corr) or corr < 0.2:
                 issues.append("low_texture_correlation")
 
-    alpha_channel = np.asarray(candidate.convert("RGBA").split()[-1], dtype=np.float32) / 255.0
+    alpha_channel = np.clip(alpha_map, 0.0, 1.0)
     preserved_rgb = np.repeat(preserved[..., None], 3, axis=2)
     combined = np.dstack((np.clip(preserved_rgb, 0.0, 1.0), alpha_channel[..., None]))
     image = Image.fromarray((combined * 255.0).astype(np.uint8), mode="RGBA")
