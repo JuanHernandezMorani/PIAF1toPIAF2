@@ -392,9 +392,12 @@ class RecolorPipeline:
         self.config = cfg
         self.input_path = Path(cfg["PATH_INPUT"])
         self.output_path = Path(cfg["PATH_OUTPUT"])
+        self.input_maps_path = Path(cfg.get("PATH_INPUT_MAPS", config.PATH_INPUT_MAPS))
         self.background_path = Path(cfg["PATH_BACKGROUNDS"])
         ensure_dir(self.output_path)
+        ensure_dir(self.input_maps_path)
         self.file_manager = SafeFileManager(self.output_path)
+        self.input_maps_manager = SafeFileManager(self.input_maps_path)
         self.rotation_angles: Tuple[int, ...] = tuple(cfg.get("ROTATION_ANGLES", (0,)))  # type: ignore[arg-type]
         self.max_variants: int = int(cfg.get("MAX_VARIANTS", 200))
         seed = cfg.get("RANDOM_SEED")
@@ -523,6 +526,7 @@ class RecolorPipeline:
             self.logger.exception("Failed to open %s: %s", path, exc)
             return
 
+        self._persist_input_maps(path.stem, rgba)
         variants = list(self._generate_variants(path.stem, rgba))
         persisted = 0
         for variant in variants[: self.max_variants]:
@@ -900,12 +904,25 @@ class RecolorPipeline:
         return restored
     
     
+    def _persist_input_maps(self, stem: str, image: Image.Image) -> None:
+        base_name = stem
+        maps, _ = self._generate_maps(
+            image,
+            None,
+            foreground_image=None,
+            preserve_original_alpha=True,
+        )
+        for map_name, map_image in maps.items():
+            map_path = self.input_maps_path / f"{base_name}_{map_name}.png"
+            self.input_maps_manager.atomic_save(map_image, map_path)
+
     def _generate_maps(
         self,
         base_image: Image.Image,
-        background: Image.Image,
+        background: Image.Image | None,
         *,
         foreground_image: Image.Image | None = None,
+        preserve_original_alpha: bool = False,
     ) -> tuple[Dict[str, Image.Image], np.ndarray]:
         baseline: Dict[str, Image.Image] = {}
         for category, generators in self.map_generators.items():
@@ -915,6 +932,12 @@ class RecolorPipeline:
                 except Exception as exc:  # pragma: no cover - logging path
                     self.logger.exception("Failed to generate %s map: %s", map_name, exc)
 
+        pbr_result = generate_physically_accurate_pbr_maps(base_image, background, baseline)
+        final_maps: Dict[str, Image.Image] = pbr_result["maps"]
+        analysis = pbr_result.get("analysis")
+        analysis_obj = analysis if hasattr(analysis, "mask") else None
+        alpha_map = pbr_result.get("alpha")
+
         if isinstance(alpha_map, np.ndarray):
             derived_alpha = alpha_map
         else:
@@ -922,13 +945,11 @@ class RecolorPipeline:
 
         if foreground_image is not None:
             derived_alpha = self._restore_background_alpha(derived_alpha, foreground_image)
-            final_maps = apply_alpha_to_maps(final_maps, derived_alpha)
+        elif preserve_original_alpha:
+            rgba = base_image.convert("RGBA")
+            derived_alpha = np.asarray(rgba.split()[-1], dtype=np.float32) / 255.0
 
-        pbr_result = generate_physically_accurate_pbr_maps(base_image, background, baseline)
-        final_maps: Dict[str, Image.Image] = pbr_result["maps"]
-        analysis = pbr_result.get("analysis")
-        analysis_obj = analysis if hasattr(analysis, "mask") else None
-        alpha_map = pbr_result.get("alpha")
+        final_maps = apply_alpha_to_maps(final_maps, derived_alpha)
 
         quality_checks = pbr_result.get("quality_checks", {})
         if quality_checks:

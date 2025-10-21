@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=config.PATH_INPUT, help="Input directory with sprites")
     parser.add_argument("--background", type=Path, default=config.PATH_BACKGROUNDS, help="Directory with background images")
     parser.add_argument("--output", type=Path, default=config.PATH_OUTPUT, help="Directory to write generated variants")
+    parser.add_argument(
+        "--input-maps",
+        type=Path,
+        default=config.PATH_INPUT_MAPS,
+        help="Directory to write PBR maps for the original input sprites",
+    )
     parser.add_argument("--threads", type=int, default=8, help="Number of worker threads")
     parser.add_argument("--max-variants", type=int, default=500, help="Maximum number of variants per sprite")
     parser.add_argument("--gpu", action="store_true", help="Enable GPU acceleration if available")
@@ -37,6 +43,7 @@ def build_runtime_config(args: argparse.Namespace) -> Dict[str, object]:
         "PATH_INPUT": args.input.resolve(),
         "PATH_BACKGROUNDS": args.background.resolve(),
         "PATH_OUTPUT": args.output.resolve(),
+        "PATH_INPUT_MAPS": args.input_maps.resolve(),
         "THREADS": args.threads,
         "MAX_VARIANTS": args.max_variants,
         "RANDOM_SEED": args.seed,

@@ -11,6 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PATH_INPUT = BASE_DIR / "input"
 PATH_BACKGROUNDS = BASE_DIR / "backgrounds"
 PATH_OUTPUT = BASE_DIR / "variants"
+PATH_INPUT_MAPS = BASE_DIR / "inputMaps"
 
 PIXEL_RESOLUTION = 16
 USE_HLS_METHOD = True
@@ -55,6 +56,7 @@ class PipelineConfig:
     input_path: Path = PATH_INPUT
     backgrounds_path: Path = PATH_BACKGROUNDS
     output_path: Path = PATH_OUTPUT
+    input_maps_path: Path = PATH_INPUT_MAPS
     pixel_resolution: int = PIXEL_RESOLUTION
     use_hls_method: bool = USE_HLS_METHOD
     use_real_backgrounds_only: bool = USE_REAL_BACKGROUNDS_ONLY
@@ -73,6 +75,7 @@ class PipelineConfig:
             "PATH_INPUT": self.input_path,
             "PATH_BACKGROUNDS": self.backgrounds_path,
             "PATH_OUTPUT": self.output_path,
+            "PATH_INPUT_MAPS": self.input_maps_path,
             "PIXEL_RESOLUTION": self.pixel_resolution,
             "USE_HLS_METHOD": self.use_hls_method,
             "USE_REAL_BACKGROUNDS_ONLY": self.use_real_backgrounds_only,
