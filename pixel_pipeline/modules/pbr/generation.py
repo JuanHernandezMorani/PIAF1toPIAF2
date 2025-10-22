@@ -1,6 +1,7 @@
 """Map generation helpers for the physically accurate PBR pipeline."""
 from __future__ import annotations
 
+import logging
 from typing import Dict, Iterable, Tuple
 
 import numpy as np
@@ -9,6 +10,8 @@ from PIL import Image, ImageFilter
 from ._image_features import _filter_with_edge_handling, ensure_variation, gaussian_blur, normalize01
 from .analysis import AnalysisResult
 from .parameters import CRITICAL_PARAMETERS
+
+LOGGER = logging.getLogger("pixel_pipeline.pbr.generation")
 
 MAX_IOR = max(CRITICAL_PARAMETERS["IOR_TRANSLUCENT_RANGES"].values())
 IOR_RANGE = max(MAX_IOR - CRITICAL_PARAMETERS["IOR_OPAQUE_DEFAULT"], 1e-3)
@@ -25,6 +28,71 @@ def _from_single_channel(array: np.ndarray, alpha: Image.Image | None = None) ->
     if alpha is None:
         alpha = Image.new("L", gray.size, 255)
     return Image.merge("RGBA", (gray, gray, gray, alpha))
+
+
+def _revive_uniform_map(
+    map_image: Image.Image, base_image: Image.Image | None, threshold: float = 1e-4
+) -> Image.Image:
+    """Blend base-image detail back into maps detected as uniform."""
+
+    if base_image is None:
+        return map_image
+
+    rgba = map_image.convert("RGBA")
+    data = np.asarray(rgba, dtype=np.float32) / 255.0
+    if data.size == 0 or float(np.std(data[..., :3])) >= threshold:
+        return map_image
+
+    base_rgba = base_image.convert("RGBA").resize(rgba.size, Image.BILINEAR)
+    base_data = np.asarray(base_rgba, dtype=np.float32) / 255.0
+    base_rgb = base_data[..., :3]
+
+    gray = np.dot(base_rgb, np.array([0.299, 0.587, 0.114], dtype=np.float32))
+    gray_image = Image.fromarray((np.clip(gray, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L")
+    edge_image = gray_image.filter(ImageFilter.FIND_EDGES).filter(ImageFilter.MaxFilter(3))
+    edge_data = np.asarray(edge_image, dtype=np.float32) / 255.0
+
+    detail = np.clip(base_rgb * 0.6 + edge_data[..., None] * 0.4, 0.0, 1.0)
+    revived_rgb = np.clip(data[..., :3] * 0.5 + detail * 0.5, 0.0, 1.0)
+    revived_rgb = ensure_variation(revived_rgb)
+
+    revived = np.dstack((revived_rgb, data[..., 3:4]))
+    revived_image = Image.fromarray((np.clip(revived, 0.0, 1.0) * 255.0).astype(np.uint8), mode="RGBA")
+    return revived_image
+
+
+def _normalized_mask(analysis: AnalysisResult, target_shape: Tuple[int, int]) -> np.ndarray:
+    raw_mask = getattr(analysis, "mask", None)
+    if isinstance(raw_mask, np.ndarray):
+        mask = np.clip(raw_mask.astype(np.float32, copy=False), 0.0, 1.0)
+        if mask.shape != target_shape:
+            mask_image = Image.fromarray((mask * 255.0).astype(np.uint8), mode="L")
+            mask = (
+                np.asarray(
+                    mask_image.resize((target_shape[1], target_shape[0]), Image.NEAREST),
+                    dtype=np.float32,
+                )
+                / 255.0
+            )
+    else:
+        LOGGER.warning(
+            "Analysis mask missing or invalid (%s); assuming fully opaque foreground",
+            type(raw_mask).__name__ if raw_mask is not None else "None",
+        )
+        mask = np.ones(target_shape, dtype=np.float32)
+    return mask
+
+
+def _alpha_from_analysis(analysis: AnalysisResult, target_shape: Tuple[int, int]) -> Image.Image:
+    alpha_array = getattr(analysis, "alpha", None)
+    if isinstance(alpha_array, np.ndarray):
+        alpha_float = np.clip(alpha_array.astype(np.float32, copy=False), 0.0, 1.0)
+        if alpha_float.shape != target_shape:
+            alpha_image = Image.fromarray((alpha_float * 255.0).astype(np.uint8), mode="L")
+            alpha_image = alpha_image.resize((target_shape[1], target_shape[0]), Image.BILINEAR)
+            alpha_float = np.asarray(alpha_image, dtype=np.float32) / 255.0
+        return Image.fromarray((alpha_float * 255.0).astype(np.uint8), mode="L")
+    return Image.new("L", (target_shape[1], target_shape[0]), 255)
 
 
 def _is_pixel_art(analysis: AnalysisResult) -> bool:
@@ -240,32 +308,42 @@ def generate_fuzz_accurate(base_img: Image.Image, analysis: AnalysisResult) -> I
 
     width, height = base_img.size
     target_shape = (height, width)
+    mask = _normalized_mask(analysis, target_shape)
 
-    microsurface = getattr(analysis, "microsurface_data", None)
-    fuzz_potential = getattr(analysis, "fuzz_potential", None)
+    try:
+        microsurface = getattr(analysis, "microsurface_data", None)
+        fuzz_potential = getattr(analysis, "fuzz_potential", None)
 
-    if microsurface is not None and fuzz_potential is not None:
-        micro_channel = _prepare_analysis_channel(microsurface, target_shape)
-        fuzz_channel = _prepare_analysis_channel(fuzz_potential, target_shape)
-    else:
+        if microsurface is not None and fuzz_potential is not None:
+            micro_channel = _prepare_analysis_channel(microsurface, target_shape)
+            fuzz_channel = _prepare_analysis_channel(fuzz_potential, target_shape)
+        else:
+            raise ValueError("microsurface descriptors unavailable")
+
+        combined = np.clip(micro_channel * 0.6 + fuzz_channel * 0.4, 0.0, 1.0)
+    except Exception as exc:  # pragma: no cover - defensive path
+        LOGGER.warning("Failed to generate fuzz map (%s); using fallback", exc)
         gray = np.asarray(base_img.convert("L"), dtype=np.float32) / 255.0
         micro_channel = gaussian_blur(gray, radius=0.9)
         fuzz_channel = np.clip(1.0 - micro_channel, 0.0, 1.0)
+        combined = np.clip(micro_channel * 0.4 + fuzz_channel * 0.6, 0.0, 1.0)
 
-    combined = np.clip(micro_channel * 0.6 + fuzz_channel * 0.4, 0.0, 1.0)
-    combined *= analysis.mask
+    combined = np.clip(combined * mask, 0.0, 1.0)
     combined = gaussian_blur(combined, radius=0.5)
     combined = ensure_variation(combined)
 
-    alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
-    return _from_single_channel(combined, alpha)
+    alpha_image = _alpha_from_analysis(analysis, target_shape)
+    return _from_single_channel(combined, alpha_image)
 
 
 def generate_material_accurate(analysis: AnalysisResult) -> Image.Image:
     """Generate a semantic material map from dominant material likelihoods."""
 
-    mask = analysis.mask
-    height, width = mask.shape
+    if isinstance(analysis.mask, np.ndarray):
+        height, width = analysis.mask.shape
+    else:
+        width, height = analysis.base_image.size
+    mask = _normalized_mask(analysis, (height, width))
     material = analysis.material_analysis
     likelihoods = material.likelihoods if material is not None else {}
 
@@ -299,12 +377,21 @@ def generate_material_accurate(analysis: AnalysisResult) -> Image.Image:
     else:
         color = np.divide(color, np.maximum(total, 1e-6))
 
+    base_rgb = normalize01(np.asarray(analysis.rgb, dtype=np.float32))
+    if base_rgb.shape[:2] != (height, width):
+        base_image = Image.fromarray((np.clip(base_rgb, 0.0, 1.0) * 255.0).astype(np.uint8), mode="RGB")
+        base_image = base_image.resize((width, height), Image.NEAREST)
+        base_rgb = np.asarray(base_image, dtype=np.float32) / 255.0
+
+    color = np.clip(color * 0.7 + base_rgb * 0.3, 0.0, 1.0)
     color = np.clip(color * mask[..., None], 0.0, 1.0)
-    color = ensure_variation(color)
+    for channel_idx in range(3):
+        color[..., channel_idx] = ensure_variation(color[..., channel_idx])
 
     alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
     rgb_image = Image.fromarray((color * 255.0).astype(np.uint8), mode="RGB")
-    return Image.merge("RGBA", (*rgb_image.split(), alpha))
+    material_map = Image.merge("RGBA", (*rgb_image.split(), alpha))
+    return _revive_uniform_map(material_map, getattr(analysis, "base_image", None))
 
 
 def generate_ior_physically_accurate(
@@ -477,6 +564,7 @@ def generate_transmission_physically_accurate(
     transmission_map[metallic_regions] = 0.0
 
     transmission_map = strategic_gaussian_blur(transmission_map, mask, sigma=0.7)
+    transmission_map[metallic_regions] = 0.0
     transmission_map = np.clip(transmission_map * mask, 0.0, 1.0)
     transmission_map = ensure_variation(transmission_map)
 
@@ -622,10 +710,14 @@ def generate_curvature_enhanced(analysis: AnalysisResult) -> Image.Image:
 
 def generate_emissive_accurate(base_img: Image.Image, analysis: AnalysisResult) -> Image.Image:
     emissive = np.clip((analysis.luminance_map - 0.6) * 2.0 + analysis.specular_achromaticity * 0.3, 0.0, 1.0)
+    gray = np.asarray(base_img.convert("L"), dtype=np.float32) / 255.0
+    edge_map = analysis.geometric_features.get("edge_map", np.zeros_like(gray))
+    emissive = np.clip(emissive + edge_map * 0.2 + gray * 0.15, 0.0, 1.0)
     emissive *= analysis.mask
     emissive = ensure_variation(emissive)
     alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
-    return _from_single_channel(emissive, alpha)
+    emissive_map = _from_single_channel(emissive, alpha)
+    return _revive_uniform_map(emissive_map, base_img)
 
 
 def generate_secondary_maps(base_img: Image.Image, analysis: AnalysisResult) -> Dict[str, Image.Image]:

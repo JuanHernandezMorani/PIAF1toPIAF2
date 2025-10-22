@@ -124,12 +124,28 @@ def gaussian_blur(channel: np.ndarray, radius: float) -> np.ndarray:
 def ensure_variation(channel: np.ndarray, epsilon: float = 1e-4) -> np.ndarray:
     """Inject subtle variation if a map becomes perfectly uniform."""
 
-    if np.std(channel) < epsilon:
-        height, width = channel.shape
-        yy, xx = np.mgrid[0:height, 0:width]
-        gradient = (xx / max(1, width - 1) + yy / max(1, height - 1)) / 2.0
-        channel = np.clip(channel + 0.02 * (gradient - 0.5), 0.0, 1.0)
-    return channel
+    array = np.asarray(channel, dtype=np.float32)
+    if array.size == 0:
+        return array
+
+    if float(np.std(array)) >= epsilon or array.ndim < 2:
+        return array
+
+    height, width = array.shape[:2]
+    if height == 0 or width == 0:
+        return array
+
+    yy, xx = np.mgrid[0:height, 0:width]
+    gradient = (xx / max(1, width - 1) + yy / max(1, height - 1)) / 2.0
+    gradient = gradient.astype(np.float32)
+    gradient -= float(np.mean(gradient))
+
+    if array.ndim == 2:
+        array = np.clip(array + 0.02 * gradient, 0.0, 1.0)
+    else:
+        array = np.clip(array + 0.02 * gradient[..., None], 0.0, 1.0)
+
+    return array
 
 
 def normalize01(channel: np.ndarray) -> np.ndarray:
