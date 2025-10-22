@@ -311,10 +311,12 @@ def generate_fuzz_accurate(base_img: Image.Image, analysis: AnalysisResult) -> I
     mask = _normalized_mask(analysis, target_shape)
 
     try:
+        # Acceder a los arrays NumPy dentro de AnalysisResult
         microsurface = getattr(analysis, "microsurface_data", None)
         fuzz_potential = getattr(analysis, "fuzz_potential", None)
 
         if microsurface is not None and fuzz_potential is not None:
+            # Asegurarse de que estamos usando arrays, no el objeto completo
             micro_channel = _prepare_analysis_channel(microsurface, target_shape)
             fuzz_channel = _prepare_analysis_channel(fuzz_potential, target_shape)
         else:
@@ -334,7 +336,6 @@ def generate_fuzz_accurate(base_img: Image.Image, analysis: AnalysisResult) -> I
 
     alpha_image = _alpha_from_analysis(analysis, target_shape)
     return _from_single_channel(combined, alpha_image)
-
 
 def generate_material_accurate(analysis: AnalysisResult) -> Image.Image:
     """Generate a semantic material map from dominant material likelihoods."""
