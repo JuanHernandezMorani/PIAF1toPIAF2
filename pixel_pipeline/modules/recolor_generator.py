@@ -29,7 +29,7 @@ from .pbr.layered import LAYERED_PBR_CONFIG, LayeredPBRCache, PBRLayerManager
 from .pbr.pipeline import generate_physically_accurate_pbr_maps
 
 try:
-    from pixel_pipeline.modules.perceptual_vision import (
+    from .perceptual_vision import (
         apply_human_vision_simulation,
         validate_photopic_parameters,
     )
@@ -851,24 +851,71 @@ class RecolorPipeline:
         ):
             self._persist_layered_variant(stem, variant)
             return
+            
         base_name = variant.name
-        composited = Image.alpha_composite(variant.background, variant.image)
+        
+        # Verificar compatibilidad antes del alpha_composite
+        background = variant.background
+        foreground = variant.image
+        
+        # Asegurar que ambas imágenes tengan el mismo modo
+        if background.mode != foreground.mode:
+            if background.mode != 'RGBA':
+                background = background.convert('RGBA')
+            if foreground.mode != 'RGBA':
+                foreground = foreground.convert('RGBA')
+        
+        # Asegurar que ambas imágenes tengan las mismas dimensiones
+        if background.size != foreground.size:
+            # Redimensionar el fondo para que coincida con el primer plano
+            # o viceversa dependiendo de cuál sea más apropiado para tu caso
+            background = background.resize(foreground.size, Image.Resampling.LANCZOS)
+        
+        try:
+            composited = Image.alpha_composite(background, foreground)
+        except ValueError as e:
+            # Fallback: crear una imagen nueva y pegar ambas
+            LOGGER.warning(f"Alpha composite failed: {e}. Using fallback composition.")
+            composited = Image.new('RGBA', foreground.size)
+            composited.paste(background, (0, 0))
+            composited.paste(foreground, (0, 0), foreground)
+    
         target_path = self.output_path / f"{base_name}.png"
+        
         if not self.enable_pbr:
             self.file_manager.atomic_save(composited, target_path)
             return
+            
+        # Manejar también la compatibilidad para la generación de mapas PBR
         source_for_maps = variant.source_input or variant.foreground_base or composited
         background_reference = variant.background_base or variant.background
-        maps, alpha_map = self._generate_maps(
-            source_for_maps,
-            background_reference,
-            foreground_image=variant.image,
-        )
-        composited = apply_alpha(composited, alpha_map)
+        
+        # Asegurar compatibilidad de dimensiones para mapas PBR
+        if hasattr(background_reference, 'size') and background_reference.size != source_for_maps.size:
+            background_reference = background_reference.resize(source_for_maps.size, Image.Resampling.LANCZOS)
+        
+        try:
+            maps, alpha_map = self._generate_maps(
+                source_for_maps,
+                background_reference,
+                foreground_image=variant.image,
+            )
+            composited = apply_alpha(composited, alpha_map)
+        except Exception as e:
+            LOGGER.warning(f"PBR map generation failed: {e}. Saving without PBR maps.")
+            # Guardar sin mapas PBR si falla la generación
+        
         self.file_manager.atomic_save(composited, target_path)
-        for map_name, map_image in maps.items():
-            map_path = self.output_path / f"{base_name}_{map_name}.png"
-            self.file_manager.atomic_save(map_image, map_path)
+        
+        if not self.enable_pbr:
+            return
+            
+        try:
+            for map_name, map_image in maps.items():
+                map_path = self.output_path / f"{base_name}_{map_name}.png"
+                self.file_manager.atomic_save(map_image, map_path)
+        except Exception as e:
+            LOGGER.warning(f"Failed to save some PBR maps: {e}")
 
     def _persist_layered_variant(self, stem: str, variant: Variant) -> None:
         if self.pbr_layer_manager is None:
@@ -924,7 +971,7 @@ class RecolorPipeline:
     
         # Restaurar fondo solo donde NO hay foreground real
         # En lugar de poner 1.0, mezclamos suavemente según el alpha base
-        restored = np.where(
+            restored = np.where(
             fg_alpha < 0.05,
             np.maximum(alpha_map, 0.95),  # fondo casi opaco
             np.clip(alpha_map, 0.0, 1.0),  # foreground intacto
@@ -943,7 +990,7 @@ class RecolorPipeline:
         base_name = stem
         maps, _ = self._generate_maps(
             image,
-            None,
+                None,
             foreground_image=None,
             preserve_original_alpha=True,
         )
@@ -964,7 +1011,7 @@ class RecolorPipeline:
         from .pbr.generation import (
             generate_alpha_accurate,
             generate_ao_physically_accurate,
-            generate_curvature_enhanced,
+                generate_curvature_enhanced,
             generate_emissive_accurate,
             generate_height_from_normal,
             generate_ior_physically_accurate,
