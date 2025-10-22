@@ -526,6 +526,14 @@ class RecolorPipeline:
         palette = self._extract_palette(image)
         variant_index = 0
         base_foreground_template = image.convert("RGBA") if self.layered_pbr_enabled else None
+        baseline_background: Optional[Image.Image] = None
+        if self.layered_pbr_enabled:
+            foreground_reference = base_foreground_template or image.convert("RGBA")
+            baseline_background = self._adapt_background(foreground_reference).convert("RGBA")
+        else:
+            baseline_background = self._adapt_background(image.convert("RGBA")).convert("RGBA")
+        if baseline_background is None:
+            baseline_background = Image.new("RGBA", image.size, (0, 0, 0, 0))
         for rotation in self.rotation_angles:
             if variant_index >= self.max_variants:
                 return
@@ -549,18 +557,18 @@ class RecolorPipeline:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             metrics = validate_photopic_parameters(foreground_variant)
                             self.logger.debug("Perceptual metrics for %s: %s", tint, metrics)
-                    background_base = self._adapt_background(foreground_variant).convert("RGBA")
-                    background_variant = self._apply_background_color_variant(background_base.copy(), tint)
+                    background_base = baseline_background.copy() if baseline_background is not None else None
+                    background_variant = background_base.copy() if background_base is not None else None
                     name = f"{stem}_r{rotation:03d}_{variant_index:04d}"
                     variant_index += 1
                     yield Variant(
                         name=name,
                         image=foreground_variant,
-                        background=background_variant,
+                        background=background_variant if background_variant is not None else background_base,
                         foreground_base=base_foreground,
                         background_base=background_base,
                         foreground_variant=foreground_variant,
-                        background_variant=background_variant,
+                        background_variant=background_variant if background_variant is not None else background_base,
                         color_variant=tint,
                         rotation=float(rotation),
                     )
@@ -581,7 +589,7 @@ class RecolorPipeline:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             metrics = validate_photopic_parameters(variant_image)
                             self.logger.debug("Perceptual metrics for %s: %s", tint, metrics)
-                    adapted = self._adapt_background(variant_image)
+                    adapted = baseline_background.copy() if baseline_background is not None else self._adapt_background(image.convert("RGBA"))
                     name = f"{stem}_r{rotation:03d}_{variant_index:04d}"
                     variant_index += 1
                     yield Variant(name=name, image=variant_image, background=adapted, rotation=float(rotation))
@@ -998,48 +1006,15 @@ class RecolorPipeline:
             raise RuntimeError("Layered PBR manager is not configured")
 
         foreground_rgba = base_image.convert("RGBA")
-        background_rgba = background.convert("RGBA") if background is not None else None
-        if background_rgba is not None and background_rgba.size != foreground_rgba.size:
-            background_rgba = background_rgba.resize(foreground_rgba.size, Image.BICUBIC)
-
-        foreground_result = generate_physically_accurate_pbr_maps(foreground_rgba, None, {})
-        alpha_array = foreground_result.get("alpha")
+        result = generate_physically_accurate_pbr_maps(foreground_rgba, None, {})
+        alpha_array = result.get("alpha")
         if alpha_array is None:
             width, height = foreground_rgba.size
             alpha_array = np.ones((height, width), dtype=np.float32)
         else:
             alpha_array = np.asarray(alpha_array, dtype=np.float32)
 
-        if background_rgba is not None:
-            alpha_binary = (alpha_array > 0.1).astype(np.uint8) * 255
-            alpha_mask = Image.fromarray(alpha_binary, mode="L")
-            foreground_rgb = foreground_rgba.convert("RGB")
-
-            if abs(scale - 1.0) > 1e-6:
-                scaled_size = (
-                    max(1, int(round(foreground_rgb.width * scale))),
-                    max(1, int(round(foreground_rgb.height * scale))),
-                )
-                scaled_rgb = foreground_rgb.resize(scaled_size, Image.BICUBIC)
-                scaled_mask = alpha_mask.resize(scaled_size, Image.BILINEAR)
-                canvas_rgb = Image.new("RGB", background_rgba.size, (0, 0, 0))
-                canvas_mask = Image.new("L", background_rgba.size, 0)
-                canvas_rgb.paste(scaled_rgb, (0, 0))
-                canvas_mask.paste(scaled_mask, (0, 0))
-                foreground_rgb = canvas_rgb
-                alpha_mask = canvas_mask
-                alpha_array = np.asarray(alpha_mask, dtype=np.float32) / 255.0
-
-            composite_bg = background_rgba.copy()
-            composite_bg.paste(foreground_rgb, (0, 0), alpha_mask)
-            final_result = generate_physically_accurate_pbr_maps(composite_bg, None, {})
-            alpha_from_result = final_result.get("alpha")
-            if alpha_from_result is not None:
-                alpha_array = np.asarray(alpha_from_result, dtype=np.float32)
-        else:
-            final_result = foreground_result
-
-        maps = final_result.get("maps", {})
+        maps = result.get("maps", {})
         alpha_map = np.asarray(alpha_array, dtype=np.float32)
         if rotation and self.layered_pbr_config.get("rotation_after_composition", True):
             maps = self._rotate_pbr_maps_layered(maps, rotation)

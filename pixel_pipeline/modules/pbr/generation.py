@@ -209,28 +209,26 @@ def generate_porosity_accurate(analysis: AnalysisResult) -> Image.Image:
 
 
 def generate_opacity_accurate(analysis: AnalysisResult) -> Image.Image:
-    """Generate an opacity map coherent with transmission cues."""
+    """Generate opacity map ensuring background is transparent."""
 
     mask = analysis.mask
     base_alpha = np.clip(analysis.alpha, 0.0, 1.0)
     translucency = np.clip(analysis.transmission_seed, 0.0, 1.0)
     thin_regions = analysis.geometric_features.get("thin_regions", np.zeros_like(mask))
 
-    translucency_smooth = gaussian_blur(translucency, radius=0.6)
-    base_detail = gaussian_blur(base_alpha, radius=0.4)
-    thin_penalty = gaussian_blur(thin_regions, radius=0.8)
-
     opacity = np.clip(
-        base_detail * 0.65
-        + base_alpha * 0.25
-        + (1.0 - translucency_smooth) * 0.1
-        + (1.0 - thin_penalty) * 0.1,
+        base_alpha * 0.8
+        + (1.0 - translucency) * 0.15
+        + (1.0 - thin_regions) * 0.05,
         0.0,
         1.0,
     )
-    opacity = np.maximum(opacity, base_alpha * 0.5)
-    opacity *= mask
+
+    opacity[analysis.background_mask] = 0.0
+    opacity[mask < 0.05] = 0.0
+
     opacity = gaussian_blur(opacity, radius=0.6)
+    opacity = np.clip(opacity * mask, 0.0, 1.0)
     opacity = ensure_variation(opacity)
 
     alpha = Image.fromarray((base_alpha * 255.0).astype(np.uint8), mode="L")
@@ -451,59 +449,36 @@ def generate_transmission_physically_accurate(
 ) -> Image.Image:
     mask = analysis.mask
     likelihoods = analysis.material_analysis.likelihoods
-    thin_regions = analysis.geometric_features.get("thin_regions", np.zeros_like(mask))
-    thickness = analysis.geometric_features.get("thickness", np.ones_like(mask))
-    luminance = analysis.luminance_map
-    saturation = analysis.hsv[1]
 
-    base = np.clip(luminance * (1.0 - saturation), 0.0, 1.0)
-    seed = np.clip(np.maximum(base, analysis.transmission_seed) * 0.6, 0.0, 1.0)
+    metal_likelihood = likelihoods.get("metal", np.zeros_like(mask))
+    metallic_regions = metal_likelihood > 0.3
 
-    transmission_map = seed
+    transmission_map = np.zeros_like(mask, dtype=np.float32)
 
-    translucent_materials = [
-        ("glass", 0.85, False),
-        ("crystal", 0.8, False),
-        ("water", 0.65, False),
-        ("ice", 0.6, False),
-        ("thin_fabric", 0.35, True),
-        ("wings", 0.35, True),
-        ("fins", 0.35, True),
-        ("leaves", 0.3, True),
-    ]
-    for material, value, requires_thin in translucent_materials:
-        likelihood = likelihoods.get(material, np.zeros_like(mask))
-        zone = analysis.material_analysis.zones.get(material, likelihood > 0.6)
-        material_mask = (likelihood > 0.55) & zone & (mask > 0.05)
-        if requires_thin:
-            material_mask &= thin_regions > 0.1
-        if np.any(material_mask):
-            transmission_map[material_mask] = np.maximum(transmission_map[material_mask], value)
+    non_metallic_mask = (~metallic_regions) & (mask > 0.05)
 
-    bright_low_sat = (luminance > 0.65) & (saturation < 0.25)
-    transmission_map[bright_low_sat] = np.maximum(transmission_map[bright_low_sat], 0.45)
+    if np.any(non_metallic_mask):
+        luminance = analysis.luminance_map
+        saturation = analysis.hsv[1]
+        thin_regions = analysis.geometric_features.get("thin_regions", np.zeros_like(mask))
+        thickness = analysis.geometric_features.get("thickness", np.ones_like(mask))
 
-    if current_transmission is not None:
-        prev = _to_float_array(current_transmission)
-        transmission_map = np.maximum(transmission_map, np.clip(prev, 0.0, 1.0) * 0.5)
+        base_transmission = np.clip(
+            (1.0 - thickness) * 0.4
+            + thin_regions * 0.3
+            + (1.0 - saturation) * 0.2
+            + luminance * 0.1,
+            0.0,
+            1.0,
+        )
 
-    metallic = likelihoods.get("metal", np.zeros_like(mask))
-    stone = likelihoods.get("stone", np.zeros_like(mask))
-    opaque_regions = (metallic > 0.35) | (stone > 0.5)
-    opaque_regions |= analysis.material_analysis.false_metal_risks > 0.25
-    transmission_map[opaque_regions] = 0.0
+        transmission_map[non_metallic_mask] = base_transmission[non_metallic_mask]
 
-    delicate_regions = (thin_regions > 0.2) & (thickness < 0.35)
-    if np.any(delicate_regions):
-        transmission_map[delicate_regions] = np.clip(transmission_map[delicate_regions], 0.15, 0.35)
+    transmission_map[metallic_regions] = 0.0
 
-    transmission_map[mask < 0.05] = 0.0
-    minimum_transmission = 0.015
-    transmission_map = np.where(mask > 0.05, np.maximum(transmission_map, minimum_transmission), transmission_map)
-    transmission_map[opaque_regions] = 0.0
-
-    transmission_map = strategic_gaussian_blur(transmission_map, mask, sigma=0.85)
-    transmission_map = ensure_variation(np.clip(transmission_map, 0.0, 1.0))
+    transmission_map = strategic_gaussian_blur(transmission_map, mask, sigma=0.7)
+    transmission_map = np.clip(transmission_map * mask, 0.0, 1.0)
+    transmission_map = ensure_variation(transmission_map)
 
     alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
     return _from_single_channel(transmission_map, alpha)
@@ -567,24 +542,34 @@ def generate_subsurface_accurate(analysis: AnalysisResult, transmission: Image.I
 
 def generate_structural_distinct(analysis: AnalysisResult, current_structural: Image.Image | None) -> Image.Image:
     height_field = _compute_height_field(analysis)
+
     grad_y, grad_x = np.gradient(height_field)
-    sobel = np.clip(np.sqrt(grad_x ** 2 + grad_y ** 2), 0.0, 1.0)
+    sobel = np.clip(np.sqrt(grad_x ** 2 + grad_y ** 2) * 1.5, 0.0, 1.0)
 
     normal_field = _height_to_normal(height_field)
     normal_mag = np.linalg.norm(normal_field - 0.5, axis=2)
-    log_normal = np.abs(normal_mag - gaussian_blur(normal_mag, radius=1.2))
+    log_normal = np.abs(normal_mag - gaussian_blur(normal_mag, radius=0.8)) * 2.0
 
-    base_luminance = analysis.luminance_map
-    high_pass = np.abs(height_field - gaussian_blur(height_field, radius=2.0))
     edge_map = analysis.geometric_features.get("edge_map", np.zeros_like(height_field))
-    decorrelated = np.clip(high_pass + np.abs(base_luminance - gaussian_blur(base_luminance, radius=1.5)), 0.0, 1.0)
-    structural = np.clip(0.4 * sobel + 0.3 * log_normal + 0.2 * decorrelated + 0.1 * edge_map, 0.0, 1.0)
+    base_luminance = analysis.luminance_map
+    high_freq_diff = np.abs(base_luminance - gaussian_blur(base_luminance, radius=1.5))
+
+    structural = np.clip(
+        0.35 * sobel + 0.25 * log_normal + 0.20 * edge_map + 0.20 * high_freq_diff,
+        0.0,
+        1.0,
+    )
+
+    min_difference = 0.1
+    base_smoothed = gaussian_blur(base_luminance, radius=3.0)
+    difference_mask = np.abs(structural - base_smoothed) < min_difference
+    structural[difference_mask] += min_difference
+    structural = np.clip(structural, 0.0, 1.0)
 
     if current_structural is not None:
         previous = _to_float_array(current_structural)
-        structural = np.clip(0.6 * structural + 0.4 * previous, 0.0, 1.0)
+        structural = np.clip(0.7 * structural + 0.3 * previous, 0.0, 1.0)
 
-    structural = gaussian_blur(structural, radius=0.45)
     structural *= analysis.mask
     structural = ensure_variation(structural)
 
