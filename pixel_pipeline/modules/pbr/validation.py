@@ -114,6 +114,34 @@ def _binary_levels(array: np.ndarray) -> bool:
     return len(unique) <= 3
 
 
+def _has_edge_discontinuities(array: np.ndarray, threshold: float = 0.12) -> bool:
+    if array.size == 0 or array.shape[0] < 3 or array.shape[1] < 3:
+        return False
+
+    top = np.abs(array[0, :] - array[1, :])
+    bottom = np.abs(array[-1, :] - array[-2, :])
+    left = np.abs(array[:, 0] - array[:, 1])
+    right = np.abs(array[:, -1] - array[:, -2])
+
+    perimeter = np.concatenate([top, bottom, left, right])
+    seam_strength = float(perimeter.mean() + perimeter.std())
+    return seam_strength > threshold
+
+
+def detect_seams_validation(final_maps: Dict[str, Image.Image]) -> List[str]:
+    """Detect discontinuities around map borders that reveal synthesis seams."""
+
+    issues: List[str] = []
+    for map_name, map_img in final_maps.items():
+        try:
+            array = np.asarray(map_img.convert("L"), dtype=np.float32) / 255.0
+        except Exception:  # pragma: no cover - defensive casting
+            continue
+        if _has_edge_discontinuities(array):
+            issues.append(f"seams_detected_in_{map_name}")
+    return issues
+
+
 def validate_all_maps(maps: Mapping[str, Image.Image], analysis) -> ValidationReport:
     """Run all validation rules and return a report."""
 

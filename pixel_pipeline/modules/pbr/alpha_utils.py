@@ -12,6 +12,13 @@ from .analysis import AnalysisResult
 
 LOGGER = logging.getLogger("pixel_pipeline.pbr.alpha_utils")
 
+try:  # pragma: no cover - Pillow compatibility shim
+    _RESAMPLING = Image.Resampling
+except AttributeError:  # pragma: no cover - older Pillow
+    _RESAMPLING = Image
+
+LANCZOS = getattr(_RESAMPLING, "LANCZOS", Image.BICUBIC)
+
 
 def _build_simple_distance_kernel(radius: int) -> np.ndarray:
     """Return a simple inverse-distance kernel normalised to 1."""
@@ -230,7 +237,7 @@ def derive_alpha_map(
     else:
         if chosen.shape != (height, width):
             chosen = np.asarray(
-                Image.fromarray((chosen * 255).astype(np.uint8), mode="L").resize((width, height), Image.BILINEAR),
+                Image.fromarray((chosen * 255).astype(np.uint8), mode="L").resize((width, height), LANCZOS),
                 dtype=np.float32,
             )
             chosen /= 255.0
@@ -240,7 +247,7 @@ def derive_alpha_map(
     if coherence is not None:
         if coherence.shape != chosen.shape:
             coherence = np.asarray(
-                Image.fromarray((coherence * 255).astype(np.uint8), mode="L").resize((width, height), Image.BILINEAR),
+                Image.fromarray((coherence * 255).astype(np.uint8), mode="L").resize((width, height), LANCZOS),
                 dtype=np.float32,
             )
             coherence /= 255.0
@@ -253,7 +260,7 @@ def apply_alpha(image: Image.Image, alpha: np.ndarray) -> Image.Image:
     rgba = image.convert("RGBA")
     if alpha.shape != (rgba.height, rgba.width):
         alpha_img = Image.fromarray((np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8), mode="L").resize(
-            rgba.size, Image.BILINEAR
+            rgba.size, LANCZOS
         )
     else:
         alpha_img = Image.fromarray((np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8), mode="L")

@@ -58,6 +58,7 @@ from .validation import (
     validate_pbr_coherence_corregido,
     automated_quality_report_v5,
     validate_pbr_coherence_v5,
+    detect_seams_validation,
 )
 
 LOGGER = logging.getLogger("pixel_pipeline.pbr.pipeline")
@@ -168,44 +169,25 @@ def _safe_map_generation(
 
 def _apply_gaussian_filter(array: np.ndarray, sigma: float) -> np.ndarray:
     if _scipy_ndimage is not None:
-        return _scipy_ndimage.gaussian_filter(array, sigma=sigma)
+        return _scipy_ndimage.gaussian_filter(array, sigma=sigma, mode="reflect")
 
     kernel = np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=np.float32) / 16.0
-    padded = np.pad(array, 1, mode="edge")
-    result = (
-        kernel[0, 0] * padded[:-2, :-2]
-        + kernel[0, 1] * padded[:-2, 1:-1]
-        + kernel[0, 2] * padded[:-2, 2:]
-        + kernel[1, 0] * padded[1:-1, :-2]
-        + kernel[1, 1] * padded[1:-1, 1:-1]
-        + kernel[1, 2] * padded[1:-1, 2:]
-        + kernel[2, 0] * padded[2:, :-2]
-        + kernel[2, 1] * padded[2:, 1:-1]
-        + kernel[2, 2] * padded[2:, 2:]
-    )
-    return result.astype(np.float32, copy=False)
+    return _convolve2d(array, kernel, pad_mode="reflect")
 
 
 def _apply_laplacian_filter(array: np.ndarray) -> np.ndarray:
     if _scipy_ndimage is not None:
-        return _scipy_ndimage.laplace(array)
+        return _scipy_ndimage.laplace(array, mode="reflect")
 
     kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32)
-    padded = np.pad(array, 1, mode="edge")
-    result = (
-        kernel[1, 1] * padded[1:-1, 1:-1]
-        + kernel[0, 1] * padded[:-2, 1:-1]
-        + kernel[2, 1] * padded[2:, 1:-1]
-        + kernel[1, 0] * padded[1:-1, :-2]
-        + kernel[1, 2] * padded[1:-1, 2:]
-    )
-    return result.astype(np.float32, copy=False)
+    return _convolve2d(array, kernel, pad_mode="reflect")
 
 
-def _convolve2d(array: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+def _convolve2d(array: np.ndarray, kernel: np.ndarray, *, pad_mode: str = "reflect") -> np.ndarray:
     pad_y = kernel.shape[0] // 2
     pad_x = kernel.shape[1] // 2
-    padded = np.pad(array, ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+    padded = np.pad(array, ((pad_y, pad_y), (pad_x, pad_x)), mode=pad_mode)
+    LOGGER.debug("Edge processing: padding=%s, filter_mode=%s", (pad_y, pad_x), pad_mode)
     result = np.zeros_like(array, dtype=np.float32)
     for y in range(kernel.shape[0]):
         for x in range(kernel.shape[1]):
@@ -265,10 +247,13 @@ def _adaptive_equalize(array: np.ndarray, clip_limit: float = 0.03) -> np.ndarra
 
 def _sobel_gradients(array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if _scipy_ndimage is not None:
-        grad_x = _scipy_ndimage.sobel(array, axis=1)
-        grad_y = _scipy_ndimage.sobel(array, axis=0)
+        grad_x = _scipy_ndimage.sobel(array, axis=1, mode="reflect")
+        grad_y = _scipy_ndimage.sobel(array, axis=0, mode="reflect")
     else:
-        grad_y, grad_x = np.gradient(array.astype(np.float32, copy=False))
+        sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+        sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+        grad_x = _convolve2d(array, sobel_x, pad_mode="reflect")
+        grad_y = _convolve2d(array, sobel_y, pad_mode="reflect")
     return grad_x.astype(np.float32, copy=False), grad_y.astype(np.float32, copy=False)
 
 
@@ -344,11 +329,11 @@ def _generate_normal_map_corrected(height_map: Image.Image, base_image: Image.Im
     sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
 
     if _scipy_ndimage is not None:
-        grad_x = _scipy_ndimage.convolve(height_enhanced, sobel_x, mode="nearest") * 2.0
-        grad_y = _scipy_ndimage.convolve(height_enhanced, sobel_y, mode="nearest") * 2.0
+        grad_x = _scipy_ndimage.convolve(height_enhanced, sobel_x, mode="reflect") * 2.0
+        grad_y = _scipy_ndimage.convolve(height_enhanced, sobel_y, mode="reflect") * 2.0
     else:
-        grad_x = _convolve2d(height_enhanced, sobel_x) * 2.0
-        grad_y = _convolve2d(height_enhanced, sobel_y) * 2.0
+        grad_x = _convolve2d(height_enhanced, sobel_x, pad_mode="reflect") * 2.0
+        grad_y = _convolve2d(height_enhanced, sobel_y, pad_mode="reflect") * 2.0
 
     z_component = 0.5
     normal = np.dstack((-grad_x, -grad_y, np.ones_like(height_array) * z_component))
@@ -384,7 +369,7 @@ def _preserve_foreground_texture_transmission(
     enhanced_candidate = _enhance_transmission_correlation(candidate, foreground, mask_image)
     transmission = _safe_map_generation(enhanced_candidate, analysis, neutral=0.0)
 
-    padded = np.pad(fg_texture, ((1, 1), (1, 1)), mode="edge")
+    padded = np.pad(fg_texture, ((1, 1), (1, 1)), mode="reflect")
     blurred = np.zeros_like(fg_texture)
     height, width = fg_texture.shape
     for dy in range(3):
@@ -624,6 +609,10 @@ def generate_physically_accurate_pbr_maps(
         validation_report = validate_all_maps(final_maps, analysis)
 
     final_validation = validate_all_maps(final_maps, analysis)
+    seam_issues = detect_seams_validation(final_maps)
+    if seam_issues:
+        LOGGER.warning("Edge seam validation triggered: %s", ", ".join(seam_issues))
+        diagnostics.setdefault("seam_issues", []).extend(seam_issues)
     if not final_validation.passes_all_critical():
         LOGGER.warning("Final maps still report issues: %s", final_validation.issues)
     else:
