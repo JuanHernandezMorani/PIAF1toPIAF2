@@ -26,6 +26,7 @@ from ..core.utils_parallel import limited_threads, run_parallel
 from . import contextual_randomizer
 from .pbr.alpha_utils import apply_alpha, apply_alpha_to_maps, derive_alpha_map
 from .pbr.layered import LAYERED_PBR_CONFIG, LayeredPBRCache, PBRLayerManager
+from .pbr.pipeline import generate_physically_accurate_pbr_maps
 
 try:
     from pixel_pipeline.modules.perceptual_vision import (
@@ -830,14 +831,18 @@ class RecolorPipeline:
         base_name = variant.name
         foreground_variant = variant.foreground_variant or variant.image
         background_variant = variant.background_variant or variant.background
+        foreground_source = foreground_variant
+        background_source = background_variant
         layered_maps, alpha_map = self._generate_maps_layered(
-            variant.foreground_base,  # type: ignore[arg-type]
-            variant.background_base,  # type: ignore[arg-type]
-            foreground_image=foreground_variant,
+            foreground_source,
+            background_source,
             rotation=variant.rotation,
         )
-        composited = Image.alpha_composite(background_variant, foreground_variant)
-        composited = apply_alpha(composited, alpha_map)
+        alpha_binary = (np.clip(alpha_map, 0.0, 1.0) > 0.1).astype(np.uint8) * 255
+        alpha_mask = Image.fromarray(alpha_binary, mode="L")
+        composited_base = background_source.convert("RGBA")
+        composited_base.paste(foreground_source.convert("RGB"), (0, 0), alpha_mask)
+        composited = apply_alpha(composited_base, alpha_map)
         if variant.rotation and self.layered_pbr_config.get("rotation_after_composition", True):
             composited = self._rotate_layer_image(composited, variant.rotation, Image.BILINEAR)
             rotated_foreground = self._rotate_layer_image(foreground_variant, variant.rotation, Image.BILINEAR)
@@ -985,17 +990,57 @@ class RecolorPipeline:
     def _generate_maps_layered(
         self,
         base_image: Image.Image,
-        background: Image.Image,
-        *,
-        foreground_image: Image.Image,
+        background: Image.Image | None,
         rotation: float = 0.0,
+        scale: float = 1.0,
     ) -> tuple[Dict[str, Image.Image], np.ndarray]:
         if self.pbr_layer_manager is None:
             raise RuntimeError("Layered PBR manager is not configured")
-        maps = self.pbr_layer_manager.generate_layered_pbr_maps(base_image, background)
-        alpha_map = derive_alpha_map(base_image, maps, analysis=None)
-        alpha_map = self._restore_background_alpha(alpha_map, foreground_image)
-        maps = apply_alpha_to_maps(maps, alpha_map)
+
+        foreground_rgba = base_image.convert("RGBA")
+        background_rgba = background.convert("RGBA") if background is not None else None
+        if background_rgba is not None and background_rgba.size != foreground_rgba.size:
+            background_rgba = background_rgba.resize(foreground_rgba.size, Image.BICUBIC)
+
+        foreground_result = generate_physically_accurate_pbr_maps(foreground_rgba, None, {})
+        alpha_array = foreground_result.get("alpha")
+        if alpha_array is None:
+            width, height = foreground_rgba.size
+            alpha_array = np.ones((height, width), dtype=np.float32)
+        else:
+            alpha_array = np.asarray(alpha_array, dtype=np.float32)
+
+        if background_rgba is not None:
+            alpha_binary = (alpha_array > 0.1).astype(np.uint8) * 255
+            alpha_mask = Image.fromarray(alpha_binary, mode="L")
+            foreground_rgb = foreground_rgba.convert("RGB")
+
+            if abs(scale - 1.0) > 1e-6:
+                scaled_size = (
+                    max(1, int(round(foreground_rgb.width * scale))),
+                    max(1, int(round(foreground_rgb.height * scale))),
+                )
+                scaled_rgb = foreground_rgb.resize(scaled_size, Image.BICUBIC)
+                scaled_mask = alpha_mask.resize(scaled_size, Image.BILINEAR)
+                canvas_rgb = Image.new("RGB", background_rgba.size, (0, 0, 0))
+                canvas_mask = Image.new("L", background_rgba.size, 0)
+                canvas_rgb.paste(scaled_rgb, (0, 0))
+                canvas_mask.paste(scaled_mask, (0, 0))
+                foreground_rgb = canvas_rgb
+                alpha_mask = canvas_mask
+                alpha_array = np.asarray(alpha_mask, dtype=np.float32) / 255.0
+
+            composite_bg = background_rgba.copy()
+            composite_bg.paste(foreground_rgb, (0, 0), alpha_mask)
+            final_result = generate_physically_accurate_pbr_maps(composite_bg, None, {})
+            alpha_from_result = final_result.get("alpha")
+            if alpha_from_result is not None:
+                alpha_array = np.asarray(alpha_from_result, dtype=np.float32)
+        else:
+            final_result = foreground_result
+
+        maps = final_result.get("maps", {})
+        alpha_map = np.asarray(alpha_array, dtype=np.float32)
         if rotation and self.layered_pbr_config.get("rotation_after_composition", True):
             maps = self._rotate_pbr_maps_layered(maps, rotation)
         return maps, alpha_map
