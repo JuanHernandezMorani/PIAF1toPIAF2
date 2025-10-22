@@ -75,6 +75,7 @@ class Variant:
     background_variant: Optional[Image.Image] = None
     color_variant: Optional[Tuple[int, int, int]] = None
     rotation: float = 0.0
+    source_input: Optional[Image.Image] = None
 
 
 class BackgroundLibrary:
@@ -571,6 +572,7 @@ class RecolorPipeline:
                         background_variant=background_variant if background_variant is not None else background_base,
                         color_variant=tint,
                         rotation=float(rotation),
+                        source_input=base_foreground.copy(),
                     )
                 else:
                     if rotated is None:
@@ -592,7 +594,16 @@ class RecolorPipeline:
                     adapted = baseline_background.copy() if baseline_background is not None else self._adapt_background(image.convert("RGBA"))
                     name = f"{stem}_r{rotation:03d}_{variant_index:04d}"
                     variant_index += 1
-                    yield Variant(name=name, image=variant_image, background=adapted, rotation=float(rotation))
+                    yield Variant(
+                        name=name,
+                        image=variant_image,
+                        background=adapted,
+                        foreground_base=rotated.copy(),
+                        background_base=baseline_background.copy() if baseline_background is not None else None,
+                        color_variant=tint,
+                        rotation=float(rotation),
+                        source_input=rotated.copy(),
+                    )
 
     def _extract_palette(self, image: Image.Image) -> List[Tuple[int, int, int]]:
         resized = image.convert("RGBA").resize((self.pixel_resolution, self.pixel_resolution), resample=Image.NEAREST)
@@ -822,9 +833,11 @@ class RecolorPipeline:
         base_name = variant.name
         composited = Image.alpha_composite(variant.background, variant.image)
         target_path = self.output_path / f"{base_name}.png"
+        source_for_maps = variant.source_input or variant.foreground_base or composited
+        background_reference = variant.background_base or variant.background
         maps, alpha_map = self._generate_maps(
-            composited,
-            variant.background,
+            source_for_maps,
+            background_reference,
             foreground_image=variant.image,
         )
         composited = apply_alpha(composited, alpha_map)
@@ -839,8 +852,8 @@ class RecolorPipeline:
         base_name = variant.name
         foreground_variant = variant.foreground_variant or variant.image
         background_variant = variant.background_variant or variant.background
-        foreground_source = foreground_variant
-        background_source = background_variant
+        foreground_source = variant.source_input or variant.foreground_base or foreground_variant
+        background_source = variant.background_base or background_variant
         layered_maps, alpha_map = self._generate_maps_layered(
             foreground_source,
             background_source,
