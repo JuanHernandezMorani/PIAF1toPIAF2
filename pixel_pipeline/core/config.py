@@ -60,6 +60,9 @@ class PipelineConfig:
     random_seed: Optional[int] = None
     threads: int = 8
     enable_gpu: bool = False
+    enable_rotation: bool = True
+    enable_pbr: bool = True
+    enable_vcolor: bool = True
     log_file: Path = BASE_DIR / "processing.log"
     pbr_generation: Dict[str, object] = field(default_factory=lambda: dict(PBR_GENERATION_CONFIG))
 
@@ -79,6 +82,9 @@ class PipelineConfig:
             "RANDOM_SEED": self.random_seed,
             "THREADS": self.threads,
             "ENABLE_GPU": self.enable_gpu,
+            "ENABLE_ROTATION": self.enable_rotation,
+            "ENABLE_PBR": self.enable_pbr,
+            "ENABLE_VCOLOR": self.enable_vcolor,
             "LOG_FILE": self.log_file,
             "PBR_GENERATION": self.pbr_generation,
         }

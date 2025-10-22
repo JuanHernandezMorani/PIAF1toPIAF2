@@ -8,6 +8,25 @@ from typing import Dict
 
 from .core import config
 
+LOGGER = logging.getLogger("pixel_pipeline.main_recolor")
+
+
+class BoolAction(argparse.Action):
+    """Robust boolean flag parser supporting affirmative and negative forms."""
+
+    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
+        if values is None:
+            setattr(namespace, self.dest, True)
+            return
+        normalized = str(values).strip().lower()
+        if normalized in {"1", "y", "yes", "t", "true", "on"}:
+            setattr(namespace, self.dest, True)
+        elif normalized in {"0", "n", "no", "f", "false", "off"}:
+            setattr(namespace, self.dest, False)
+        else:
+            raise argparse.ArgumentTypeError(f"Invalid boolean for {option_string}: {values!r}")
+
+
 def _configure_logging(log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -35,6 +54,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-variants", type=int, default=500, help="Maximum number of variants per sprite")
     parser.add_argument("--gpu", action="store_true", help="Enable GPU acceleration if available")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--rotation",
+        nargs="?",
+        default=True,
+        action=BoolAction,
+        help="Create rotation variants (default: true)",
+    )
+    parser.add_argument(
+        "--no-rotation",
+        dest="rotation",
+        action="store_false",
+        help="Disable rotation variants",
+    )
+    parser.add_argument(
+        "--pbr",
+        nargs="?",
+        default=True,
+        action=BoolAction,
+        help="Create PBR maps for each variant (default: true)",
+    )
+    parser.add_argument(
+        "--no-pbr",
+        dest="pbr",
+        action="store_false",
+        help="Disable PBR map generation",
+    )
+    parser.add_argument(
+        "--vcolor",
+        nargs="?",
+        default=True,
+        action=BoolAction,
+        help="Create alternative color variants (default: true)",
+    )
+    parser.add_argument(
+        "--no-vcolor",
+        dest="vcolor",
+        action="store_false",
+        help="Use input colors without recoloring",
+    )
     return parser.parse_args()
 
 
@@ -48,6 +106,9 @@ def build_runtime_config(args: argparse.Namespace) -> Dict[str, object]:
         "MAX_VARIANTS": args.max_variants,
         "RANDOM_SEED": args.seed,
         "ENABLE_GPU": args.gpu,
+        "ENABLE_ROTATION": args.rotation,
+        "ENABLE_PBR": args.pbr,
+        "ENABLE_VCOLOR": args.vcolor,
     }
     return config.build_config(overrides)
 
@@ -56,6 +117,12 @@ def main() -> None:
     args = parse_args()
     cfg = build_runtime_config(args)
     _configure_logging(Path(cfg["LOG_FILE"]))
+    LOGGER.info(
+        "CLI flags resolved -> rotation=%s, pbr=%s, vcolor=%s",
+        args.rotation,
+        args.pbr,
+        args.vcolor,
+    )
     logging.getLogger("pixel_pipeline").info("Starting recolor pipeline")
     try:
         from .modules.recolor_generator import RecolorPipeline
