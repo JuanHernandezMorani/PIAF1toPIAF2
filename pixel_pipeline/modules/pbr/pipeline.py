@@ -400,6 +400,9 @@ def _preserve_foreground_texture_transmission(
         LOGGER.info("Transmission map corrected: foreground texture preservation active")
     else:
         LOGGER.warning("Transmission map adjustment triggered: %s", ", ".join(issues))
+
+    return image, issues
+
 def _ensure_current_maps(base_img: Image.Image, current_maps: Mapping[str, Image.Image]) -> Dict[str, Image.Image]:
     required = {
         "opacity",
