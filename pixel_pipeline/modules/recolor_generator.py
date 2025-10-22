@@ -396,7 +396,9 @@ class RecolorPipeline:
         ensure_dir(self.input_maps_path)
         self.file_manager = SafeFileManager(self.output_path)
         self.input_maps_manager = SafeFileManager(self.input_maps_path)
-        self.rotation_angles: Tuple[int, ...] = tuple(cfg.get("ROTATION_ANGLES", (0,)))  # type: ignore[arg-type]
+        configured_rotations: Tuple[int, ...] = tuple(cfg.get("ROTATION_ANGLES", (0,)))  # type: ignore[arg-type]
+        self.enable_rotation: bool = bool(cfg.get("ENABLE_ROTATION", True))
+        self.rotation_angles: Tuple[int, ...] = configured_rotations if self.enable_rotation else (0,)
         self.max_variants: int = int(cfg.get("MAX_VARIANTS", 200))
         seed = cfg.get("RANDOM_SEED")
         self.rng = random.Random(seed)
@@ -405,10 +407,18 @@ class RecolorPipeline:
         self.pbr_generation_config = dict(cfg.get("PBR_GENERATION", config.PBR_GENERATION_CONFIG))
         self.pixel_resolution = int(cfg.get("PIXEL_RESOLUTION", config.PIXEL_RESOLUTION))
         self.logger = LOGGER
+        self.enable_pbr: bool = bool(cfg.get("ENABLE_PBR", True))
+        self.enable_vcolor: bool = bool(cfg.get("ENABLE_VCOLOR", True))
         self.enable_gpu = bool(cfg.get("ENABLE_GPU", False))
         self.gpu_available = self._detect_gpu() if self.enable_gpu else False
         if self.enable_gpu and not self.gpu_available:
             self.logger.warning("GPU acceleration requested but no compatible backend was found")
+        if not self.enable_rotation:
+            self.logger.info("Rotation variants disabled; using base orientation only")
+        if not self.enable_vcolor:
+            self.logger.info("Color recoloring disabled; base sprite colors will be preserved")
+        if not self.enable_pbr:
+            self.logger.info("PBR generation disabled; only composite variants will be saved")
         self.logger.debug("Pipeline configured with %s", cfg)
         color_cfg = DEFAULT_COLOR_CONFIG.copy()
         color_cfg.update({k: v for k, v in cfg.items() if k in DEFAULT_COLOR_CONFIG})
@@ -438,7 +448,7 @@ class RecolorPipeline:
                 else:
                     base_layered_cfg[key] = value
         self.layered_pbr_config = base_layered_cfg
-        self.layered_pbr_enabled = bool(self.layered_pbr_config.get("generate_separate_pbr", False))
+        self.layered_pbr_enabled = self.enable_pbr and bool(self.layered_pbr_config.get("generate_separate_pbr", False))
         self.layered_cache = (
             LayeredPBRCache()
             if self.layered_pbr_enabled and self.layered_pbr_config.get("cache_layers_separately", True)
@@ -511,7 +521,8 @@ class RecolorPipeline:
             self.logger.exception("Failed to open %s: %s", path, exc)
             return
 
-        self._persist_input_maps(path.stem, rgba)
+        if self.enable_pbr:
+            self._persist_input_maps(path.stem, rgba)
         variants = list(self._generate_variants(path.stem, rgba))
         persisted = 0
         for variant in variants[: self.max_variants]:
@@ -524,7 +535,10 @@ class RecolorPipeline:
             self._total_image_time += elapsed
 
     def _generate_variants(self, stem: str, image: Image.Image) -> Iterator[Variant]:
-        palette = self._extract_palette(image)
+        if self.enable_vcolor:
+            palette = self._extract_palette(image)
+        else:
+            palette = [None]
         variant_index = 0
         base_foreground_template = image.convert("RGBA") if self.layered_pbr_enabled else None
         baseline_background: Optional[Image.Image] = None
@@ -544,7 +558,10 @@ class RecolorPipeline:
                     return
                 if self.layered_pbr_enabled:
                     base_foreground = base_foreground_template.copy() if base_foreground_template else image.convert("RGBA")
-                    foreground_variant = self._apply_tint(base_foreground.copy(), tint)
+                    if self.enable_vcolor:
+                        foreground_variant = self._apply_tint(base_foreground.copy(), tint)  # type: ignore[arg-type]
+                    else:
+                        foreground_variant = base_foreground.copy()
                     if PERCEPTUAL_VISION_AVAILABLE and self.config.get("enable_perceptual_simulation", True):
                         lighting_condition = str(self.config.get("lighting_condition", "photopic"))
                         adaptation_level = float(self.config.get("adaptation_level", 1.0))
@@ -570,14 +587,17 @@ class RecolorPipeline:
                         background_base=background_base,
                         foreground_variant=foreground_variant,
                         background_variant=background_variant if background_variant is not None else background_base,
-                        color_variant=tint,
+                        color_variant=tint if self.enable_vcolor else None,
                         rotation=float(rotation),
                         source_input=base_foreground.copy(),
                     )
                 else:
                     if rotated is None:
                         rotated = safe_rotate(image, rotation)
-                    variant_image = self._apply_tint(rotated, tint)
+                    if self.enable_vcolor:
+                        variant_image = self._apply_tint(rotated, tint)  # type: ignore[arg-type]
+                    else:
+                        variant_image = rotated.copy()
                     if PERCEPTUAL_VISION_AVAILABLE and self.config.get("enable_perceptual_simulation", True):
                         lighting_condition = str(self.config.get("lighting_condition", "photopic"))
                         adaptation_level = float(self.config.get("adaptation_level", 1.0))
@@ -600,7 +620,7 @@ class RecolorPipeline:
                         background=adapted,
                         foreground_base=rotated.copy(),
                         background_base=baseline_background.copy() if baseline_background is not None else None,
-                        color_variant=tint,
+                        color_variant=tint if self.enable_vcolor else None,
                         rotation=float(rotation),
                         source_input=rotated.copy(),
                     )
@@ -824,7 +844,8 @@ class RecolorPipeline:
     # Persistence ---------------------------------------------------------
     def _persist_variant(self, stem: str, variant: Variant) -> None:
         if (
-            self.layered_pbr_enabled
+            self.enable_pbr
+            and self.layered_pbr_enabled
             and variant.foreground_base is not None
             and variant.background_base is not None
         ):
@@ -833,6 +854,9 @@ class RecolorPipeline:
         base_name = variant.name
         composited = Image.alpha_composite(variant.background, variant.image)
         target_path = self.output_path / f"{base_name}.png"
+        if not self.enable_pbr:
+            self.file_manager.atomic_save(composited, target_path)
+            return
         source_for_maps = variant.source_input or variant.foreground_base or composited
         background_reference = variant.background_base or variant.background
         maps, alpha_map = self._generate_maps(
@@ -914,6 +938,8 @@ class RecolorPipeline:
     
     
     def _persist_input_maps(self, stem: str, image: Image.Image) -> None:
+        if not self.enable_pbr:
+            return
         base_name = stem
         maps, _ = self._generate_maps(
             image,
