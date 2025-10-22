@@ -403,9 +403,20 @@ def analyze_image_comprehensive(
     )
 
 
+def analyze_image(
+    base_img: Image.Image,
+    bg_img: Image.Image | None = None,
+    current_maps: Mapping[str, Image.Image] | None = None,
+) -> AnalysisResult:
+    """Convenience wrapper to run comprehensive analysis with defaults."""
+
+    return analyze_image_comprehensive(base_img, bg_img, current_maps or {})
+
+
 __all__ = [
     "AnalysisResult",
     "MaterialAnalysis",
+    "analyze_image",
     "analyze_image_comprehensive",
     "calculate_entropy",
     "diagnose_current_map_issues",
