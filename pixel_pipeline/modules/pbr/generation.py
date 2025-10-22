@@ -1,12 +1,12 @@
 """Map generation helpers for the physically accurate PBR pipeline."""
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 from PIL import Image, ImageFilter
 
-from ._image_features import ensure_variation, gaussian_blur
+from ._image_features import ensure_variation, gaussian_blur, normalize01
 from .analysis import AnalysisResult
 from .parameters import CRITICAL_PARAMETERS
 
@@ -146,6 +146,131 @@ def generate_metallic_physically_accurate(base_img: Image.Image, analysis: Analy
 
     alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
     return _from_single_channel(metallic_map, alpha)
+
+
+def _prepare_analysis_channel(channel: np.ndarray | Iterable[float], target_shape: Tuple[int, int]) -> np.ndarray:
+    """Normalize and resize analysis channels to match ``target_shape``."""
+
+    array = np.asarray(channel, dtype=np.float32)
+    if array.ndim >= 3:
+        array = array[..., 0]
+    array = np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+    if array.size == 0:
+        return np.zeros(target_shape, dtype=np.float32)
+    if array.shape != target_shape:
+        image = Image.fromarray((normalize01(array) * 255.0).astype(np.uint8), mode="L")
+        image = image.resize((target_shape[1], target_shape[0]), Image.BILINEAR)
+        array = np.asarray(image, dtype=np.float32)
+    max_value = float(array.max())
+    scale = max(max_value, 1e-5)
+    return np.clip(array / scale, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def generate_porosity_accurate(analysis: AnalysisResult) -> Image.Image:
+    """Generate a porosity map derived from unified analysis features."""
+
+    mask = analysis.mask
+    thickness = analysis.geometric_features.get("thickness", np.ones_like(mask))
+    edge_density = analysis.geometric_features.get("edge_map", np.zeros_like(mask))
+    cavities = 1.0 - np.clip(thickness, 0.0, 1.0)
+    rough_hint = np.clip(1.0 - analysis.specular_achromaticity, 0.0, 1.0)
+
+    porosity = np.clip(cavities * 0.55 + rough_hint * 0.25 + edge_density * 0.2, 0.0, 1.0)
+    porosity *= mask
+    porosity = gaussian_blur(porosity, radius=0.6)
+    porosity = ensure_variation(porosity)
+
+    alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
+    return _from_single_channel(porosity, alpha)
+
+
+def generate_opacity_accurate(analysis: AnalysisResult) -> Image.Image:
+    """Generate an opacity map coherent with transmission cues."""
+
+    mask = analysis.mask
+    base_alpha = np.clip(analysis.alpha, 0.0, 1.0)
+    translucency = np.clip(analysis.transmission_seed, 0.0, 1.0)
+    thin_regions = analysis.geometric_features.get("thin_regions", np.zeros_like(mask))
+
+    opacity = np.clip(base_alpha * 0.7 + (1.0 - translucency) * 0.2 + (1.0 - thin_regions) * 0.1, 0.0, 1.0)
+    opacity *= mask
+    opacity = gaussian_blur(opacity, radius=0.8)
+    opacity = ensure_variation(opacity)
+
+    alpha = Image.fromarray((base_alpha * 255.0).astype(np.uint8), mode="L")
+    return _from_single_channel(opacity, alpha)
+
+
+def generate_fuzz_accurate(base_img: Image.Image, analysis: AnalysisResult) -> Image.Image:
+    """Generate fuzz map using microsurface descriptors with graceful fallback."""
+
+    width, height = base_img.size
+    target_shape = (height, width)
+
+    microsurface = getattr(analysis, "microsurface_data", None)
+    fuzz_potential = getattr(analysis, "fuzz_potential", None)
+
+    if microsurface is not None and fuzz_potential is not None:
+        micro_channel = _prepare_analysis_channel(microsurface, target_shape)
+        fuzz_channel = _prepare_analysis_channel(fuzz_potential, target_shape)
+    else:
+        gray = np.asarray(base_img.convert("L"), dtype=np.float32) / 255.0
+        micro_channel = gaussian_blur(gray, radius=0.9)
+        fuzz_channel = np.clip(1.0 - micro_channel, 0.0, 1.0)
+
+    combined = np.clip(micro_channel * 0.6 + fuzz_channel * 0.4, 0.0, 1.0)
+    combined *= analysis.mask
+    combined = gaussian_blur(combined, radius=0.5)
+    combined = ensure_variation(combined)
+
+    alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
+    return _from_single_channel(combined, alpha)
+
+
+def generate_material_accurate(analysis: AnalysisResult) -> Image.Image:
+    """Generate a semantic material map from dominant material likelihoods."""
+
+    mask = analysis.mask
+    height, width = mask.shape
+    material = analysis.material_analysis
+    likelihoods = material.likelihoods if material is not None else {}
+
+    palette: Dict[str, Tuple[float, float, float]] = {
+        "metal": (0.75, 0.75, 0.85),
+        "stone": (0.55, 0.55, 0.6),
+        "organic": (0.45, 0.7, 0.4),
+        "skin": (0.85, 0.6, 0.55),
+        "fabric": (0.6, 0.35, 0.65),
+        "wood": (0.65, 0.45, 0.3),
+        "glass": (0.6, 0.8, 0.95),
+        "water": (0.4, 0.6, 0.85),
+    }
+
+    color = np.zeros((height, width, 3), dtype=np.float32)
+    total = np.zeros((height, width, 1), dtype=np.float32)
+
+    for name, rgb in palette.items():
+        likelihood = likelihoods.get(name)
+        if likelihood is None:
+            continue
+        channel = _prepare_analysis_channel(likelihood, (height, width))
+        rgb_vec = np.array(rgb, dtype=np.float32).reshape(1, 1, 3)
+        color += channel[..., None] * rgb_vec
+        total += channel[..., None]
+
+    if np.all(total <= 1e-6):
+        base_rgb = np.asarray(analysis.rgb, dtype=np.float32)
+        base_rgb = normalize01(base_rgb)
+        color = base_rgb
+    else:
+        color = np.divide(color, np.maximum(total, 1e-6))
+
+    color = np.clip(color * mask[..., None], 0.0, 1.0)
+    color = ensure_variation(color)
+
+    alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
+    rgb_image = Image.fromarray((color * 255.0).astype(np.uint8), mode="RGB")
+    return Image.merge("RGBA", (*rgb_image.split(), alpha))
 
 
 def generate_ior_physically_accurate(
@@ -470,12 +595,16 @@ def generate_secondary_maps(base_img: Image.Image, analysis: AnalysisResult) -> 
 __all__ = [
     "generate_alpha_accurate",
     "generate_ao_physically_accurate",
+    "generate_fuzz_accurate",
     "generate_curvature_enhanced",
     "generate_emissive_accurate",
     "generate_height_from_normal",
     "generate_ior_physically_accurate",
+    "generate_material_accurate",
     "generate_metallic_physically_accurate",
     "generate_normal_enhanced",
+    "generate_opacity_accurate",
+    "generate_porosity_accurate",
     "generate_roughness_physically_accurate",
     "generate_specular_coherent",
     "generate_structural_distinct",
