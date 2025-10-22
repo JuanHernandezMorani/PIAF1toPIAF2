@@ -619,11 +619,13 @@ def generate_physically_accurate_pbr_maps(
         LOGGER.info("All PBR maps validated successfully")
 
     if sanitized_bg is not None:
-        corrected_foreground = correct_edges_with_background(sanitized_base, sanitized_bg)
+        alpha_binary = (alpha_map > 0.1).astype(np.uint8) * 255
+        alpha_mask = Image.fromarray(alpha_binary, mode="L")
+        composite = sanitized_bg.copy()
+        foreground_rgb = sanitized_base.convert("RGB")
+        composite.paste(foreground_rgb, (0, 0), alpha_mask)
     else:
-        corrected_foreground = sanitized_base
-
-    composite = apply_alpha(corrected_foreground, alpha_map)
+        composite = apply_alpha(sanitized_base, alpha_map)
     foreground_texture = np.asarray(sanitized_base.convert("L"), dtype=np.float32) / 255.0
     quality_checks = _evaluate_quality_checks_improved(
         final_maps,

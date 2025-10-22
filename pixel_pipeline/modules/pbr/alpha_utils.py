@@ -258,15 +258,21 @@ def derive_alpha_map(
 
 def apply_alpha(image: Image.Image, alpha: np.ndarray) -> Image.Image:
     rgba = image.convert("RGBA")
-    if alpha.shape != (rgba.height, rgba.width):
-        alpha_img = Image.fromarray((np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8), mode="L").resize(
+    alpha_array = np.asarray(alpha, dtype=np.float32)
+    if alpha_array.shape != (rgba.height, rgba.width):
+        alpha_img = Image.fromarray((np.clip(alpha_array, 0.0, 1.0) * 255).astype(np.uint8), mode="L").resize(
             rgba.size, LANCZOS
         )
+        alpha_array = np.asarray(alpha_img, dtype=np.float32) / 255.0
     else:
-        alpha_img = Image.fromarray((np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8), mode="L")
-    result = rgba.copy()
-    result.putalpha(alpha_img)
-    return result
+        alpha_array = np.clip(alpha_array, 0.0, 1.0)
+        alpha_img = Image.fromarray((alpha_array * 255).astype(np.uint8), mode="L")
+
+    alpha_binary = (alpha_array > 0.1).astype(np.uint8) * 255
+    alpha_mask = Image.fromarray(alpha_binary, mode="L")
+    transparent_bg = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+    transparent_bg.paste(rgba.convert("RGB"), (0, 0), alpha_mask)
+    return transparent_bg
 
 
 def apply_alpha_to_maps(maps: Mapping[str, Image.Image], alpha: np.ndarray) -> Dict[str, Image.Image]:
