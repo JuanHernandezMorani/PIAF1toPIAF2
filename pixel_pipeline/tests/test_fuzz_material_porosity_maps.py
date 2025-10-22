@@ -1,12 +1,35 @@
-"""Integration tests for newly reintegrated optional maps in the PBR pipeline."""
-from __future__ import annotations
-
 import pytest
 
 pytest.importorskip("PIL")
 from PIL import Image
 
 from pixel_pipeline.modules.pbr import pipeline
+from pixel_pipeline.modules.pbr.analysis import analyze_image
+from pixel_pipeline.modules.pbr.generation import (
+    generate_fuzz_accurate,
+    generate_material_accurate,
+    generate_porosity_accurate,
+    generate_opacity_accurate,
+)
+
+EXPECTED_MAPS = {
+    "metallic",
+    "roughness",
+    "normal",
+    "height",
+    "ao",
+    "curvature",
+    "transmission",
+    "subsurface",
+    "specular",
+    "ior",
+    "emissive",
+    "structural",
+    "porosity",
+    "opacity",
+    "fuzz",
+    "material",
+}
 
 
 def _base_sprite() -> Image.Image:
@@ -16,30 +39,22 @@ def _base_sprite() -> Image.Image:
     return sprite
 
 
-def test_pipeline_outputs_optional_maps() -> None:
+def test_generation_functions_return_rgba() -> None:
+    sprite = _base_sprite()
+    analysis = analyze_image(sprite, None, {})
+    fuzz = generate_fuzz_accurate(sprite, analysis)
+    porosity = generate_porosity_accurate(analysis)
+    material = generate_material_accurate(analysis)
+    opacity = generate_opacity_accurate(analysis)
+    for generated in (fuzz, porosity, material, opacity):
+        assert generated.mode == "RGBA"
+        assert generated.size == sprite.size
+
+
+def test_pipeline_outputs_unified_maps() -> None:
     result = pipeline.generate_physically_accurate_pbr_maps(_base_sprite(), None, {})
     maps = result["maps"]
-    for key in ("fuzz", "material", "porosity"):
-        assert key in maps
-        assert maps[key].mode == "RGBA"
-        assert maps[key].size == _base_sprite().size
-
-
-def test_pipeline_fallback_when_generators_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pipeline, "generate_fuzz_enhanced", None, raising=False)
-
-    def _broken_material(*_args, **_kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(pipeline, "generate_material_semantic", _broken_material, raising=False)
-    monkeypatch.setattr(pipeline, "generate_porosity_physically_accurate", None, raising=False)
-
-    result = pipeline.generate_physically_accurate_pbr_maps(_base_sprite(), None, {})
-    maps = result["maps"]
-    assert maps["fuzz"].mode == "RGBA"
-    assert maps["material"].mode == "RGBA"
-    assert maps["porosity"].mode == "RGBA"
-    expected_size = _base_sprite().size
-    assert maps["fuzz"].size == expected_size
-    assert maps["material"].size == expected_size
-    assert maps["porosity"].size == expected_size
+    assert set(maps) == EXPECTED_MAPS
+    for name in EXPECTED_MAPS:
+        assert maps[name].mode == "RGBA"
+        assert maps[name].size == _base_sprite().size

@@ -11,13 +11,16 @@ from PIL import Image
 
 from .pipeline import (
     generate_physically_accurate_pbr_maps,
-    _detect_and_correct_flat_maps_v5,
-    _generate_emissive_map_v5,
-    _generate_metallic_map_v5,
-    _generate_normal_map_v5,
-    _generate_roughness_map_v5,
+    _detect_and_correct_flat_maps,
     automated_quality_report_v5,
     validate_pbr_coherence_v5,
+)
+from .generation import (
+    generate_emissive_accurate,
+    generate_metallic_physically_accurate,
+    generate_normal_enhanced,
+    generate_roughness_physically_accurate,
+    generate_specular_coherent,
 )
 from .validation import _validate_halo_elimination
 
@@ -504,34 +507,26 @@ def execute_physically_correct_pbr_v5(
     metallic_candidate = maps.get("metallic")
     roughness_candidate = maps.get("roughness")
 
-    maps["metallic"] = _generate_metallic_map_v5(
-        base_image,
-        roughness_candidate,
-        analysis,
-        material_class=material_class,
-        candidate=metallic_candidate,
-    )
-    maps["roughness"] = _generate_roughness_map_v5(
+    maps["metallic"] = generate_metallic_physically_accurate(
         base_image,
         analysis,
-        maps.get("metallic"),
-        material_class,
+        metallic_candidate,
     )
-    maps["metallic"] = _generate_metallic_map_v5(
-        base_image,
-        maps.get("roughness"),
-        analysis,
-        material_class=material_class,
-        candidate=maps.get("metallic"),
-    )
-    maps["emissive"] = _generate_emissive_map_v5(
+    maps["roughness"] = generate_roughness_physically_accurate(
         base_image,
         analysis,
-        material_class=material_class,
+        maps["metallic"],
     )
-    maps["normal"] = _generate_normal_map_v5(base_image, analysis)
+    maps["specular"] = generate_specular_coherent(maps["roughness"], analysis)
+    maps["metallic"] = generate_metallic_physically_accurate(
+        base_image,
+        analysis,
+        maps["metallic"],
+    )
+    maps["emissive"] = generate_emissive_accurate(base_image, analysis)
+    maps["normal"] = generate_normal_enhanced(base_image, analysis)
 
-    maps = _detect_and_correct_flat_maps_v5(maps, base_image, analysis, material_class)
+    maps = _detect_and_correct_flat_maps(maps, base_image, analysis)
 
     validation = validate_pbr_coherence_v5(base_image, maps, material_class)
     quality_report = automated_quality_report_v5(validation)

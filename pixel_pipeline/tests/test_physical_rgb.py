@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("numpy")
 import numpy as np
 from PIL import Image
 

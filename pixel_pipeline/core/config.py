@@ -18,34 +18,29 @@ USE_HLS_METHOD = True
 USE_REAL_BACKGROUNDS_ONLY = True
 
 
-MAP_TYPES: Dict[str, Dict[str, str]] = {
-    "surface": {
-        "normal": "pixel_pipeline.modules.surface_maps.normal_map",
-        "specular": "pixel_pipeline.modules.surface_maps.specular_map",
-        "roughness": "pixel_pipeline.modules.surface_maps.roughness_map",
-        "metallic": "pixel_pipeline.modules.surface_maps.metallic_map",
-    },
-    "geometry": {
-        "height": "pixel_pipeline.modules.geometry_maps.height_map",
-        "ao": "pixel_pipeline.modules.geometry_maps.ambient_occlusion",
-        "curvature": "pixel_pipeline.modules.geometry_maps.curvature_map",
-    },
-    "pixelart": {
-        "porosity": "pixel_pipeline.modules.pixelart_maps.porosity_map",
-        "fuzz": "pixel_pipeline.modules.pixelart_maps.fuzz_map",
-    },
-    "illumination": {
-        "transmission": "pixel_pipeline.modules.illumination_maps.transmission_map",
-        "subsurface": "pixel_pipeline.modules.illumination_maps.subsurface_map",
-    },
-    "semantic": {
-        "material": "pixel_pipeline.modules.semantic_maps.material_type",
-        "structural": "pixel_pipeline.modules.semantic_maps.structural_map",
-    },
-    "optical": {
-        "ior": "pixel_pipeline.modules.optical_maps.ior_map",
-        "opacity": "pixel_pipeline.modules.optical_maps.opacity_map",
-    },
+PBR_GENERATION_CONFIG: Dict[str, object] = {
+    "use_unified_generation": True,
+    "analysis_shared_across_maps": True,
+    "generation_module": "pixel_pipeline.modules.pbr.generation",
+    "total_pbr_maps": 16,
+    "maps_list": [
+        "metallic",
+        "roughness",
+        "normal",
+        "height",
+        "ao",
+        "curvature",
+        "transmission",
+        "subsurface",
+        "specular",
+        "ior",
+        "emissive",
+        "structural",
+        "porosity",
+        "opacity",
+        "fuzz",
+        "material",
+    ],
 }
 
 
@@ -66,7 +61,7 @@ class PipelineConfig:
     threads: int = 8
     enable_gpu: bool = False
     log_file: Path = BASE_DIR / "processing.log"
-    map_types: Dict[str, Dict[str, str]] = field(default_factory=lambda: {k: dict(v) for k, v in MAP_TYPES.items()})
+    pbr_generation: Dict[str, object] = field(default_factory=lambda: dict(PBR_GENERATION_CONFIG))
 
     def as_dict(self) -> Dict[str, object]:
         """Return the configuration as a plain dictionary."""
@@ -85,7 +80,7 @@ class PipelineConfig:
             "THREADS": self.threads,
             "ENABLE_GPU": self.enable_gpu,
             "LOG_FILE": self.log_file,
-            "MAP_TYPES": self.map_types,
+            "PBR_GENERATION": self.pbr_generation,
         }
 
 

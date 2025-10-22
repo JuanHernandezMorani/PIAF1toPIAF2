@@ -1,7 +1,6 @@
 """Core recoloring pipeline that orchestrates image variants and map generation."""
 from __future__ import annotations
 
-import importlib
 import logging
 import random
 import threading
@@ -25,7 +24,6 @@ from ..core.utils_color import (
 from ..core.utils_io import SafeFileManager, ensure_dir
 from ..core.utils_parallel import limited_threads, run_parallel
 from . import contextual_randomizer
-from .pbr import generate_physically_accurate_pbr_maps, generate_quality_report
 from .pbr.alpha_utils import apply_alpha, apply_alpha_to_maps, derive_alpha_map
 from .pbr.layered import LAYERED_PBR_CONFIG, LayeredPBRCache, PBRLayerManager
 
@@ -40,8 +38,6 @@ except ImportError:  # pragma: no cover - optional dependency
     PERCEPTUAL_VISION_AVAILABLE = False
 
 LOGGER = logging.getLogger("pixel_pipeline.recolor")
-
-GeneratorFn = Callable[[Image.Image], Image.Image]
 
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
 
@@ -404,7 +400,7 @@ class RecolorPipeline:
         self.rng = random.Random(seed)
         self.use_real_backgrounds = bool(cfg.get("USE_REAL_BACKGROUNDS_ONLY", True))
         self.backgrounds = BackgroundLibrary(self.background_path, rng=self.rng, allow_generated=not self.use_real_backgrounds)
-        self.map_generators = self._load_map_generators(cfg.get("MAP_TYPES", config.MAP_TYPES))
+        self.pbr_generation_config = dict(cfg.get("PBR_GENERATION", config.PBR_GENERATION_CONFIG))
         self.pixel_resolution = int(cfg.get("PIXEL_RESOLUTION", config.PIXEL_RESOLUTION))
         self.logger = LOGGER
         self.enable_gpu = bool(cfg.get("ENABLE_GPU", False))
@@ -457,19 +453,6 @@ class RecolorPipeline:
         contextual_randomizer.pixel_variation_callback(
             self._apply_pixel_variation, persistent=True
         )
-
-    def _load_map_generators(self, mapping: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, GeneratorFn]]:
-        generators: Dict[str, Dict[str, GeneratorFn]] = {}
-        for category, entries in mapping.items():
-            category_generators: Dict[str, GeneratorFn] = {}
-            for name, module_path in entries.items():
-                module = importlib.import_module(module_path)
-                generator = getattr(module, "generate", None)
-                if generator is None:
-                    raise AttributeError(f"Module {module_path} does not expose a generate() function")
-                category_generators[name] = generator
-            generators[category] = category_generators
-        return generators
 
     def _iter_input_files(self) -> Iterator[Path]:
         for entry in sorted(self.input_path.iterdir()):
@@ -924,24 +907,71 @@ class RecolorPipeline:
         foreground_image: Image.Image | None = None,
         preserve_original_alpha: bool = False,
     ) -> tuple[Dict[str, Image.Image], np.ndarray]:
-        baseline: Dict[str, Image.Image] = {}
-        for category, generators in self.map_generators.items():
-            for map_name, generator in generators.items():
-                try:
-                    baseline[map_name] = generator(base_image)
-                except Exception as exc:  # pragma: no cover - logging path
-                    self.logger.exception("Failed to generate %s map: %s", map_name, exc)
+        """Generate unified PBR maps using the comprehensive generation module."""
 
-        pbr_result = generate_physically_accurate_pbr_maps(base_image, background, baseline)
-        final_maps: Dict[str, Image.Image] = pbr_result["maps"]
-        analysis = pbr_result.get("analysis")
-        analysis_obj = analysis if hasattr(analysis, "mask") else None
-        alpha_map = pbr_result.get("alpha")
+        from .pbr.generation import (
+            generate_alpha_accurate,
+            generate_ao_physically_accurate,
+            generate_curvature_enhanced,
+            generate_emissive_accurate,
+            generate_height_from_normal,
+            generate_ior_physically_accurate,
+            generate_material_accurate,
+            generate_metallic_physically_accurate,
+            generate_normal_enhanced,
+            generate_opacity_accurate,
+            generate_porosity_accurate,
+            generate_roughness_physically_accurate,
+            generate_specular_coherent,
+            generate_structural_distinct,
+            generate_subsurface_accurate,
+            generate_fuzz_accurate,
+            generate_transmission_physically_accurate,
+        )
+        from .pbr.analysis import analyze_image
 
-        if isinstance(alpha_map, np.ndarray):
-            derived_alpha = alpha_map
-        else:
-            derived_alpha = derive_alpha_map(base_image, final_maps, analysis_obj)
+        analysis = analyze_image(base_image, background, {})
+
+        metallic = generate_metallic_physically_accurate(base_image, analysis, None)
+        roughness = generate_roughness_physically_accurate(base_image, analysis, metallic)
+        specular = generate_specular_coherent(roughness, analysis)
+        transmission = generate_transmission_physically_accurate(analysis, None)
+        subsurface = generate_subsurface_accurate(analysis, transmission)
+        ior = generate_ior_physically_accurate(transmission, analysis.material_analysis, analysis)
+        normal = generate_normal_enhanced(base_image, analysis)
+        height = generate_height_from_normal(normal, analysis)
+        ao = generate_ao_physically_accurate(analysis)
+        curvature = generate_curvature_enhanced(analysis)
+        emissive = generate_emissive_accurate(base_image, analysis)
+        structural = generate_structural_distinct(analysis, None)
+        porosity = generate_porosity_accurate(analysis)
+        opacity_map = generate_opacity_accurate(analysis)
+        fuzz = generate_fuzz_accurate(base_image, analysis)
+        material = generate_material_accurate(analysis)
+        alpha_image = generate_alpha_accurate(analysis, None)
+
+        final_maps: Dict[str, Image.Image] = {
+            "metallic": metallic,
+            "roughness": roughness,
+            "normal": normal,
+            "height": height,
+            "ao": ao,
+            "curvature": curvature,
+            "transmission": transmission,
+            "subsurface": subsurface,
+            "specular": specular,
+            "ior": ior,
+            "emissive": emissive,
+            "structural": structural,
+            "porosity": porosity,
+            "opacity": opacity_map,
+            "fuzz": fuzz,
+            "material": material,
+        }
+
+        alpha_channel = np.asarray(alpha_image.split()[-1], dtype=np.float32) / 255.0
+        derived_alpha = derive_alpha_map(base_image, final_maps, analysis)
+        derived_alpha = np.clip(derived_alpha * 0.5 + alpha_channel * 0.5, 0.0, 1.0)
 
         if foreground_image is not None:
             derived_alpha = self._restore_background_alpha(derived_alpha, foreground_image)
@@ -951,23 +981,7 @@ class RecolorPipeline:
 
         final_maps = apply_alpha_to_maps(final_maps, derived_alpha)
 
-        quality_checks = pbr_result.get("quality_checks", {})
-        if quality_checks:
-            self.logger.debug("PBR validation checks: %s", quality_checks)
-            if quality_checks.get("halos_eliminated", False):
-                self.logger.info("No visible halos detected in composition")
-            else:
-                self.logger.warning("Halos detected in generated composition output")
-            if not quality_checks.get("transmission_preserved", True):
-                self.logger.warning("Transmission map flagged for manual inspection")
-
-
-        quality = pbr_result.get("quality_report")
-        if quality is None:
-            quality = generate_quality_report(final_maps, analysis_obj)
-        self.logger.debug("PBR quality report: %s", quality)
         return final_maps, derived_alpha
-
     def _generate_maps_layered(
         self,
         base_image: Image.Image,
