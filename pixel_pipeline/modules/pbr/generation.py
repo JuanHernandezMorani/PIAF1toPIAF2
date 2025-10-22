@@ -6,7 +6,7 @@ from typing import Dict, Iterable, Tuple
 import numpy as np
 from PIL import Image, ImageFilter
 
-from ._image_features import ensure_variation, gaussian_blur, normalize01
+from ._image_features import _filter_with_edge_handling, ensure_variation, gaussian_blur, normalize01
 from .analysis import AnalysisResult
 from .parameters import CRITICAL_PARAMETERS
 
@@ -72,10 +72,21 @@ def _height_to_normal(height_field: np.ndarray) -> np.ndarray:
     return normal
 
 
-def strategic_gaussian_blur(array: np.ndarray, mask: np.ndarray, sigma: float, preserve_organic: np.ndarray | None = None) -> np.ndarray:
-    image = Image.fromarray((np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L")
-    blurred = image.filter(ImageFilter.GaussianBlur(radius=sigma))
-    blurred_np = np.asarray(blurred, dtype=np.float32) / 255.0
+def strategic_gaussian_blur(
+    array: np.ndarray,
+    mask: np.ndarray,
+    sigma: float,
+    preserve_organic: np.ndarray | None = None,
+) -> np.ndarray:
+    base = np.clip(array, 0.0, 1.0).astype(np.float32)
+    pad = max(int(np.ceil(sigma * 2.0)), 1)
+
+    def _pil_blur(padded: np.ndarray, *, radius: float) -> np.ndarray:
+        image = Image.fromarray((np.clip(padded, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L")
+        blurred = image.filter(ImageFilter.GaussianBlur(radius=radius))
+        return np.asarray(blurred, dtype=np.float32) / 255.0
+
+    blurred_np = _filter_with_edge_handling(base, _pil_blur, pad_width=pad, radius=sigma)
     if preserve_organic is not None:
         preserve = preserve_organic.astype(bool)
         blurred_np[preserve] = array[preserve]
@@ -92,7 +103,11 @@ def enforce_metallic_coherence(metallic_map: np.ndarray, analysis: AnalysisResul
     return coherent.astype(np.float32)
 
 
-def generate_metallic_physically_accurate(base_img: Image.Image, analysis: AnalysisResult, current_metallic: Image.Image | None) -> Image.Image:
+def generate_metallic_physically_accurate(
+    base_img: Image.Image,
+    analysis: AnalysisResult,
+    current_metallic: Image.Image | None,
+) -> Image.Image:
     mask = analysis.mask
     likelihoods = analysis.material_analysis.likelihoods
     metal_like = likelihoods.get("metal", np.zeros_like(mask))
@@ -106,21 +121,29 @@ def generate_metallic_physically_accurate(base_img: Image.Image, analysis: Analy
     saturation = analysis.hsv[1]
     roughness_hint = np.clip(1.0 - specular, 0.0, 1.0)
 
+    spectral_confidence = np.clip(
+        metal_like * 0.7
+        + np.clip(specular - 0.6, 0.0, 1.0) * 0.25
+        - saturation * 0.2
+        - roughness_hint * 0.15,
+        0.0,
+        1.0,
+    )
+
     candidate = (
         (metal_like > 0.55)
         & (false_risk < 0.25)
-        & (specular > max(0.7, CRITICAL_PARAMETERS["METALLIC_SPECULAR_MIN"]))
-        & (roughness_hint < 0.35)
-        & (saturation < 0.2)
+        & (specular > max(0.65, CRITICAL_PARAMETERS["METALLIC_SPECULAR_MIN"]))
+        & (roughness_hint < 0.4)
         & (mask > 0.05)
     )
 
-    metallic_map = np.zeros_like(mask, dtype=np.float32)
-    metallic_map[candidate] = np.clip(metal_like[candidate], 0.0, 1.0)
+    metallic_map = spectral_confidence
+    metallic_map[candidate] = np.maximum(metallic_map[candidate], np.clip(metal_like[candidate], 0.0, 1.0))
 
     if current_metallic is not None:
         prev = _to_float_array(current_metallic)
-        metallic_map = np.maximum(metallic_map, np.clip(prev, 0.0, 1.0) * 0.6)
+        metallic_map = np.maximum(metallic_map, np.clip(prev, 0.0, 1.0) * 0.5)
 
     organic_suppression = (
         (organic_like > 0.3)
@@ -129,7 +152,7 @@ def generate_metallic_physically_accurate(base_img: Image.Image, analysis: Analy
         | (wood_like > 0.3)
     )
 
-    metallic_map[organic_suppression] = np.minimum(metallic_map[organic_suppression], CRITICAL_PARAMETERS["METALLIC_ORGANIC_TOLERANCE"])
+    metallic_map[organic_suppression] *= 0.25
     metallic_map[false_risk > 0.25] = 0.0
 
     metallic_image = Image.fromarray((np.clip(metallic_map, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L")
@@ -137,9 +160,10 @@ def generate_metallic_physically_accurate(base_img: Image.Image, analysis: Analy
     closed = opened.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
     metallic_map = np.asarray(closed, dtype=np.float32) / 255.0
 
-    metallic_map = strategic_gaussian_blur(metallic_map, mask, sigma=0.6, preserve_organic=organic_suppression)
-    metallic_map = enforce_metallic_coherence(metallic_map, analysis)
-    metallic_map = np.clip(metallic_map * mask, 0.0, 1.0)
+    metallic_map = strategic_gaussian_blur(metallic_map, mask, sigma=0.65, preserve_organic=organic_suppression)
+    coherence = enforce_metallic_coherence(metallic_map, analysis)
+    metallic_map = np.clip(metallic_map * coherence, 0.0, 1.0)
+    metallic_map = ensure_variation(np.clip(metallic_map * mask, 0.0, 1.0))
 
     if metallic_map.sum() < 3:
         metallic_map[:] = 0.0
@@ -192,9 +216,21 @@ def generate_opacity_accurate(analysis: AnalysisResult) -> Image.Image:
     translucency = np.clip(analysis.transmission_seed, 0.0, 1.0)
     thin_regions = analysis.geometric_features.get("thin_regions", np.zeros_like(mask))
 
-    opacity = np.clip(base_alpha * 0.7 + (1.0 - translucency) * 0.2 + (1.0 - thin_regions) * 0.1, 0.0, 1.0)
+    translucency_smooth = gaussian_blur(translucency, radius=0.6)
+    base_detail = gaussian_blur(base_alpha, radius=0.4)
+    thin_penalty = gaussian_blur(thin_regions, radius=0.8)
+
+    opacity = np.clip(
+        base_detail * 0.65
+        + base_alpha * 0.25
+        + (1.0 - translucency_smooth) * 0.1
+        + (1.0 - thin_penalty) * 0.1,
+        0.0,
+        1.0,
+    )
+    opacity = np.maximum(opacity, base_alpha * 0.5)
     opacity *= mask
-    opacity = gaussian_blur(opacity, radius=0.8)
+    opacity = gaussian_blur(opacity, radius=0.6)
     opacity = ensure_variation(opacity)
 
     alpha = Image.fromarray((base_alpha * 255.0).astype(np.uint8), mode="L")
@@ -320,8 +356,10 @@ def generate_ior_physically_accurate(
     ior_map = ior_map * (1.0 - blend) + 1.48 * blend
 
     if analysis is not None:
-        ior_map[analysis.material_analysis.false_metal_risks > 0.2] = CRITICAL_PARAMETERS["IOR_OPAQUE_DEFAULT"]
-        ior_map[analysis.mask < 0.05] = CRITICAL_PARAMETERS["IOR_OPAQUE_DEFAULT"]
+        opaque_default = CRITICAL_PARAMETERS["IOR_OPAQUE_DEFAULT"]
+        opaque_mask = (analysis.mask < 0.05) | (translucent_seed < CRITICAL_PARAMETERS["TRANSMISSION_OPAQUE_MAX"])
+        opaque_mask |= analysis.material_analysis.false_metal_risks > 0.2
+        ior_map[opaque_mask] = opaque_default
         alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
     else:
         alpha = transmission.split()[-1]
@@ -408,7 +446,9 @@ def is_thin_section(geometric_features: Dict[str, np.ndarray]) -> np.ndarray:
     return thin
 
 
-def generate_transmission_physically_accurate(analysis: AnalysisResult, current_transmission: Image.Image | None) -> Image.Image:
+def generate_transmission_physically_accurate(
+    analysis: AnalysisResult, current_transmission: Image.Image | None
+) -> Image.Image:
     mask = analysis.mask
     likelihoods = analysis.material_analysis.likelihoods
     thin_regions = analysis.geometric_features.get("thin_regions", np.zeros_like(mask))
@@ -445,11 +485,12 @@ def generate_transmission_physically_accurate(analysis: AnalysisResult, current_
 
     if current_transmission is not None:
         prev = _to_float_array(current_transmission)
-        transmission_map = np.maximum(transmission_map, prev * 0.6)
+        transmission_map = np.maximum(transmission_map, np.clip(prev, 0.0, 1.0) * 0.5)
 
     metallic = likelihoods.get("metal", np.zeros_like(mask))
     stone = likelihoods.get("stone", np.zeros_like(mask))
-    opaque_regions = (metallic > 0.4) | (stone > 0.5)
+    opaque_regions = (metallic > 0.35) | (stone > 0.5)
+    opaque_regions |= analysis.material_analysis.false_metal_risks > 0.25
     transmission_map[opaque_regions] = 0.0
 
     delicate_regions = (thin_regions > 0.2) & (thickness < 0.35)
@@ -457,24 +498,27 @@ def generate_transmission_physically_accurate(analysis: AnalysisResult, current_
         transmission_map[delicate_regions] = np.clip(transmission_map[delicate_regions], 0.15, 0.35)
 
     transmission_map[mask < 0.05] = 0.0
-    minimum_transmission = 0.02
+    minimum_transmission = 0.015
     transmission_map = np.where(mask > 0.05, np.maximum(transmission_map, minimum_transmission), transmission_map)
     transmission_map[opaque_regions] = 0.0
 
-    transmission_map = strategic_gaussian_blur(transmission_map, mask, sigma=0.9)
+    transmission_map = strategic_gaussian_blur(transmission_map, mask, sigma=0.85)
     transmission_map = ensure_variation(np.clip(transmission_map, 0.0, 1.0))
 
     alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
     return _from_single_channel(transmission_map, alpha)
 
 
-def generate_roughness_physically_accurate(base_img: Image.Image, analysis: AnalysisResult, metallic_map: Image.Image) -> Image.Image:
+def generate_roughness_physically_accurate(
+    base_img: Image.Image, analysis: AnalysisResult, metallic_map: Image.Image
+) -> Image.Image:
     edge_map = analysis.geometric_features.get("edge_map")
     specular = analysis.specular_achromaticity
     metallic_np = _to_float_array(metallic_map)
 
-    roughness = np.clip(1.0 - specular * 0.6 + edge_map * 0.2, 0.05, 1.0)
-    roughness = np.where(metallic_np > 0.5, np.clip(roughness * 0.4, 0.05, 0.65), roughness)
+    roughness = np.clip(1.0 - specular * 0.55 + edge_map * 0.25, 0.05, 1.0)
+    roughness = np.where(metallic_np > 0.5, np.clip(roughness * 0.45, 0.05, 0.65), roughness)
+    roughness = gaussian_blur(roughness, radius=0.35)
     roughness = ensure_variation(roughness * analysis.mask + (1.0 - analysis.mask) * 0.05)
 
     alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
@@ -503,9 +547,18 @@ def generate_subsurface_accurate(analysis: AnalysisResult, transmission: Image.I
     min_alpha = np.asarray(alpha_channel.filter(ImageFilter.MinFilter(3)), dtype=np.float32) / 255.0
 
     low_freq = gaussian_blur(analysis.luminance_map, radius=3.5)
-    subsurface_np = np.clip(0.5 * low_freq + 0.3 * min_alpha + 0.2 * transmission_np, 0.0, 1.0)
-    subsurface_np *= organic_mask
+    thin_regions = analysis.geometric_features.get("thin_regions", np.zeros_like(organic_mask))
+    thickness = analysis.geometric_features.get("thickness", np.ones_like(organic_mask))
+
+    organic_focus = gaussian_blur(organic_mask, radius=1.0)
+    thin_boost = np.clip(0.6 * thin_regions + 0.4 * (1.0 - thickness), 0.0, 1.0)
+    thin_boost = gaussian_blur(thin_boost, radius=1.2)
+
+    subsurface_np = np.clip(0.45 * low_freq + 0.3 * min_alpha + 0.25 * transmission_np, 0.0, 1.0)
+    subsurface_np *= organic_focus
+    subsurface_np = np.clip(subsurface_np * (0.6 + 0.4 * thin_boost), 0.0, 1.0)
     subsurface_np *= analysis.mask
+    subsurface_np = gaussian_blur(subsurface_np, radius=0.6)
     subsurface_np = ensure_variation(subsurface_np)
 
     alpha = Image.fromarray((analysis.alpha * 255.0).astype(np.uint8), mode="L")
@@ -521,13 +574,17 @@ def generate_structural_distinct(analysis: AnalysisResult, current_structural: I
     normal_mag = np.linalg.norm(normal_field - 0.5, axis=2)
     log_normal = np.abs(normal_mag - gaussian_blur(normal_mag, radius=1.2))
 
+    base_luminance = analysis.luminance_map
+    high_pass = np.abs(height_field - gaussian_blur(height_field, radius=2.0))
     edge_map = analysis.geometric_features.get("edge_map", np.zeros_like(height_field))
-    structural = np.clip(0.45 * sobel + 0.35 * log_normal + 0.2 * edge_map, 0.0, 1.0)
+    decorrelated = np.clip(high_pass + np.abs(base_luminance - gaussian_blur(base_luminance, radius=1.5)), 0.0, 1.0)
+    structural = np.clip(0.4 * sobel + 0.3 * log_normal + 0.2 * decorrelated + 0.1 * edge_map, 0.0, 1.0)
 
     if current_structural is not None:
         previous = _to_float_array(current_structural)
         structural = np.clip(0.6 * structural + 0.4 * previous, 0.0, 1.0)
 
+    structural = gaussian_blur(structural, radius=0.45)
     structural *= analysis.mask
     structural = ensure_variation(structural)
 
